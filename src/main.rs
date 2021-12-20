@@ -3,11 +3,10 @@ use log::{error, info};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::time::{Instant};
+use std::time::Instant;
 use structopt::StructOpt;
 
 /// Display a bunch of photographs in a reasonable manner.
-
 mod audio;
 mod image;
 mod shared;
@@ -46,7 +45,10 @@ fn main() -> anyhow::Result<()> {
     // Check if opt.base_path is a directory that exists
     if !Path::new(&opt.base_path).is_dir() {
         error!("{:?} is not a directory", opt.base_path);
-        eprintln!("Input error: {:?} is not a directory I can read from {}", opt.base_path, cwd);
+        eprintln!(
+            "Input error: {:?} is not a directory I can read from {}",
+            opt.base_path, cwd
+        );
         pixrs_exit(exitcode::USAGE)
     }
 
@@ -55,16 +57,26 @@ fn main() -> anyhow::Result<()> {
         let idx = format!("{}/index.html", opt.out_path.display());
         if !opt.clobber && Path::new(&idx).exists() {
             error!("{:?} exists and clobber is false", idx);
-            eprintln!("Error: {:?} already exists - to overwrite it, run PixRS with the --clobber flag", idx);
+            eprintln!(
+                "Error: {:?} already exists - to overwrite it, run PixRS with the --clobber flag",
+                idx
+            );
             pixrs_exit(exitcode::CANTCREAT)
         }
     } else {
         error!("{:?} is not a directory", opt.out_path);
-        eprintln!("Input error: {:?} is not a directory I can write to from {}", opt.out_path, cwd);
+        eprintln!(
+            "Input error: {:?} is not a directory I can write to from {}",
+            opt.out_path, cwd
+        );
         pixrs_exit(exitcode::USAGE)
     }
 
-    let glob_base = format!("{}{}/*.", opt.base_path, if opt.recurse { "/**" } else { "" });
+    let glob_base = format!(
+        "{}{}/*.",
+        opt.base_path,
+        if opt.recurse { "/**" } else { "" }
+    );
 
     let audio_file_extensions = vec!["mp3", "wav"];
     let audio_files = shared::find_files(audio_file_extensions, &glob_base, pixrs_exit);
