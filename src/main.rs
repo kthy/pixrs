@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
         if opt.recurse { "/**" } else { "" }
     );
 
-    let audio_file_extensions = vec!["mp3", "wav"];
+    let audio_file_extensions = vec!["mp3", "ogg", "wav"];
     let audio_files = shared::find_files(audio_file_extensions, &glob_base, pixrs_exit);
     let len_audio_files = audio_files.len();
     info!("Found {} audio files", len_audio_files);
@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     let len_image_files = image_files.len();
     info!("Found {} image files", len_image_files);
 
-    let video_file_extensions = vec!["avi", "m4v", "mp4", "mpeg", "mpg"];
+    let video_file_extensions = vec!["avi", "m4v", "mp4", "mpeg", "mpg", "webm"];
     let video_files = shared::find_files(video_file_extensions, &glob_base, pixrs_exit);
     let len_video_files = video_files.len();
     info!("Found {} video files", len_video_files);
@@ -76,9 +76,20 @@ fn main() -> anyhow::Result<()> {
     let total_len = len_audio_files + len_image_files + len_video_files;
     let pb = ProgressBar::new(total_len as u64);
 
-    audio::process(audio_files, &pb, pixrs_exit);
-    image::process(image_files, &pb, pixrs_exit);
-    video::process(video_files, &pb, pixrs_exit);
+    let output = html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {}
+            body {
+                (audio::process(audio_files, &pb, pixrs_exit))
+                (image::process(image_files, &pb, pixrs_exit))
+                (video::process(video_files, &pb, pixrs_exit))
+            }
+        }
+    }
+    .into_string();
+    write_html(&idx, &output);
+
     pb.finish_with_message("done");
     pixrs_exit(exitcode::OK);
     Ok(())
