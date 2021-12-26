@@ -10,7 +10,7 @@ static GLOPTS: MatchOptions = MatchOptions {
 
 pub(crate) fn find_files<F>(extensions: Vec<&str>, search_path: &str, on_err: F) -> Vec<PathBuf>
 where
-    F: Fn(i32) -> (),
+    F: Fn(i32),
 {
     trace!("find_files({:?}, {:?})", extensions, search_path);
     let mut files: Vec<PathBuf> = vec![];
