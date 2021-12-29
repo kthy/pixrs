@@ -37,6 +37,10 @@ struct PixrsOpt {
     recurse: bool,
 }
 
+/// HTMX URL and SRI hash.
+static HTMX_SRI: &str = "sha384-tvG/2mnCFmGQzYC1Oh3qxQ7CkQ9kMzYjWZSNtrRZygHPDDqottzEJsqS4oUVodhW";
+static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.6.1";
+
 /// This is where the magic happens.
 fn main() {
     let now = Instant::now();
@@ -75,22 +79,43 @@ fn main() {
     let output = html! {
         (DOCTYPE)
         html lang="en" {
-            head {}
+            head {
+                meta charset="utf-8";
+                title { "PixRS output" }
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                style {
+                    "
+                    code {
+                        background-color: #ddd;
+                        border-radius: 6px;
+                        color: #222;
+                        padding: 2px 4px;
+                    }
+
+                    li { padding: 2px 0; }
+
+                    .ease-in { transition: all ease-in 1s; }
+
+                    .warning { color: red; }
+                    "
+                }
+                script src=(HTMX_URL) integrity=(HTMX_SRI) crossorigin="anonymous" {}
+
+            }
             body {
                 header {
                     (shared::html_header(&opt.base_path))
                 }
                 main {
-                    section #audio { (audio::into_html(&glob_pattern, pixrs_exit)) }
-                    section #image { (image::into_html(&glob_pattern, pixrs_exit)) }
-                    section #video { (video::into_html(&glob_pattern, pixrs_exit)) }
+                    section #audio { (audio::into_html(&opt.out_path, &glob_pattern, pixrs_exit)) }
+                    section #image { (image::into_html(&opt.out_path, &glob_pattern, pixrs_exit)) }
+                    section #video { (video::into_html(&opt.out_path, &glob_pattern, pixrs_exit)) }
                 }
             }
         }
-    }
-    .into_string();
+    };
 
-    shared::write_html(&idx, &output);
+    shared::write_html(&idx, &output.into_string());
 
     if opt.open {
         shared::open_in_browser(&idx);

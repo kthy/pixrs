@@ -4,9 +4,9 @@ use crate::shared;
 use indicatif::ProgressBar;
 use log::{debug, info, trace};
 use maud::{html, Markup};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-pub(crate) fn into_html<F>(glob_pattern: &str, on_err: F) -> Markup
+pub(crate) fn into_html<F>(_path: &Path, glob_pattern: &str, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
@@ -22,9 +22,9 @@ where
 
     for file in &files {
         debug!("Processing image: {:?}", file);
-        let path = format!("file://{}", file.display());
+        let snippet_path = format!("file://{}", file.display());
         snippets.push(html! {
-            a href=(path) { img src=(path); }
+            a href=(snippet_path) { img src=(snippet_path); }
         });
         pb.inc(1);
     }

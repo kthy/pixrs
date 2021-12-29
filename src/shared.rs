@@ -1,12 +1,22 @@
 //! The meat of the matter.
 
+use data_encoding::HEXLOWER;
 use glob::{glob_with, MatchOptions};
 use log::{debug, error, info, trace};
 use maud::{html, Markup};
+use ring::digest::{Context, SHA256};
 use std::fs::{canonicalize, create_dir_all, File};
-use std::io::prelude::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use time::{macros::format_description, OffsetDateTime};
+use uuid::Uuid;
+
+#[derive(Clone, Debug)]
+pub(crate) struct InventoryItem {
+    pub(crate) digest: String,
+    pub(crate) path: String,
+    pub(crate) uuid: Uuid,
+}
 
 /// Glob options.
 static GLOPTS: MatchOptions = MatchOptions {
@@ -55,6 +65,20 @@ where
     files
 }
 
+/// Generate HTML duplicate file warning.
+pub(crate) fn html_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
+    trace!("html_dupe({:?}, {:?})", the_real_deal, the_impostor);
+
+    html! {
+        span .warning {
+            "The file "
+            code { (the_impostor) }
+            " is a duplicate of "
+            code { (the_real_deal) }
+        }
+    }
+}
+
 /// Generate HTML header for the output.
 pub(crate) fn html_header(from_path: &str) -> Markup {
     trace!("html_header({:?})", from_path);
@@ -93,6 +117,24 @@ pub(crate) fn open_in_browser(path: &str) {
             eprintln!("Error canonicalizing path {:?}: {}", path, e);
         }
     };
+}
+
+/// Calculate the SHA256 digest of the file at `path`.
+pub(crate) fn sha256_digest(path: &Path) -> String {
+    let input = File::open(path).unwrap();
+    let mut reader = BufReader::new(input);
+    let mut context = Context::new(&SHA256);
+    let mut buffer = [0; 1024];
+
+    loop {
+        let count = reader.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+        context.update(&buffer[..count]);
+    }
+
+    HEXLOWER.encode(context.finish().as_ref())
 }
 
 /// If `path` is not an existing directory, execute the provided callback function.
