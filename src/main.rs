@@ -1,6 +1,7 @@
 //! Display a bunch of photographs in a reasonable manner.
 
-use indicatif::{HumanDuration, ProgressBar};
+use chrono::offset::Local;
+use indicatif::HumanDuration;
 use log::{debug, error, info};
 use maud::{html, DOCTYPE};
 use std::env;
@@ -52,50 +53,40 @@ fn main() -> anyhow::Result<()> {
 
     exit_if_existing_output(&cwd, &opt.out_path, &idx, opt.clobber, pixrs_exit);
 
-    let glob_base = format!(
-        "{}{}/*.",
-        opt.base_path,
-        if opt.recurse { "/**" } else { "" }
-    );
-
-    let audio_file_extensions = vec!["mp3", "ogg", "wav"];
-    let audio_files = shared::find_files(audio_file_extensions, &glob_base, pixrs_exit);
-    let len_audio_files = audio_files.len();
-    info!("Found {} audio files", len_audio_files);
-
-    let image_file_extensions = vec!["gif", "jpg", "jpeg", "png"];
-    let image_files = shared::find_files(image_file_extensions, &glob_base, pixrs_exit);
-    let len_image_files = image_files.len();
-    info!("Found {} image files", len_image_files);
-
-    let video_file_extensions = vec!["avi", "m4v", "mp4", "mpeg", "mpg", "webm"];
-    let video_files = shared::find_files(video_file_extensions, &glob_base, pixrs_exit);
-    let len_video_files = video_files.len();
-    info!("Found {} video files", len_video_files);
-
-    let total_len = len_audio_files + len_image_files + len_video_files;
-    let pb = ProgressBar::new(total_len as u64);
+    let glob_pattern = create_glob_pattern(&opt.base_path, opt.recurse);
 
     let output = html! {
         (DOCTYPE)
         html lang="en" {
             head {}
             body {
-                (audio::process(audio_files, &pb, pixrs_exit))
-                (image::process(image_files, &pb, pixrs_exit))
-                (video::process(video_files, &pb, pixrs_exit))
+                header {
+                    h1 { "PixRS" }
+                    p {
+                        "Output from "
+                        code { (opt.base_path) }
+                        " generated "
+                        (Local::now().format("%A, %e %b %Y @ %T%z"))
+                    }
+                }
+                main {
+                    section #audio { (audio::process(&glob_pattern, pixrs_exit)) }
+                    section #image { (image::process(&glob_pattern, pixrs_exit)) }
+                    section #video { (video::process(&glob_pattern, pixrs_exit)) }
+                }
             }
         }
     }
     .into_string();
+
     write_html(&idx, &output);
 
-    pb.finish_with_message("done");
     pixrs_exit(exitcode::OK);
+
     Ok(())
 }
 
-/// If path/index.html exists and clobber is not `True`, execute the provided callback function.
+/// If `path`/index.html exists and clobber is not `True`, execute the provided callback function.
 fn exit_if_existing_output<F>(cwd: &str, path: &Path, idx: &str, clobber: bool, on_err: F)
 where
     F: Fn(i32),
@@ -119,7 +110,7 @@ where
     }
 }
 
-/// If path is not an existing directory, execute the provided callback function.
+/// If `path` is not an existing directory, execute the provided callback function.
 fn exit_if_nonexisting_input<F>(cwd: &str, path: &str, on_err: F)
 where
     F: Fn(i32),
@@ -134,7 +125,12 @@ where
     }
 }
 
-/// Write html to path.
+/// Create the glob pattern.
+fn create_glob_pattern(path: &str, recurse: bool) -> String {
+    format!("{}{}/*.", path, if recurse { "/**" } else { "" })
+}
+
+/// Write `html` to `path`.
 fn write_html(path: &str, html: &str) {
     debug!("{}", html);
 

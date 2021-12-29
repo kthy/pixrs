@@ -23,6 +23,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"          # MIT OR Apache-2.0
+chrono = "0.4"          # MIT OR Apache-2.0
 env_logger = "0.9"      # MIT OR Apache-2.0
 exitcode = "1.1"        # Apache-2.0
 glob = "0.3"            # MIT OR Apache-2.0
