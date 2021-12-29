@@ -1,5 +1,5 @@
 use glob::{glob_with, MatchOptions};
-use log::{error, trace, warn};
+use log::{debug, error, info, trace};
 use std::path::PathBuf;
 
 static GLOPTS: MatchOptions = MatchOptions {
@@ -12,7 +12,8 @@ pub(crate) fn find_files<F>(extensions: Vec<&str>, glob_pattern: &str, on_err: F
 where
     F: Fn(i32),
 {
-    trace!("find_files({:?}, {:?})", extensions, glob_pattern);
+    trace!("find_files({:?}, {:?}, _)", extensions, glob_pattern);
+
     let mut files: Vec<PathBuf> = vec![];
     for extension in extensions {
         let pattern = &(glob_pattern.to_owned() + extension);
@@ -22,7 +23,7 @@ where
                 for entry in entries {
                     match entry {
                         Ok(path) => files.push(path),
-                        Err(e) => warn!("{:?}", e),
+                        Err(e) => error!("{:?}", e),
                     }
                 }
             }
