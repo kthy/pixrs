@@ -1,3 +1,5 @@
+//! Code for handling audio files.
+
 use crate::shared;
 use indicatif::ProgressBar;
 use log::{debug, info, trace};

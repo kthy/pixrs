@@ -1,3 +1,5 @@
+//! The meat of the matter.
+
 use glob::{glob_with, MatchOptions};
 use log::{debug, error, info, trace};
 use maud::{html, Markup};
@@ -6,6 +8,7 @@ use std::io::prelude::Write;
 use std::path::{Path, PathBuf};
 use time::{macros::format_description, OffsetDateTime};
 
+/// Glob options.
 static GLOPTS: MatchOptions = MatchOptions {
     case_sensitive: false,
     require_literal_separator: true,

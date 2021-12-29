@@ -1,3 +1,5 @@
+//! Code for handling image files.
+
 use crate::shared;
 use indicatif::ProgressBar;
 use log::{debug, info, trace};

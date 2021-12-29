@@ -14,6 +14,7 @@ mod image;
 mod shared;
 mod video;
 
+/// Command-line options.
 #[derive(Debug, StructOpt)]
 struct PixrsOpt {
     /// The base path to search
