@@ -6,7 +6,7 @@ use log::{debug, info, trace};
 use maud::{html, Markup};
 use std::path::PathBuf;
 
-pub(crate) fn process<F>(glob_pattern: &str, on_err: F) -> Markup
+pub(crate) fn into_html<F>(glob_pattern: &str, on_err: F) -> Markup
 where
     F: Fn(i32),
 {

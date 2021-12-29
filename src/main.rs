@@ -81,9 +81,9 @@ fn main() {
                     (shared::html_header(&opt.base_path))
                 }
                 main {
-                    section #audio { (audio::process(&glob_pattern, pixrs_exit)) }
-                    section #image { (image::process(&glob_pattern, pixrs_exit)) }
-                    section #video { (video::process(&glob_pattern, pixrs_exit)) }
+                    section #audio { (audio::into_html(&glob_pattern, pixrs_exit)) }
+                    section #image { (image::into_html(&glob_pattern, pixrs_exit)) }
+                    section #video { (video::into_html(&glob_pattern, pixrs_exit)) }
                 }
             }
         }
