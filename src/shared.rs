@@ -8,14 +8,14 @@ static GLOPTS: MatchOptions = MatchOptions {
     require_literal_leading_dot: false,
 };
 
-pub(crate) fn find_files<F>(extensions: Vec<&str>, search_path: &str, on_err: F) -> Vec<PathBuf>
+pub(crate) fn find_files<F>(extensions: Vec<&str>, glob_pattern: &str, on_err: F) -> Vec<PathBuf>
 where
     F: Fn(i32),
 {
-    trace!("find_files({:?}, {:?})", extensions, search_path);
+    trace!("find_files({:?}, {:?})", extensions, glob_pattern);
     let mut files: Vec<PathBuf> = vec![];
     for extension in extensions {
-        let pattern = &(search_path.to_owned() + extension);
+        let pattern = &(glob_pattern.to_owned() + extension);
         let entries = glob_with(pattern, GLOPTS);
         match entries {
             Ok(entries) => {
@@ -30,7 +30,7 @@ where
                 error!("{:?} (pattern was {:?})", e, pattern);
                 eprintln!(
                     "Input error: {:?} is not a valid pattern ({})",
-                    search_path, e.msg
+                    glob_pattern, e.msg
                 );
                 on_err(exitcode::USAGE)
             }
