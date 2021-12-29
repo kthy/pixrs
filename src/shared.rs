@@ -57,6 +57,8 @@ where
 
 /// Generate HTML header for the output.
 pub(crate) fn html_header(from_path: &str) -> Markup {
+    trace!("html_header({:?})", from_path);
+
     let dt = OffsetDateTime::now_local().unwrap_or_else(|e| {
         error!("Unable to get local time (defaulting to UTC): {:?}", e);
         OffsetDateTime::now_utc()
