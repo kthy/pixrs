@@ -1,21 +1,36 @@
+use crate::shared;
 use indicatif::ProgressBar;
-use log::trace;
+use log::{info, trace};
 use maud::{html, Markup};
 use std::path::PathBuf;
 
-pub(crate) fn process<F>(files: Vec<PathBuf>, pb: &ProgressBar, _on_err: F) -> Markup
+pub(crate) fn process<F>(glob_pattern: &str, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
+    let mut snippets: Vec<Markup> = vec![];
+
+    let file_extensions = vec!["avi", "m4v", "mp4", "mpeg", "mpg", "webm"];
+    let files: Vec<PathBuf> = shared::find_files(file_extensions, glob_pattern, on_err);
+    let num_files = files.len();
+    info!("Found {} video files", num_files);
+    let pb = ProgressBar::new(num_files as u64);
+
     for file in &files {
-        trace!("Processing video: {:?}", file);
+        trace!("Processing image: {:?}", file);
+        let path = format!("file://{}", file.display());
+        snippets.push(html! {
+            a href=(path) { img src=(path); }
+        });
         pb.inc(1);
     }
 
+    pb.finish_with_message("done");
+
     html! {
         ul {
-            @for file in &files {
-                li { (file.display()) }
+            @for snippet in snippets {
+                li { (snippet) }
             }
         }
     }

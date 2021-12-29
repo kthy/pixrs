@@ -1,14 +1,22 @@
+use crate::shared;
 use indicatif::ProgressBar;
-use log::trace;
+use log::{info, trace};
 use maud::{html, Markup};
 use std::path::PathBuf;
 
-pub(crate) fn process<F>(files: Vec<PathBuf>, pb: &ProgressBar, _on_err: F) -> Markup
+pub(crate) fn process<F>(glob_pattern: &str, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
     let mut snippets: Vec<Markup> = vec![];
-    for file in &files {
+
+    let file_extensions = vec!["mp3", "ogg", "wav"];
+    let files: Vec<PathBuf> = shared::find_files(file_extensions, glob_pattern, on_err);
+    let num_files = files.len();
+    info!("Found {} audio files", num_files);
+    let pb = ProgressBar::new(num_files as u64);
+
+    for file in files {
         trace!("Processing audio: {:?}", file);
         let path = format!("file://{}", file.display());
         snippets.push(html! {
@@ -23,6 +31,8 @@ where
         });
         pb.inc(1);
     }
+
+    pb.finish_with_message("done");
 
     html! {
         ul {
