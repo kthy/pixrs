@@ -12,10 +12,10 @@ use time::{macros::format_description, OffsetDateTime};
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
-pub(crate) struct InventoryItem {
-    pub(crate) digest: String,
-    pub(crate) path: String,
-    pub(crate) uuid: Uuid,
+pub struct InventoryItem {
+    pub digest: String,
+    pub path: String,
+    pub uuid: Uuid,
 }
 
 /// Glob options.
@@ -26,14 +26,26 @@ static GLOPTS: MatchOptions = MatchOptions {
 };
 
 /// Create a glob pattern.
-pub(crate) fn create_glob_pattern(path: &str, recurse: bool) -> String {
+///
+/// ```
+/// let pat = pixrs::create_glob_pattern("foo", false);
+/// assert_eq!(pat, "foo/*.");
+/// ```
+///
+/// If `recurse` is true, the pattern will include subdirs.
+///
+/// ```
+/// let pat = pixrs::create_glob_pattern("foo", true);
+/// assert_eq!(pat, "foo/**/*.");
+/// ```
+pub fn create_glob_pattern(path: &str, recurse: bool) -> String {
     trace!("create_glob_pattern({:?}, {:?})", path, recurse);
 
     format!("{}{}/*.", path, if recurse { "/**" } else { "" })
 }
 
 /// Return a list of files with the given `extensions` in a directory given by `glob_pattern`.
-pub(crate) fn find_files<F>(extensions: Vec<&str>, glob_pattern: &str, on_err: F) -> Vec<PathBuf>
+pub fn find_files<F>(extensions: Vec<&str>, glob_pattern: &str, on_err: F) -> Vec<PathBuf>
 where
     F: Fn(i32),
 {
@@ -66,7 +78,7 @@ where
 }
 
 /// Generate HTML duplicate file warning.
-pub(crate) fn html_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
+pub fn html_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
     trace!("html_dupe({:?}, {:?})", the_real_deal, the_impostor);
 
     html! {
@@ -80,7 +92,7 @@ pub(crate) fn html_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
 }
 
 /// Generate HTML header for the output.
-pub(crate) fn html_header(from_path: &str) -> Markup {
+pub fn html_header(from_path: &str) -> Markup {
     trace!("html_header({:?})", from_path);
 
     let dt = OffsetDateTime::now_local().unwrap_or_else(|e| {
@@ -99,7 +111,7 @@ pub(crate) fn html_header(from_path: &str) -> Markup {
 }
 
 /// Open a file in the default browser.
-pub(crate) fn open_in_browser(path: &str) {
+pub fn open_in_browser(path: &str) {
     trace!("open_in_browser({:?})", path);
 
     let canonical_path = canonicalize(path);
@@ -120,7 +132,7 @@ pub(crate) fn open_in_browser(path: &str) {
 }
 
 /// Calculate the SHA256 digest of the file at `path`.
-pub(crate) fn sha256_digest(path: &Path) -> String {
+pub fn sha256_digest(path: &Path) -> String {
     let input = File::open(path).unwrap();
     let mut reader = BufReader::new(input);
     let mut context = Context::new(&SHA256);
@@ -138,7 +150,7 @@ pub(crate) fn sha256_digest(path: &Path) -> String {
 }
 
 /// If `path` is not an existing directory, execute the provided callback function.
-pub(crate) fn validate_input<F>(cwd: &str, path: &str, on_err: F)
+pub fn validate_input<F>(cwd: &str, path: &str, on_err: F)
 where
     F: Fn(i32),
 {
@@ -156,7 +168,7 @@ where
 
 /// If `path`/index.html exists and `clobber` is not `True`, execute the provided callback
 /// function. If `path` does not exist and `create_dir` is `True`, create it.
-pub(crate) fn validate_output<F>(
+pub fn validate_output<F>(
     cwd: &str,
     path: &Path,
     idx: &str,
@@ -196,7 +208,7 @@ pub(crate) fn validate_output<F>(
 }
 
 /// Write `html` to `path`.
-pub(crate) fn write_html(path: &str, html: &str) {
+pub fn write_html(path: &str, html: &str) {
     trace!("write_html({:?}, {:?})", path, html);
 
     let mut out_file = match File::create(&path) {

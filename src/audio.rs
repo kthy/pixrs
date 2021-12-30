@@ -1,9 +1,9 @@
 //! Code for handling audio files.
 
-use crate::shared::{find_files, html_dupe, sha256_digest, InventoryItem};
 use indicatif::ProgressBar;
 use log::{debug, info, trace};
 use maud::{html, Markup, PreEscaped};
+use pixrs::{find_files, html_dupe, sha256_digest, InventoryItem};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::io::Write;

@@ -11,7 +11,6 @@ use structopt::StructOpt;
 
 mod audio;
 mod image;
-mod shared;
 mod video;
 
 /// Command-line options.
@@ -37,8 +36,9 @@ struct PixrsOpt {
     recurse: bool,
 }
 
-/// HTMX URL and SRI hash.
+/// HTMX SRI hash.
 static HTMX_SRI: &str = "sha384-tvG/2mnCFmGQzYC1Oh3qxQ7CkQ9kMzYjWZSNtrRZygHPDDqottzEJsqS4oUVodhW";
+/// HTMX unpkg URL.
 static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.6.1";
 
 /// This is where the magic happens.
@@ -63,9 +63,9 @@ fn main() {
         exit(code)
     };
 
-    shared::validate_input(&cwd, &opt.base_path, pixrs_exit);
+    pixrs::validate_input(&cwd, &opt.base_path, pixrs_exit);
 
-    shared::validate_output(
+    pixrs::validate_output(
         &cwd,
         &opt.out_path,
         &idx,
@@ -74,7 +74,7 @@ fn main() {
         pixrs_exit,
     );
 
-    let glob_pattern = shared::create_glob_pattern(&opt.base_path, opt.recurse);
+    let glob_pattern = pixrs::create_glob_pattern(&opt.base_path, opt.recurse);
 
     let output = html! {
         (DOCTYPE)
@@ -104,7 +104,7 @@ fn main() {
             }
             body {
                 header {
-                    (shared::html_header(&opt.base_path))
+                    (pixrs::html_header(&opt.base_path))
                 }
                 main {
                     section #audio { (audio::into_html(&opt.out_path, &glob_pattern, pixrs_exit)) }
@@ -115,10 +115,10 @@ fn main() {
         }
     };
 
-    shared::write_html(&idx, &output.into_string());
+    pixrs::write_html(&idx, &output.into_string());
 
     if opt.open {
-        shared::open_in_browser(&idx);
+        pixrs::open_in_browser(&idx);
     }
 
     pixrs_exit(exitcode::OK);

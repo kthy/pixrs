@@ -1,9 +1,9 @@
 //! Code for handling image files.
 
-use crate::shared;
 use indicatif::ProgressBar;
 use log::{debug, info, trace};
 use maud::{html, Markup};
+use pixrs;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn into_html<F>(_path: &Path, glob_pattern: &str, on_err: F) -> Markup
@@ -15,7 +15,7 @@ where
     let mut snippets: Vec<Markup> = vec![];
 
     let file_extensions = vec!["gif", "jpg", "jpeg", "png"];
-    let files: Vec<PathBuf> = shared::find_files(file_extensions, glob_pattern, on_err);
+    let files: Vec<PathBuf> = pixrs::find_files(file_extensions, glob_pattern, on_err);
     let num_files = files.len();
     info!("Found {} image files", num_files);
     let pb = ProgressBar::new(num_files as u64);
