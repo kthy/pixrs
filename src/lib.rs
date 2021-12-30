@@ -78,6 +78,11 @@ where
 }
 
 /// Generate HTML duplicate file warning.
+///
+/// ```
+/// let html = pixrs::html_dupe("foo", "bar").into_string();
+/// assert!(html.contains("foo") && html.contains("bar"));
+/// ```
 pub fn html_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
     trace!("html_dupe({:?}, {:?})", the_real_deal, the_impostor);
 
