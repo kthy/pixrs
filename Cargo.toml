@@ -22,6 +22,7 @@ categories = [
 publish = false
 
 [dependencies]
+ctrlc = { version = "3.2", features = ["termination"] }                         # MIT OR Apache-2.0
 data-encoding = "2.3"                                                           # MIT
 env_logger = "0.9"                                                              # MIT OR Apache-2.0
 exitcode = "1.1"                                                                # Apache-2.0
@@ -32,6 +33,7 @@ log = "0.4"                                                                     
 maud = "0.23"                                                                   # MIT OR Apache-2.0
 open = "2.0"                                                                    # MIT
 ring = "0.16"                                                                   # ISC-ish
+rouille = "3.5"                                                                 # MIT OR Apache-2.0
 structopt = "0.3"                                                               # MIT OR Apache-2.0
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] } # MIT OR Apache-2.0
 uuid = { version = "0.8", features = ["v4"] }                                   # MIT OR Apache-2.0

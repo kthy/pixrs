@@ -1,8 +1,9 @@
 //! Present a bunch of media files in a reasonable manner.
 
 use indicatif::HumanDuration;
-use log::info;
+use log::{error, info};
 use maud::{html, DOCTYPE};
+use rouille::{match_assets, router, start_server, Response};
 use std::env;
 use std::path::PathBuf;
 use std::process::exit;
@@ -45,6 +46,12 @@ static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.6.1";
 fn main() {
     let now = Instant::now();
     let opt = PixrsOpt::from_args();
+
+    ctrlc::set_handler(move || {
+        println!("Ctrl-C received, stopping.");
+        exit(exitcode::OK);
+    }).expect("Error setting Ctrl-C handler");
+
     let cwd = format!(
         "{}",
         env::current_dir()
@@ -59,7 +66,7 @@ fn main() {
 
     // Callback to stop the timer and exit with the given code.
     let pixrs_exit = |code| {
-        info!("Execution finished in {}", HumanDuration(now.elapsed()));
+        info!("Execution interrupted after {}", HumanDuration(now.elapsed()));
         exit(code)
     };
 
@@ -117,9 +124,25 @@ fn main() {
 
     pixrs::write_html(&idx, &output.into_string());
 
+    info!("HTML generator finished in {}", HumanDuration(now.elapsed()));
+
+    let url = "http://localhost:2635/index.html";
     if opt.open {
-        pixrs::open_in_browser(&idx);
+        // pixrs::open_in_browser(&idx);
+        open::that(url).unwrap_or_else(|e| {
+            error!("{:?}", e);
+            eprintln!("Error opening output: {}", e);
+        });
     }
 
-    pixrs_exit(exitcode::OK);
+    println!("\nNow serving your media files at {}", url);
+    println!("Press Ctrl-C in this window to stop serving.");
+
+    start_server("localhost:2635", move |req| {
+        // TODO: add No-Cache header
+        router!(req,
+            (GET) (/) => { Response::redirect_303("/index.html") },
+            _ => match_assets(&req, &opt.out_path),
+        )
+    });
 }
