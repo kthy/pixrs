@@ -149,7 +149,9 @@ fn main() {
         // TODO: add No-Cache header
         router!(req,
             (GET) (/) => { Response::redirect_303("/index.html") },
-            _ => match_assets(req, &opt.out_path),
+            _ => {
+                match_assets(req, &opt.out_path).with_unique_header("Cache-Control", "no-store")
+            },
         )
     });
 }
