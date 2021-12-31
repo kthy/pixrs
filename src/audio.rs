@@ -34,6 +34,8 @@ where
 
         // Calculate file digest and check if we've seen it before
         let digest = sha256_digest(&file);
+
+        #[allow(clippy::map_entry)]
         if !map_digest_to_item.contains_key(&digest) {
             // Insert new inventory item
             let uuid = Uuid::new_v4();

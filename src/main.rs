@@ -50,7 +50,8 @@ fn main() {
     ctrlc::set_handler(move || {
         println!("Ctrl-C received, stopping.");
         exit(exitcode::OK);
-    }).expect("Error setting Ctrl-C handler");
+    })
+    .expect("Error setting Ctrl-C handler");
 
     let cwd = format!(
         "{}",
@@ -66,7 +67,10 @@ fn main() {
 
     // Callback to stop the timer and exit with the given code.
     let pixrs_exit = |code| {
-        info!("Execution interrupted after {}", HumanDuration(now.elapsed()));
+        info!(
+            "Execution interrupted after {}",
+            HumanDuration(now.elapsed())
+        );
         exit(code)
     };
 
@@ -124,7 +128,10 @@ fn main() {
 
     pixrs::write_html(&idx, &output.into_string());
 
-    info!("HTML generator finished in {}", HumanDuration(now.elapsed()));
+    info!(
+        "HTML generator finished in {}",
+        HumanDuration(now.elapsed())
+    );
 
     let url = "http://localhost:2635/index.html";
     if opt.open {
@@ -142,7 +149,7 @@ fn main() {
         // TODO: add No-Cache header
         router!(req,
             (GET) (/) => { Response::redirect_303("/index.html") },
-            _ => match_assets(&req, &opt.out_path),
+            _ => match_assets(req, &opt.out_path),
         )
     });
 }

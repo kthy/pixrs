@@ -3,7 +3,6 @@
 use indicatif::ProgressBar;
 use log::{debug, info, trace};
 use maud::{html, Markup};
-use pixrs;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn into_html<F>(_path: &Path, glob_pattern: &str, on_err: F) -> Markup
