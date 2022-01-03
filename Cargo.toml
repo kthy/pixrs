@@ -7,16 +7,17 @@ description = "A command-line program to present a bunch of media files in a rea
 repository = "https://github.com/pyxy-dk/pixrs/"
 license = "AGPL-3.0-or-later"
 keywords = [
-    "exif",
+    "audio",
     "gallery",
+    "image",
     "photo",
-    "picture",
+    "video",
 ]
 categories = [
     "command-line-utilities",
+    "multimedia::audio",
     "multimedia::images",
     "multimedia::video",
-    "template-engine",
     "visualization",
 ]
 publish = false
@@ -27,8 +28,9 @@ data-encoding = "2.3"                                                           
 env_logger = "0.9"                                                              # MIT OR Apache-2.0
 exitcode = "1.1"                                                                # Apache-2.0
 glob = "0.3"                                                                    # MIT OR Apache-2.0
+# id3 = "0.6"                                                                     # MIT
 indicatif = "0.16"                                                              # MIT
-kamadak-exif = "0.5.4"                                                          # BSD-2-Clause
+# kamadak-exif = "0.5.4"                                                          # BSD-2-Clause
 log = "0.4"                                                                     # MIT OR Apache-2.0
 maud = "0.23"                                                                   # MIT OR Apache-2.0
 open = "2.0"                                                                    # MIT

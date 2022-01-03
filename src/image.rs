@@ -1,5 +1,10 @@
 //! Code for handling image files.
 
+/*************************************************************************************************
+ * Copyright © 2022 Kristian Thy (<k@pyxy.dk>)                                                   *
+ * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
+ *************************************************************************************************/
+
 use indicatif::ProgressBar;
 use log::{debug, info, trace};
 use maud::{html, Markup};
@@ -14,7 +19,7 @@ where
     let mut snippets: Vec<Markup> = vec![];
 
     let file_extensions = vec!["gif", "jpg", "jpeg", "png"];
-    let files: Vec<PathBuf> = pixrs::find_files(file_extensions, glob_pattern, on_err);
+    let files: Vec<PathBuf> = crate::find_files(file_extensions, glob_pattern, on_err);
     let num_files = files.len();
     info!("Found {} image files", num_files);
     let pb = ProgressBar::new(num_files as u64);

@@ -1,29 +1,40 @@
 //! The meat of the matter.
 
+/*************************************************************************************************
+ * Copyright © 2022 Kristian Thy (<k@pyxy.dk>)                                                   *
+ *                                                                                               *
+ * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
+ *                                                                                               *
+ * This program is free software: you can redistribute it and/or modify                          *
+ * it under the terms of the GNU Affero General Public License as                                *
+ * published by the Free Software Foundation, either version 3 of the                            *
+ * License, or (at your option) any later version.                                               *
+ *                                                                                               *
+ * This program is distributed in the hope that it will be useful,                               *
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of                                *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the                                  *
+ * GNU Affero General Public License for more details.                                           *
+ *                                                                                               *
+ * You should have received a copy of the GNU Affero General Public License                      *
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.                         *
+ *************************************************************************************************/
+
+use crate::structs::PixrsOpt;
 use data_encoding::HEXLOWER;
-use glob::{glob_with, MatchOptions};
-use log::{debug, error, info, trace};
-use maud::{html, Markup};
+use glob::glob_with;
+use log::{error, info, trace};
+use maud::{html, Markup, DOCTYPE};
 use ring::digest::{Context, SHA256};
-use std::fs::{canonicalize, create_dir_all, File};
+use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use time::{macros::format_description, OffsetDateTime};
-use uuid::Uuid;
 
-#[derive(Clone, Debug)]
-pub struct InventoryItem {
-    pub digest: String,
-    pub path: String,
-    pub uuid: Uuid,
-}
-
-/// Glob options.
-static GLOPTS: MatchOptions = MatchOptions {
-    case_sensitive: false,
-    require_literal_separator: true,
-    require_literal_leading_dot: false,
-};
+mod audio;
+mod image;
+pub mod statics;
+pub mod structs;
+mod video;
 
 /// Create a glob pattern.
 ///
@@ -54,7 +65,7 @@ where
     let mut files: Vec<PathBuf> = vec![];
     for extension in extensions {
         let pattern = &(glob_pattern.to_owned() + extension);
-        let entries = glob_with(pattern, GLOPTS);
+        let entries = glob_with(pattern, statics::GLOPTS);
         match entries {
             Ok(entries) => {
                 for entry in entries {
@@ -82,6 +93,9 @@ where
 /// ```
 /// let html = pixrs::html_dupe("foo", "bar").into_string();
 /// assert!(html.contains("foo") && html.contains("bar"));
+/// assert_eq!(html, "\
+///     <span class=\"warning\">The file <code>bar</code> \
+///     is a duplicate of <code>foo</code></span>");
 /// ```
 pub fn html_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
     trace!("html_dupe({:?}, {:?})", the_real_deal, the_impostor);
@@ -115,25 +129,53 @@ pub fn html_header(from_path: &str) -> Markup {
     )
 }
 
-/// Open a file in the default browser.
-pub fn open_in_browser(path: &str) {
-    trace!("open_in_browser({:?})", path);
+/// Generate HTML index page.
+pub fn html_index<F>(opt: &PixrsOpt, on_err: F) -> Markup
+where
+    F: Fn(i32),
+{
+    let glob_pattern = create_glob_pattern(&opt.base_path, opt.recurse);
 
-    let canonical_path = canonicalize(path);
-    match canonical_path {
-        Ok(cpath) => {
-            let file_url = format!("file:///{}", cpath.display());
-            debug!("Opening {:?}", file_url);
-            open::that(file_url).unwrap_or_else(|e| {
-                error!("{:?}", e);
-                eprintln!("Error opening output: {}", e);
-            });
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                title { "PixRS output" }
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                style {
+                    "
+                    code {
+                        background-color: #ddd;
+                        border-radius: 6px;
+                        color: #222;
+                        padding: 2px 4px;
+                    }
+
+                    li { padding: 2px 0; }
+
+                    .clickable { cursor: pointer; }
+
+                    .ease-in { transition: all ease-in 3s; } /* FIXME */
+
+                    .warning { color: red; }
+                    "
+                }
+                script src=(statics::HTMX_URL) integrity=(statics::HTMX_SRI) crossorigin="anonymous" {}
+
+            }
+            body {
+                header {
+                    (html_header(&opt.base_path))
+                }
+                main {
+                    section #audio { (audio::into_html(&opt.out_path, &glob_pattern, &on_err)) }
+                    section #image { (image::into_html(&opt.out_path, &glob_pattern, &on_err)) }
+                    section #video { (video::into_html(&opt.out_path, &glob_pattern, &on_err)) }
+                }
+            }
         }
-        Err(e) => {
-            error!("{:?}", e);
-            eprintln!("Error canonicalizing path {:?}: {}", path, e);
-        }
-    };
+    }
 }
 
 /// Calculate the SHA256 digest of the file at `path`.
@@ -213,15 +255,20 @@ pub fn validate_output<F>(
 }
 
 /// Write `html` to `path`.
-pub fn write_html(path: &str, html: &str) {
-    trace!("write_html({:?}, {:?})", path, html);
+pub fn write_html<F>(opt: &PixrsOpt, path: &str, on_err: F)
+where
+    F: Fn(i32),
+{
+    trace!("write_html({:?}, {:?})", &opt, &path);
+
+    let index_html = html_index(&opt, on_err);
 
     let mut out_file = match File::create(&path) {
         Err(why) => panic!("Couldn't create {}: {}", path, why),
         Ok(file) => file,
     };
 
-    match out_file.write_all(html.as_bytes()) {
+    match out_file.write_all(index_html.into_string().as_bytes()) {
         Err(why) => panic!("Couldn't write to {}: {}", path, why),
         Ok(_) => info!("Successfully wrote to {}", path),
     }

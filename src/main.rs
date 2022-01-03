@@ -1,58 +1,53 @@
 //! Present a bunch of media files in a reasonable manner.
 
+/*************************************************************************************************
+ * Copyright © 2022 Kristian Thy (<k@pyxy.dk>)                                                   *
+ *                                                                                               *
+ * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
+ *                                                                                               *
+ * This program is free software: you can redistribute it and/or modify                          *
+ * it under the terms of the GNU Affero General Public License as                                *
+ * published by the Free Software Foundation, either version 3 of the                            *
+ * License, or (at your option) any later version.                                               *
+ *                                                                                               *
+ * This program is distributed in the hope that it will be useful,                               *
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of                                *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the                                  *
+ * GNU Affero General Public License for more details.                                           *
+ *                                                                                               *
+ * You should have received a copy of the GNU Affero General Public License                      *
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.                         *
+ *************************************************************************************************/
+
 use indicatif::HumanDuration;
 use log::{error, info};
-use maud::{html, DOCTYPE};
+use pixrs::statics::{PROTOCOL, SERVER_URL};
+use pixrs::structs::PixrsOpt;
 use rouille::{match_assets, router, start_server, Response};
 use std::env;
-use std::path::PathBuf;
 use std::process::exit;
 use std::time::Instant;
 use structopt::StructOpt;
 
-mod audio;
-mod image;
-mod video;
-
-/// Command-line options.
-#[derive(Debug, StructOpt)]
-struct PixrsOpt {
-    /// The base path to search
-    #[structopt()]
-    base_path: String,
-    /// Clobber output file if it exists
-    #[structopt(short, long)]
-    clobber: bool,
-    /// Create output directory if it does not exist
-    #[structopt(short = "d", long = "create-dir")]
-    create_output_dir: bool,
-    /// Open output in default browser when finished
-    #[structopt(short, long)]
-    open: bool,
-    /// The path where the output is placed
-    #[structopt(parse(from_os_str))]
-    out_path: PathBuf,
-    /// Recurse into subdirs below the base path
-    #[structopt(short, long)]
-    recurse: bool,
-}
-
-/// HTMX SRI hash.
-static HTMX_SRI: &str = "sha384-tvG/2mnCFmGQzYC1Oh3qxQ7CkQ9kMzYjWZSNtrRZygHPDDqottzEJsqS4oUVodhW";
-/// HTMX unpkg URL.
-static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.6.1";
-
 /// This is where the magic happens.
 fn main() {
+    // Start the timer
     let now = Instant::now();
-    let opt = PixrsOpt::from_args();
 
+    // Initialize logger from RUST_LOG environment variable
+    env_logger::init();
+
+    // Set Ctrl-C handler
     ctrlc::set_handler(move || {
         println!("Ctrl-C received, stopping.");
         exit(exitcode::OK);
     })
     .expect("Error setting Ctrl-C handler");
 
+    // Load command line arguments
+    let opt = PixrsOpt::from_args();
+
+    // Infer current working directory
     let cwd = format!(
         "{}",
         env::current_dir()
@@ -60,10 +55,9 @@ fn main() {
             .as_path()
             .display()
     );
-    let idx = format!("{}/index.html", opt.out_path.display());
 
-    env_logger::init();
-    info!("Executing: {:?}", opt);
+    // Construct path to index page
+    let idx = format!("{}/index.html", opt.out_path.display());
 
     // Callback to stop the timer and exit with the given code.
     let pixrs_exit = |code| {
@@ -73,6 +67,9 @@ fn main() {
         );
         exit(code)
     };
+
+    // Initial skirmish ends, now engage the enemy's main force!
+    info!("Executing: {:?}", opt);
 
     pixrs::validate_input(&cwd, &opt.base_path, pixrs_exit);
 
@@ -85,73 +82,41 @@ fn main() {
         pixrs_exit,
     );
 
-    let glob_pattern = pixrs::create_glob_pattern(&opt.base_path, opt.recurse);
+    pixrs::write_html(&opt, &idx, pixrs_exit);
 
-    let output = html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                title { "PixRS output" }
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                style {
-                    "
-                    code {
-                        background-color: #ddd;
-                        border-radius: 6px;
-                        color: #222;
-                        padding: 2px 4px;
-                    }
+    info!("HTML generation finished in {}", HumanDuration(now.elapsed()));
 
-                    li { padding: 2px 0; }
+    let url = format!("{}/index.html", SERVER_URL);
+    open_in_browser(opt.open, &url);
+    serve(String::from(opt.base_path), opt.out_path.display().to_string(), url);
+}
 
-                    .ease-in { transition: all ease-in 1s; }
-
-                    .warning { color: red; }
-                    "
-                }
-                script src=(HTMX_URL) integrity=(HTMX_SRI) crossorigin="anonymous" {}
-
-            }
-            body {
-                header {
-                    (pixrs::html_header(&opt.base_path))
-                }
-                main {
-                    section #audio { (audio::into_html(&opt.out_path, &glob_pattern, pixrs_exit)) }
-                    section #image { (image::into_html(&opt.out_path, &glob_pattern, pixrs_exit)) }
-                    section #video { (video::into_html(&opt.out_path, &glob_pattern, pixrs_exit)) }
-                }
-            }
-        }
-    };
-
-    pixrs::write_html(&idx, &output.into_string());
-
-    info!(
-        "HTML generator finished in {}",
-        HumanDuration(now.elapsed())
-    );
-
-    let url = "http://localhost:2635/index.html";
-    if opt.open {
-        // pixrs::open_in_browser(&idx);
-        open::that(url).unwrap_or_else(|e| {
+fn open_in_browser(should_open: bool, url: &str) {
+    if should_open {
+        open::that(&url).unwrap_or_else(|e| {
             error!("{:?}", e);
             eprintln!("Error opening output: {}", e);
         });
     }
+}
 
-    println!("\nNow serving your media files at {}", url);
+fn serve(base_path: String, out_path: String, url: String) -> Response {
+    println!("\nNow serving your media files at {}", &url);
     println!("Press Ctrl-C in this window to stop serving.");
-
-    start_server("localhost:2635", move |req| {
-        // TODO: add No-Cache header
-        router!(req,
-            (GET) (/) => { Response::redirect_303("/index.html") },
-            _ => {
-                match_assets(req, &opt.out_path).with_unique_header("Cache-Control", "no-store")
-            },
-        )
-    });
+    start_server(
+        SERVER_URL
+            .strip_prefix(&PROTOCOL)
+            .expect(&format!("Expected SERVER_URL to start with '{}'", &PROTOCOL)),
+        move |req| {
+            router!(req,
+                (GET) (/) => { Response::redirect_303("/index.html") },
+                _ => {
+                    if let Some(req) = req.remove_prefix("/local") {
+                        return match_assets(&req, &base_path);
+                    }
+                    match_assets(req, &out_path).with_unique_header("Cache-Control", "no-store")
+                },
+            )
+        },
+    );
 }
