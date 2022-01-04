@@ -178,6 +178,9 @@ where
 mod tests {
     use super::*;
 
+    use pretty_assertions::assert_eq;
+    use tempfile::NamedTempFile;
+
     #[test]
     fn test_create_glob_pattern() {
         let mut expected = "foo/*.";
@@ -207,8 +210,11 @@ mod tests {
 
     #[test]
     fn test_sha256_digest() {
-        let expected = "eca7cbb9efee543f0b9612a53838518c215d48d9062b62eeb84cbac23fb6ad32";
-        let actual = sha256_digest(Path::new("tests/files/audio/dupes/impostor.mp3"));
+        let expected = "dbd318c1c462aee872f41109a4dfd3048871a03dedd0fe0e757ced57dad6f2d7";
+        let mut temp_file = NamedTempFile::new().expect("Couldn't create temp file!");
+        write!(temp_file, "foo bar baz").expect("Couldn't write test file!");
+        let actual = sha256_digest(&temp_file.path());
+        let _ = temp_file.close();
         assert_eq!(actual, expected);
     }
 }

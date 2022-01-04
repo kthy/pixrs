@@ -1,3 +1,6 @@
+#[cfg(test)]
+use pretty_assertions::assert_eq;
+
 #[test]
 fn canary_in_the_coalmine() {
     assert_eq!(2 + 2, 4);

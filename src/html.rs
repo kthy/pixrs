@@ -15,6 +15,7 @@ use time::{macros::format_description, OffsetDateTime};
 /// Generate HTML duplicate file warning markup.
 ///
 /// ```
+/// use pretty_assertions::assert_eq;
 /// let html = pixrs::html::html_index_dupe("foo", "bar").into_string();
 /// assert_eq!(html, "<span class=\"dupe\">\
 ///                       The file \

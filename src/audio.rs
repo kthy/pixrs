@@ -137,6 +137,7 @@ fn html_for_index(inv_item: &InventoryItem) -> Markup {
 /// Make a `/local/` URL path out of the `InventoryItem`'s path.
 ///
 /// ```
+/// use pretty_assertions::assert_eq;
 /// let expected = "/local/audio/Birk%20CTG.mp3";
 /// let p = std::path::Path::new(".\\tests\\files\\audio\\Birk CTG.mp3");
 /// let g = ".\\tests\\files\\**/*.mp3";
@@ -145,10 +146,10 @@ fn html_for_index(inv_item: &InventoryItem) -> Markup {
 /// ```
 pub fn make_path_local(path: &Path, glob_pattern: &str) -> String {
     trace!("make_path_local({:?}, {:?})", path, glob_pattern);
-    let fwd_pattern = glob_pattern.replace("\\", "/");
+    let fwd_pattern = glob_pattern.replace('\\', "/");
     let pattern_graphemes = fwd_pattern.graphemes(true).collect::<Vec<&str>>();
     let wildcard_position = pattern_graphemes.iter().position(|x| *x == "*").unwrap();
-    let fwd_path = path.display().to_string().replace("\\", "/");
+    let fwd_path = path.display().to_string().replace('\\', "/");
     let path_graphemes = fwd_path.graphemes(true).collect::<Vec<&str>>();
     let final_path = path_graphemes[wildcard_position..].concat();
     format!(
