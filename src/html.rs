@@ -103,9 +103,9 @@ where
     trace!("html_index_main({:?}, {:?}, _)", out_path, glob_pattern);
 
     html!(
-        section #audio { (crate::audio::into_html(out_path, &glob_pattern, &on_err)) }
-        section #image { (crate::image::into_html(out_path, &glob_pattern, &on_err)) }
-        section #video { (crate::video::into_html(out_path, &glob_pattern, &on_err)) }
+        section #audio { (crate::audio::into_html(out_path, glob_pattern, &on_err)) }
+        section #image { (crate::image::into_html(out_path, glob_pattern, &on_err)) }
+        section #video { (crate::video::into_html(out_path, glob_pattern, &on_err)) }
     )
 }
 

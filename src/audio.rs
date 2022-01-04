@@ -57,7 +57,7 @@ where
         #[allow(clippy::map_entry)]
         if !map_digest_to_item.contains_key(&digest) {
             // Insert new inventory item
-            let (inv_item, uuid) = create_inventory_item(&digest, &file, &glob_pattern);
+            let (inv_item, uuid) = create_inventory_item(&digest, &file, glob_pattern);
             map_digest_to_item.insert(digest, inv_item.clone());
             map_uuid_to_item.insert(uuid, inv_item.clone());
 
@@ -97,9 +97,9 @@ fn create_inventory_item(digest: &str, path: &Path, glob_pattern: &str) -> (Inve
     let uuid = Uuid::new_v4();
     let inv_item = InventoryItem {
         digest: String::from(digest),
-        local_path: make_path_local(&path, glob_pattern),
+        local_path: make_path_local(path, glob_pattern),
         path: format!("{}", path.display()),
-        uuid: uuid.clone(),
+        uuid,
     };
     (inv_item, uuid)
 }
@@ -151,8 +151,10 @@ pub fn make_path_local(path: &Path, glob_pattern: &str) -> String {
     let fwd_path = path.display().to_string().replace("\\", "/");
     let path_graphemes = fwd_path.graphemes(true).collect::<Vec<&str>>();
     let final_path = path_graphemes[wildcard_position..].concat();
-    format!("/local/{}", urlencoding::encode(&final_path).replace("%2F", "/"))
-
+    format!(
+        "/local/{}",
+        urlencoding::encode(&final_path).replace("%2F", "/")
+    )
 }
 
 /// Write HTML snippet to a file.

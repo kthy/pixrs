@@ -118,10 +118,9 @@ fn serve(opt: PixrsOpt, url: &str) -> Response {
     println!("\nNow serving your media files at {}", &url);
     println!("Press Ctrl-C in this window to stop serving.");
     start_server(
-        SERVER_URL.strip_prefix(&PROTOCOL).expect(&format!(
-            "Expected SERVER_URL to start with '{}'",
-            &PROTOCOL
-        )),
+        SERVER_URL
+            .strip_prefix(&PROTOCOL)
+            .unwrap_or_else(|| panic!("Expected SERVER_URL to start with '{}'", &PROTOCOL)),
         move |req| {
             router!(req,
                 (GET) (/) => { Response::redirect_303("/index.html") },
