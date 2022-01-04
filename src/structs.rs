@@ -29,12 +29,18 @@ pub struct PixrsOpt {
     /// Create output directory if it does not exist
     #[structopt(short = "d", long = "create-dir")]
     pub create_output_dir: bool,
-    /// Open output in default browser when finished
+    /// Do not start local server when finished (forbidden if --open is set)
+    #[structopt(short, long)]
+    pub no_server: bool,
+    /// Open output in default browser when finished (forbidden if --no-server is set)
     #[structopt(short, long)]
     pub open: bool,
     /// The path where the output is placed
     #[structopt(parse(from_os_str))]
     pub out_path: PathBuf,
+    /// Disable progress bars
+    #[structopt(short, long)]
+    pub quiet: bool, // TODO: implement
     /// Recurse into subdirs below the base path
     #[structopt(short, long)]
     pub recurse: bool,

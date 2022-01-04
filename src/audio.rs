@@ -5,23 +5,24 @@
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *************************************************************************************************/
 
-use crate::{find_files, html_dupe, sha256_digest};
 use crate::statics::SERVER_URL;
 use crate::structs::InventoryItem;
-use indicatif::ProgressBar;
+use crate::{find_files, html::html_index_dupe, sha256_digest};
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, trace};
 use maud::{html, Markup, PreEscaped};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, remove_dir_all, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 pub(crate) fn into_html<F>(out_path: &Path, glob_pattern: &str, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
-    trace!("process({:?}, _)", glob_pattern);
+    trace!("into_html({:?}, {:?}, _)", out_path, glob_pattern);
 
     // Prepare output directory
     let base_snippet_path = format!("{}/audio", out_path.display());
@@ -35,7 +36,14 @@ where
     let files: Vec<PathBuf> = find_files(file_extensions, glob_pattern, on_err);
     let num_files = files.len();
     info!("Found {} audio files", num_files);
-    let pb = ProgressBar::new(num_files as u64);
+    let pb = ProgressBar::new(num_files as u64).with_prefix("Processing audio files …");
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{prefix} [{elapsed}/{duration}] {wide_bar:.white/grey} {pos:>5}/{len:5} {>msg}",
+            )
+            .progress_chars("#>-"),
+    );
     let mut map_digest_to_item = HashMap::with_capacity(num_files);
     let mut map_uuid_to_item = HashMap::with_capacity(num_files);
 
@@ -65,7 +73,7 @@ where
             items.push(html_for_index(&inv_item));
         } else {
             // Push duplicate warning to list of snippets
-            items.push(html_dupe(
+            items.push(html_index_dupe(
                 &file.display().to_string(),
                 &map_digest_to_item[&digest].path,
             ));
@@ -130,14 +138,22 @@ fn html_for_index(inv_item: &InventoryItem) -> Markup {
 ///
 /// ```
 /// let expected = "/local/audio/Birk%20CTG.mp3";
-/// let p = ".\\tests\\files\\audio\\Birk CTG.mp3";
+/// let p = std::path::Path::new(".\\tests\\files\\audio\\Birk CTG.mp3");
 /// let g = ".\\tests\\files\\**/*.mp3";
-/// let actual = make_path_local(&p, &g);
+/// let actual = pixrs::audio::make_path_local(&p, &g);
 /// assert_eq!(actual, expected);
 /// ```
-fn make_path_local(path: &Path, glob_pattern: &str) -> String {
-    format!("{}", path.display())
+pub fn make_path_local(path: &Path, glob_pattern: &str) -> String {
+    trace!("make_path_local({:?}, {:?})", path, glob_pattern);
+    let fwd_pattern = glob_pattern.replace("\\", "/");
+    let pattern_graphemes = fwd_pattern.graphemes(true).collect::<Vec<&str>>();
+    let wildcard_position = pattern_graphemes.iter().position(|x| *x == "*").unwrap();
+    let fwd_path = path.display().to_string().replace("\\", "/");
+    let path_graphemes = fwd_path.graphemes(true).collect::<Vec<&str>>();
+    let final_path = path_graphemes[wildcard_position..].concat();
+    format!("/local/{}", urlencoding::encode(&final_path).replace("%2F", "/"))
+
 }
 
 /// Write HTML snippet to a file.
-fn write_snippet(base_snippet_path: &str, uuid: &Uuid) {}
+fn _write_snippet(_base_snippet_path: &str, _uuid: &Uuid) {}

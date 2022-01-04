@@ -19,44 +19,32 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.                         *
  *************************************************************************************************/
 
+use crate::statics::GLOPTS;
 use crate::structs::PixrsOpt;
 use data_encoding::HEXLOWER;
 use glob::glob_with;
 use log::{error, info, trace};
-use maud::{html, Markup, DOCTYPE};
 use ring::digest::{Context, SHA256};
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use time::{macros::format_description, OffsetDateTime};
 
-mod audio;
-mod image;
+pub mod audio;
+pub mod html;
+pub mod image;
 pub mod statics;
 pub mod structs;
-mod video;
+pub mod video;
 
 /// Create a glob pattern.
-///
-/// ```
-/// let pat = pixrs::create_glob_pattern("foo", false);
-/// assert_eq!(pat, "foo/*.");
-/// ```
-///
-/// If `recurse` is true, the pattern will include subdirs.
-///
-/// ```
-/// let pat = pixrs::create_glob_pattern("foo", true);
-/// assert_eq!(pat, "foo/**/*.");
-/// ```
-pub fn create_glob_pattern(path: &str, recurse: bool) -> String {
+fn create_glob_pattern(path: &str, recurse: bool) -> String {
     trace!("create_glob_pattern({:?}, {:?})", path, recurse);
 
     format!("{}{}/*.", path, if recurse { "/**" } else { "" })
 }
 
 /// Return a list of files with the given `extensions` in a directory given by `glob_pattern`.
-pub fn find_files<F>(extensions: Vec<&str>, glob_pattern: &str, on_err: F) -> Vec<PathBuf>
+fn find_files<F>(extensions: Vec<&str>, glob_pattern: &str, on_err: F) -> Vec<PathBuf>
 where
     F: Fn(i32),
 {
@@ -65,7 +53,7 @@ where
     let mut files: Vec<PathBuf> = vec![];
     for extension in extensions {
         let pattern = &(glob_pattern.to_owned() + extension);
-        let entries = glob_with(pattern, statics::GLOPTS);
+        let entries = glob_with(pattern, GLOPTS);
         match entries {
             Ok(entries) => {
                 for entry in entries {
@@ -88,98 +76,10 @@ where
     files
 }
 
-/// Generate HTML duplicate file warning.
-///
-/// ```
-/// let html = pixrs::html_dupe("foo", "bar").into_string();
-/// assert!(html.contains("foo") && html.contains("bar"));
-/// assert_eq!(html, "\
-///     <span class=\"warning\">The file <code>bar</code> \
-///     is a duplicate of <code>foo</code></span>");
-/// ```
-pub fn html_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
-    trace!("html_dupe({:?}, {:?})", the_real_deal, the_impostor);
-
-    html! {
-        span .warning {
-            "The file "
-            code { (the_impostor) }
-            " is a duplicate of "
-            code { (the_real_deal) }
-        }
-    }
-}
-
-/// Generate HTML header for the output.
-pub fn html_header(from_path: &str) -> Markup {
-    trace!("html_header({:?})", from_path);
-
-    let dt = OffsetDateTime::now_local().unwrap_or_else(|e| {
-        error!("Unable to get local time (defaulting to UTC): {:?}", e);
-        OffsetDateTime::now_utc()
-    });
-    let dt_fmt = format_description!(
-        "[weekday], [day] [month repr:long] [year] at \
-         [hour repr:24]:[minute]:[second][offset_hour sign:mandatory]:[offset_minute]"
-    );
-    let formatted_dt = dt.format(dt_fmt).expect("Unable to format DateTime!");
-    html!(
-        h1 { "PixRS" }
-        p { "Output from " code { (from_path) } " generated " (formatted_dt) ":" }
-    )
-}
-
-/// Generate HTML index page.
-pub fn html_index<F>(opt: &PixrsOpt, on_err: F) -> Markup
-where
-    F: Fn(i32),
-{
-    let glob_pattern = create_glob_pattern(&opt.base_path, opt.recurse);
-
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                title { "PixRS output" }
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                style {
-                    "
-                    code {
-                        background-color: #ddd;
-                        border-radius: 6px;
-                        color: #222;
-                        padding: 2px 4px;
-                    }
-
-                    li { padding: 2px 0; }
-
-                    .clickable { cursor: pointer; }
-
-                    .ease-in { transition: all ease-in 3s; } /* FIXME */
-
-                    .warning { color: red; }
-                    "
-                }
-                script src=(statics::HTMX_URL) integrity=(statics::HTMX_SRI) crossorigin="anonymous" {}
-
-            }
-            body {
-                header {
-                    (html_header(&opt.base_path))
-                }
-                main {
-                    section #audio { (audio::into_html(&opt.out_path, &glob_pattern, &on_err)) }
-                    section #image { (image::into_html(&opt.out_path, &glob_pattern, &on_err)) }
-                    section #video { (video::into_html(&opt.out_path, &glob_pattern, &on_err)) }
-                }
-            }
-        }
-    }
-}
-
 /// Calculate the SHA256 digest of the file at `path`.
-pub fn sha256_digest(path: &Path) -> String {
+fn sha256_digest(path: &Path) -> String {
+    trace!("sha256_digest({:?})", path);
+
     let input = File::open(path).unwrap();
     let mut reader = BufReader::new(input);
     let mut context = Context::new(&SHA256);
@@ -261,7 +161,7 @@ where
 {
     trace!("write_html({:?}, {:?})", &opt, &path);
 
-    let index_html = html_index(&opt, on_err);
+    let index_html = html::html_index(&opt, on_err);
 
     let mut out_file = match File::create(&path) {
         Err(why) => panic!("Couldn't create {}: {}", path, why),
@@ -271,5 +171,44 @@ where
     match out_file.write_all(index_html.into_string().as_bytes()) {
         Err(why) => panic!("Couldn't write to {}: {}", path, why),
         Ok(_) => info!("Successfully wrote to {}", path),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_glob_pattern() {
+        let mut expected = "foo/*.";
+        let mut actual = create_glob_pattern("foo", false);
+        assert_eq!(actual, expected);
+
+        expected = "foo/**/*.";
+        actual = create_glob_pattern("foo", true);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_find_files() {
+        // use std::process::exit;
+        let on_err = |_| panic!("at the callback");
+        let expected: usize = 14;
+        let actual = find_files(vec!["wav"], "tests/files/**/*.", on_err).len();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_find_files_panic() {
+        let on_err = |_| panic!("at the callback");
+        let _ = find_files(vec!["wav"], "[", on_err);
+    }
+
+    #[test]
+    fn test_sha256_digest() {
+        let expected = "eca7cbb9efee543f0b9612a53838518c215d48d9062b62eeb84cbac23fb6ad32";
+        let actual = sha256_digest(Path::new("tests/files/audio/dupes/impostor.mp3"));
+        assert_eq!(actual, expected);
     }
 }

@@ -38,4 +38,6 @@ ring = "0.16"                                                                   
 rouille = "3.5"                                                                 # MIT OR Apache-2.0
 structopt = "0.3"                                                               # MIT OR Apache-2.0
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] } # MIT OR Apache-2.0
+unicode-segmentation = "1.8"                                                    # MIT OR Apache-2.0
+urlencoding = "2.1"                                                             # MIT
 uuid = { version = "0.8", features = ["v4"] }                                   # MIT OR Apache-2.0

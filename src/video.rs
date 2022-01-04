@@ -22,6 +22,7 @@ where
     let files: Vec<PathBuf> = crate::find_files(file_extensions, glob_pattern, on_err);
     let num_files = files.len();
     info!("Found {} video files", num_files);
+    println!("Processing video files …");
     let pb = ProgressBar::new(num_files as u64);
 
     for file in &files {

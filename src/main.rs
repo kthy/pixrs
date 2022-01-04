@@ -23,6 +23,7 @@ use indicatif::HumanDuration;
 use log::{error, info};
 use pixrs::statics::{PROTOCOL, SERVER_URL};
 use pixrs::structs::PixrsOpt;
+use pixrs::{validate_input, validate_output, write_html};
 use rouille::{match_assets, router, start_server, Response};
 use std::env;
 use std::process::exit;
@@ -46,6 +47,12 @@ fn main() {
 
     // Load command line arguments
     let opt = PixrsOpt::from_args();
+
+    // Sanity check
+    if opt.no_server && opt.open {
+        eprintln!("Cannot use `--no-server` and `--open` flags at the same time!");
+        exit(exitcode::USAGE)
+    }
 
     // Infer current working directory
     let cwd = format!(
@@ -71,9 +78,9 @@ fn main() {
     // Initial skirmish ends, now engage the enemy's main force!
     info!("Executing: {:?}", opt);
 
-    pixrs::validate_input(&cwd, &opt.base_path, pixrs_exit);
+    validate_input(&cwd, &opt.base_path, pixrs_exit);
 
-    pixrs::validate_output(
+    validate_output(
         &cwd,
         &opt.out_path,
         &idx,
@@ -82,39 +89,47 @@ fn main() {
         pixrs_exit,
     );
 
-    pixrs::write_html(&opt, &idx, pixrs_exit);
+    write_html(&opt, &idx, pixrs_exit);
 
-    info!("HTML generation finished in {}", HumanDuration(now.elapsed()));
+    info!(
+        "HTML generation finished in {}",
+        HumanDuration(now.elapsed())
+    );
 
     let url = format!("{}/index.html", SERVER_URL);
-    open_in_browser(opt.open, &url);
-    serve(String::from(opt.base_path), opt.out_path.display().to_string(), url);
-}
 
-fn open_in_browser(should_open: bool, url: &str) {
-    if should_open {
-        open::that(&url).unwrap_or_else(|e| {
-            error!("{:?}", e);
-            eprintln!("Error opening output: {}", e);
-        });
+    if opt.open {
+        open_in_browser(&url);
+    }
+
+    if !opt.no_server {
+        serve(opt, &url);
     }
 }
 
-fn serve(base_path: String, out_path: String, url: String) -> Response {
+fn open_in_browser(url: &str) {
+    open::that(&url).unwrap_or_else(|e| {
+        error!("{:?}", e);
+        eprintln!("Error opening output: {}", e);
+    });
+}
+
+fn serve(opt: PixrsOpt, url: &str) -> Response {
     println!("\nNow serving your media files at {}", &url);
     println!("Press Ctrl-C in this window to stop serving.");
     start_server(
-        SERVER_URL
-            .strip_prefix(&PROTOCOL)
-            .expect(&format!("Expected SERVER_URL to start with '{}'", &PROTOCOL)),
+        SERVER_URL.strip_prefix(&PROTOCOL).expect(&format!(
+            "Expected SERVER_URL to start with '{}'",
+            &PROTOCOL
+        )),
         move |req| {
             router!(req,
                 (GET) (/) => { Response::redirect_303("/index.html") },
                 _ => {
                     if let Some(req) = req.remove_prefix("/local") {
-                        return match_assets(&req, &base_path);
+                        return match_assets(&req, &opt.base_path);
                     }
-                    match_assets(req, &out_path).with_unique_header("Cache-Control", "no-store")
+                    match_assets(req, &opt.out_path).with_unique_header("Cache-Control", "no-store")
                 },
             )
         },

@@ -20,6 +20,7 @@ pub static PROTOCOL: &str = "http://";
 pub static SERVER_URL: &str = "http://localhost:2635";
 
 /// HTMX SRI hash.
-pub static HTMX_SRI: &str = "sha384-tvG/2mnCFmGQzYC1Oh3qxQ7CkQ9kMzYjWZSNtrRZygHPDDqottzEJsqS4oUVodhW";
+pub static HTMX_SRI: &str =
+    "sha384-tvG/2mnCFmGQzYC1Oh3qxQ7CkQ9kMzYjWZSNtrRZygHPDDqottzEJsqS4oUVodhW";
 /// HTMX unpkg URL.
 pub static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.6.1";
