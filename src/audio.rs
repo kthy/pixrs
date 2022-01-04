@@ -134,15 +134,14 @@ fn html_for_index(inv_item: &InventoryItem) -> Markup {
     }
 }
 
-/// Make a `/local/` URL path out of the `InventoryItem`'s path.
+/// Make a `/local/` URL-encoded path out of the `InventoryItem`'s path.
 ///
 /// ```
-/// use pretty_assertions::assert_eq;
-/// let expected = "/local/audio/Birk%20CTG.mp3";
-/// let p = std::path::Path::new(".\\tests\\files\\audio\\Birk CTG.mp3");
-/// let g = ".\\tests\\files\\**/*.mp3";
+/// let expected = "/local/%E3%83%AF%E3%82%A4%E3%83%95/bl%C3%A5%20b%C3%A6r%20gr%C3%B8d.mp3";
+/// let p = std::path::Path::new(".\\tästs\\漢字\\ワイフ\\blå bær grød.mp3");
+/// let g = ".\\tästs\\漢字\\**/*.mp3";
 /// let actual = pixrs::audio::make_path_local(&p, &g);
-/// assert_eq!(actual, expected);
+/// pretty_assertions::assert_eq!(actual, expected);
 /// ```
 pub fn make_path_local(path: &Path, glob_pattern: &str) -> String {
     trace!("make_path_local({:?}, {:?})", path, glob_pattern);

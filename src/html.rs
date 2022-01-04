@@ -15,14 +15,13 @@ use time::{macros::format_description, OffsetDateTime};
 /// Generate HTML duplicate file warning markup.
 ///
 /// ```
-/// use pretty_assertions::assert_eq;
 /// let html = pixrs::html::html_index_dupe("foo", "bar").into_string();
-/// assert_eq!(html, "<span class=\"dupe\">\
-///                       The file \
-///                       <code>bar</code> \
-///                       is a duplicate of \
-///                       <code>foo</code>\
-///                   </span>");
+/// pretty_assertions::assert_eq!(html, "<span class=\"dupe\">\
+///                                          The file \
+///                                          <code>bar</code> \
+///                                          is a duplicate of \
+///                                          <code>foo</code>\
+///                                      </span>");
 /// ```
 pub fn html_index_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
     trace!("html_index_dupe({:?}, {:?})", the_real_deal, the_impostor);
