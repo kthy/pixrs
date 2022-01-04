@@ -15,7 +15,9 @@ FLAGS:
     -c, --clobber       Clobber output file if it exists
     -d, --create-dir    Create output directory if it does not exist
     -h, --help          Prints help information
-    -o, --open          Open output in default browser when finished
+    -n, --no-server     Do not start local server when finished (forbidden if --open is set)
+    -o, --open          Open output in default browser when finished (forbidden if --no-server is set)
+    -q, --quiet         Disable progress bars
     -r, --recurse       Recurse into subdirs below the base path
     -V, --version       Prints version information
 
