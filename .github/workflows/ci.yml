@@ -11,7 +11,7 @@ on:
       - '**'
 
 env:
-  FFMPEG_DEPS: clang libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev pkg-config
+  FFMPEG_DEPS: clang libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev pkg-config
 
 jobs:
   check:
@@ -72,6 +72,8 @@ jobs:
       matrix:
         rust: [stable, nightly]
     steps:
+      - name: Install FFmpeg prerequisites
+        run: sudo apt install -y ${{ env.FFMPEG_DEPS }}
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
