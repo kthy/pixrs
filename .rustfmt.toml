@@ -1,1 +1,8 @@
+# comment_width = 99
+edition = "2021"
+# group_imports = "StdExternalCrate"
 max_width = 99
+newline_style = "Unix"
+# report_fixme = "Unnumbered"
+# report_todo = "Unnumbered"
+# wrap_comments = true
