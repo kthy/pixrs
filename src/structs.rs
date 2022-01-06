@@ -23,7 +23,7 @@ pub struct InventoryItem {
 #[structopt(about = ABOUT, after_help = AFTER_HELP, set_term_width = 80)]
 pub struct PixrsOpt {
     /// The base path to search
-    #[structopt(default_value=".", required_unless = "license")]
+    #[structopt(default_value = ".", required_unless = "license")]
     pub base_path: String,
     /// Clobber output file if it exists
     #[structopt(short, long)]
