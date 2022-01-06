@@ -5,27 +5,26 @@
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *************************************************************************************************/
 
+use crate::html::html_index_dupe;
 use crate::statics::SERVER_URL;
-use crate::structs::InventoryItem;
-use crate::{find_files, html::html_index_dupe, sha256_digest};
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::structs::{InventoryItem, PixrsOpt};
+use crate::{create_inventory_item, create_progress_bar, find_files, sha256_digest};
 use log::{debug, info, trace};
 use maud::{html, Markup, PreEscaped};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, remove_dir_all, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use unicode_segmentation::UnicodeSegmentation;
+use std::path::PathBuf;
 use uuid::Uuid;
 
-pub(crate) fn into_html<F>(out_path: &Path, glob_pattern: &str, on_err: F) -> Markup
+pub(crate) fn into_html<F>(opt: &PixrsOpt, glob_pattern: &str, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
-    trace!("into_html({:?}, {:?}, _)", out_path, glob_pattern);
+    trace!("into_html({:?}, {:?}, _)", opt, glob_pattern);
 
     // Prepare output directory
-    let base_snippet_path = format!("{}/audio", out_path.display());
+    let base_snippet_path = format!("{}/audio", opt.out_path.display());
     let _ = remove_dir_all(&base_snippet_path);
     create_dir_all(&base_snippet_path).expect("Unable to create audio output directory!");
 
@@ -36,16 +35,13 @@ where
     let files: Vec<PathBuf> = find_files(file_extensions, glob_pattern, on_err);
     let num_files = files.len();
     info!("Found {} audio files", num_files);
-    let pb = ProgressBar::new(num_files as u64).with_prefix("Processing audio files …");
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{prefix} [{elapsed}/{duration}] {wide_bar:.white/grey} {pos:>5}/{len:5} {>msg}",
-            )
-            .progress_chars("#>-"),
+    let pb = create_progress_bar(
+        opt,
+        num_files as u64,
+        String::from("Processing audio files …"),
     );
     let mut map_digest_to_item = HashMap::with_capacity(num_files);
-    let mut map_uuid_to_item = HashMap::with_capacity(num_files);
+    // let mut map_uuid_to_item = HashMap::with_capacity(num_files);
 
     for file in files {
         debug!("Processing audio: {:?}", file);
@@ -59,15 +55,10 @@ where
             // Insert new inventory item
             let (inv_item, uuid) = create_inventory_item(&digest, &file, glob_pattern);
             map_digest_to_item.insert(digest, inv_item.clone());
-            map_uuid_to_item.insert(uuid, inv_item.clone());
+            // map_uuid_to_item.insert(uuid, inv_item.clone());
 
             // Write HTML snippet to local file
-            let snippet_path = format!("{}/{}.html", &base_snippet_path, uuid);
-            let mut snippet_file =
-                File::create(&snippet_path).expect("Couldn't create audio file HTML snippet!");
-            let snippet_html = html_for_htmx(&inv_item);
-            write!(snippet_file, "{}", snippet_html.into_string())
-                .expect("Couldn't write audio file HTML snippet!");
+            write_snippet(&base_snippet_path, &uuid, html_for_htmx(&inv_item));
 
             // Push initial HTML for main page to list of snippets
             items.push(html_for_index(&inv_item));
@@ -92,18 +83,6 @@ where
     }
 }
 
-/// Create an inventory item and return it together with its UUID.
-fn create_inventory_item(digest: &str, path: &Path, glob_pattern: &str) -> (InventoryItem, Uuid) {
-    let uuid = Uuid::new_v4();
-    let inv_item = InventoryItem {
-        digest: String::from(digest),
-        local_path: make_path_local(path, glob_pattern),
-        path: format!("{}", path.display()),
-        uuid,
-    };
-    (inv_item, uuid)
-}
-
 /// Generate HTML for a single file to load into index.html.
 fn html_for_htmx(inv_item: &InventoryItem) -> Markup {
     let src = format!("{}{}", SERVER_URL, &inv_item.local_path);
@@ -112,9 +91,7 @@ fn html_for_htmx(inv_item: &InventoryItem) -> Markup {
             figure {
                 figcaption { code { (inv_item.path) } }
                 audio controls preload="metadata" src=(src) {
-                    "Your browser does not support the "
-                    code { "audio" }
-                    " element."
+                    "Your browser does not support embedded audio."
                 }
             }
         }
@@ -134,28 +111,11 @@ fn html_for_index(inv_item: &InventoryItem) -> Markup {
     }
 }
 
-/// Make a `/local/` URL-encoded path out of the `InventoryItem`'s path.
-///
-/// ```
-/// let expected = "/local/%E3%83%AF%E3%82%A4%E3%83%95/bl%C3%A5%20b%C3%A6r%20gr%C3%B8d.mp3";
-/// let p = std::path::Path::new(".\\tästs\\漢字\\ワイフ\\blå bær grød.mp3");
-/// let g = ".\\tästs\\漢字\\**/*.mp3";
-/// let actual = pixrs::audio::make_path_local(&p, &g);
-/// pretty_assertions::assert_eq!(actual, expected);
-/// ```
-pub fn make_path_local(path: &Path, glob_pattern: &str) -> String {
-    trace!("make_path_local({:?}, {:?})", path, glob_pattern);
-    let fwd_pattern = glob_pattern.replace('\\', "/");
-    let pattern_graphemes = fwd_pattern.graphemes(true).collect::<Vec<&str>>();
-    let wildcard_position = pattern_graphemes.iter().position(|x| *x == "*").unwrap();
-    let fwd_path = path.display().to_string().replace('\\', "/");
-    let path_graphemes = fwd_path.graphemes(true).collect::<Vec<&str>>();
-    let final_path = path_graphemes[wildcard_position..].concat();
-    format!(
-        "/local/{}",
-        urlencoding::encode(&final_path).replace("%2F", "/")
-    )
-}
-
 /// Write HTML snippet to a file.
-fn _write_snippet(_base_snippet_path: &str, _uuid: &Uuid) {}
+fn write_snippet(base_snippet_path: &str, uuid: &Uuid, markup: Markup) {
+    let snippet_path = format!("{}/{}.html", &base_snippet_path, uuid);
+    let mut snippet_file =
+        File::create(&snippet_path).expect("Couldn't create audio file HTML snippet!");
+    write!(snippet_file, "{}", markup.into_string())
+        .expect("Couldn't write audio file HTML snippet!");
+}

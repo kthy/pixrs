@@ -48,10 +48,9 @@ fn main() {
     // Load command line arguments
     let opt = PixrsOpt::from_args();
 
-    // Sanity check
-    if opt.no_server && opt.open {
-        eprintln!("Cannot use `--no-server` and `--open` flags at the same time!");
-        exit(exitcode::USAGE)
+    // Short circuit to license display
+    if opt.license {
+        panic!("FIXME: --license option not implemented");
     }
 
     // Infer current working directory
@@ -103,7 +102,7 @@ fn main() {
     }
 
     if !opt.no_server {
-        serve(opt, &url);
+        serve(opt.out_path.display().to_string(), opt.base_path, url);
     }
 }
 
@@ -114,7 +113,7 @@ fn open_in_browser(url: &str) {
     });
 }
 
-fn serve(opt: PixrsOpt, url: &str) -> Response {
+fn serve(assets_path: String, local_assets_path: String, url: String) -> Response {
     println!("\nNow serving your media files at {}", &url);
     println!("Press Ctrl-C in this window to stop serving.");
     start_server(
@@ -126,9 +125,10 @@ fn serve(opt: PixrsOpt, url: &str) -> Response {
                 (GET) (/) => { Response::redirect_303("/index.html") },
                 _ => {
                     if let Some(req) = req.remove_prefix("/local") {
-                        return match_assets(&req, &opt.base_path);
+                        match_assets(&req, &local_assets_path)
+                    } else {
+                        match_assets(req, &assets_path).with_unique_header("Cache-Control", "no-store")
                     }
-                    match_assets(req, &opt.out_path).with_unique_header("Cache-Control", "no-store")
                 },
             )
         },

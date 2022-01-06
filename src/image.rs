@@ -5,12 +5,13 @@
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *************************************************************************************************/
 
-use indicatif::ProgressBar;
+use crate::structs::PixrsOpt;
+use crate::{create_progress_bar, find_files};
 use log::{debug, info, trace};
 use maud::{html, Markup};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-pub(crate) fn into_html<F>(_path: &Path, glob_pattern: &str, on_err: F) -> Markup
+pub(crate) fn into_html<F>(opt: &PixrsOpt, glob_pattern: &str, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
@@ -19,11 +20,14 @@ where
     let mut snippets: Vec<Markup> = vec![];
 
     let file_extensions = vec!["gif", "jpg", "jpeg", "png"];
-    let files: Vec<PathBuf> = crate::find_files(file_extensions, glob_pattern, on_err);
+    let files: Vec<PathBuf> = find_files(file_extensions, glob_pattern, on_err);
     let num_files = files.len();
     info!("Found {} image files", num_files);
-    println!("Processing image files …");
-    let pb = ProgressBar::new(num_files as u64);
+    let pb = create_progress_bar(
+        opt,
+        num_files as u64,
+        String::from("Processing image files …"),
+    );
 
     for file in &files {
         debug!("Processing image: {:?}", file);

@@ -20,14 +20,17 @@
  *************************************************************************************************/
 
 use crate::statics::GLOPTS;
-use crate::structs::PixrsOpt;
+use crate::structs::{InventoryItem, PixrsOpt};
 use data_encoding::HEXLOWER;
 use glob::glob_with;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, trace};
 use ring::digest::{Context, SHA256};
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use unicode_segmentation::UnicodeSegmentation;
+use uuid::Uuid;
 
 pub mod audio;
 pub mod html;
@@ -40,7 +43,41 @@ pub mod video;
 fn create_glob_pattern(path: &str, recurse: bool) -> String {
     trace!("create_glob_pattern({:?}, {:?})", path, recurse);
 
-    format!("{}{}/*.", path, if recurse { "/**" } else { "" })
+    format!(
+        "{}{}/*.",
+        path.replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_end_matches('/'),
+        if recurse { "/**" } else { "" }
+    )
+}
+
+/// Create an inventory item and return it together with its UUID.
+fn create_inventory_item(digest: &str, path: &Path, glob_pattern: &str) -> (InventoryItem, Uuid) {
+    let uuid = Uuid::new_v4();
+    let inv_item = InventoryItem {
+        digest: String::from(digest),
+        local_path: path_to_local(path, glob_pattern),
+        path: format!("{}", path.display()),
+        uuid,
+    };
+    (inv_item, uuid)
+}
+
+/// Create a progress bar with the given length and prefixed message.
+fn create_progress_bar(opt: &PixrsOpt, len: u64, prefix: String) -> ProgressBar {
+    if opt.quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(len).with_prefix(prefix);
+        let t = "{prefix} [{elapsed}/{duration}] {wide_bar:.white/grey} {pos:>5}/{len:5} {>msg}";
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(t)
+                .progress_chars("##-"),
+        );
+        pb
+    }
 }
 
 /// Return a list of files with the given `extensions` in a directory given by `glob_pattern`.
@@ -74,6 +111,25 @@ where
         }
     }
     files
+}
+
+/// Make a `/local/` URL-encoded path out of an `InventoryItem`'s path.
+fn path_to_local(path: &Path, glob_pattern: &str) -> String {
+    trace!("path_to_local({:?}, {:?})", path, glob_pattern);
+
+    let fwd_pattern = glob_pattern.replace('\\', "/");
+    let pattern_graphemes = fwd_pattern.graphemes(true).collect::<Vec<&str>>();
+    let wildcard_position = pattern_graphemes
+        .iter()
+        .position(|grapheme| *grapheme == "*")
+        .unwrap();
+    let fwd_path = path.display().to_string().replace('\\', "/");
+    let path_graphemes = fwd_path.graphemes(true).collect::<Vec<&str>>();
+    let final_path = path_graphemes[wildcard_position..].concat();
+    format!(
+        "/local/{}",
+        urlencoding::encode(&final_path).replace("%2F", "/")
+    )
 }
 
 /// Calculate the SHA256 digest of the file at `path`.
@@ -190,6 +246,10 @@ mod tests {
         expected = "foo/**/*.";
         actual = create_glob_pattern("foo", true);
         assert_eq!(actual, expected);
+
+        expected = "tests/files/**/*.";
+        actual = create_glob_pattern(".\\tests\\files\\", true);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -206,6 +266,24 @@ mod tests {
     fn test_find_files_panic() {
         let on_err = |_| panic!("at the callback");
         let _ = find_files(vec!["wav"], "[", on_err);
+    }
+
+    #[test]
+    fn test_path_to_local() {
+        let expected = "/local/audio/Birk%20CTG.mp3";
+        let p = Path::new("tests\\files\\audio/Birk CTG.mp3");
+        let g = "tests/files/**/*.mp3";
+        let actual = path_to_local(&p, &g);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_path_to_local_unicode() {
+        let expected = "/local/%E3%83%AF%E3%82%A4%E3%83%95/bl%C3%A5%20b%C3%A6r%20gr%C3%B8d.txt";
+        let p = Path::new(".\\tästs\\漢字\\ワイフ\\blå bær grød.txt");
+        let g = ".\\tästs\\漢字\\**/*.txt";
+        let actual = path_to_local(&p, &g);
+        assert_eq!(actual, expected);
     }
 
     #[test]

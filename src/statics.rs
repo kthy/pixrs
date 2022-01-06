@@ -5,10 +5,23 @@
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *************************************************************************************************/
 
-use glob::MatchOptions;
+/// Clap about text.
+pub static ABOUT: &str = "A CLI tool that presents a bunch of media files in a reasonable manner.";
+
+/// Clap after-help text.
+pub static AFTER_HELP: &str = "LEGAL NOTICE:
+    This Software is released under the GNU Affero General Public License,
+    version 3 or any later version (SPDX: \"AGPL-3.0-or-later\").
+
+    TODO \"contains software from\"
+
+    You may obtain a copy of the Software's corresponding source code from
+    <https://github.com/pyxy-dk/pixrs>. To read the full license notices, run
+    the Software with the `--license` flag.
+";
 
 /// Glob options.
-pub static GLOPTS: MatchOptions = MatchOptions {
+pub static GLOPTS: glob::MatchOptions = glob::MatchOptions {
     case_sensitive: false,
     require_literal_separator: true,
     require_literal_leading_dot: false,
@@ -24,3 +37,18 @@ pub static HTMX_SRI: &str =
     "sha384-tvG/2mnCFmGQzYC1Oh3qxQ7CkQ9kMzYjWZSNtrRZygHPDDqottzEJsqS4oUVodhW";
 /// HTMX unpkg URL.
 pub static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.6.1";
+
+/// Lightbox2 JS SRI hash.
+pub static LIGHTBOX_CSS_SRI: &str =
+    "sha384-MzHT0pgTPI8fjMvEz54yA7HmSVjLLsxl+ytGS13+EOr/L5uLaBakmchzKgDYsSQz";
+
+/// Lightbox2 CSS unpkg URL.
+pub static LIGHTBOX_CSS_URL: &str = "https://unpkg.com/lightbox2@2.11.3/dist/css/lightbox.min.css";
+
+/// Lightbox2 JS SRI hash.
+pub static LIGHTBOX_JS_SRI: &str =
+    "sha384-wiGTgQvE7f6PIrSpsBWk8EB5jmwOU6icSFbmocq5bMw/sUKpySMRR4JLw3aSuy/5";
+
+/// Lightbox2 JS unpkg URL.
+pub static LIGHTBOX_JS_URL: &str =
+    "https://unpkg.com/lightbox2@2.11.3/dist/js/lightbox-plus-jquery.min.js";

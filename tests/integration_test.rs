@@ -7,6 +7,7 @@ fn e2e() {
         base_path: String::from("tests/files"),
         clobber: true,
         create_output_dir: true,
+        license: false,
         no_server: true,
         open: false,
         out_path: Path::new("./target/e2e").to_path_buf(),

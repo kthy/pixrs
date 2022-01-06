@@ -5,12 +5,28 @@
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *************************************************************************************************/
 
-use crate::statics::{HTMX_SRI, HTMX_URL};
+use crate::statics::{
+    HTMX_SRI, HTMX_URL, LIGHTBOX_CSS_SRI, LIGHTBOX_CSS_URL, LIGHTBOX_JS_SRI, LIGHTBOX_JS_URL,
+};
 use crate::structs::PixrsOpt;
 use log::{error, trace};
 use maud::{html, Markup, DOCTYPE};
-use std::path::Path;
 use time::{macros::format_description, OffsetDateTime};
+
+/// Generate an emoji favicon as inline SVG.
+fn favicon(emoji: &str, x: i8, y: i8) -> Markup {
+    trace!("favicon({:?})", emoji);
+    let data = vec![
+        "data:image/svg+xml,",
+        "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Ctext",
+        &format!("%20x='{}'", x),
+        &format!("%20y='{}'%3E", y),
+        emoji,
+        "%3C/text%3E%3C/svg%3E",
+    ]
+    .concat();
+    html! { link rel="icon" href=(data) type="image/svg+xml"; }
+}
 
 /// Generate HTML duplicate file warning markup.
 ///
@@ -44,6 +60,8 @@ fn html_index_head() -> Markup {
         meta charset="utf-8";
         title { "PixRS output" }
         meta name="viewport" content="width=device-width, initial-scale=1";
+        (favicon("🗃️", -3, 14))
+        link rel="stylesheet" href=(LIGHTBOX_CSS_URL) integrity=(LIGHTBOX_CSS_SRI) crossorigin="anonymous";
         style { (stylesheet()) }
         script src=(HTMX_URL) integrity=(HTMX_SRI) crossorigin="anonymous" {}
     )
@@ -75,8 +93,6 @@ where
 {
     trace!("html_index({:?}, _)", opt);
 
-    let glob_pattern = crate::create_glob_pattern(&opt.base_path, opt.recurse);
-
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -88,7 +104,7 @@ where
                     (html_index_header(&opt.base_path))
                 }
                 main {
-                    (html_index_main(&opt.out_path, &glob_pattern, &on_err))
+                    (html_index_main(opt, &on_err))
                 }
             }
         }
@@ -96,16 +112,19 @@ where
 }
 
 /// Generate HTML body markup.
-fn html_index_main<F>(out_path: &Path, glob_pattern: &str, on_err: F) -> Markup
+fn html_index_main<F>(opt: &PixrsOpt, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
-    trace!("html_index_main({:?}, {:?}, _)", out_path, glob_pattern);
+    trace!("html_index_main({:?}, _)", opt);
+
+    let glob_pattern = crate::create_glob_pattern(&opt.base_path, opt.recurse);
 
     html!(
-        section #audio { (crate::audio::into_html(out_path, glob_pattern, &on_err)) }
-        section #image { (crate::image::into_html(out_path, glob_pattern, &on_err)) }
-        section #video { (crate::video::into_html(out_path, glob_pattern, &on_err)) }
+        section #audio { (crate::audio::into_html(opt, &glob_pattern, &on_err)) }
+        section #image { (crate::image::into_html(opt, &glob_pattern, &on_err)) }
+        section #video { (crate::video::into_html(opt, &glob_pattern, &on_err)) }
+        script src=(LIGHTBOX_JS_URL) integrity=(LIGHTBOX_JS_SRI) crossorigin="anonymous" {}
     )
 }
 
@@ -115,20 +134,29 @@ fn stylesheet() -> String {
 
     String::from(
         "
-    code {
-        background-color: #ddd;
-        border-radius: 6px;
-        color: #222;
-        padding: 2px 4px;
-    }
+        audio {
+            border-radius: 8px;
+            padding: 8px 4px;
+        }
 
-    li { padding: 2px 0; }
+        code {
+            background-color: #ddd;
+            border-radius: 6px;
+            color: #222;
+            padding: 2px 4px;
+        }
 
-    .clickable { cursor: pointer; }
+        li { padding: 2px 0; }
 
-    .dupe { color: red; }
+        .clickable { cursor: pointer; }
 
-    .ease-in { transition: all ease-in 3s; } /* FIXME */
+        .dupe { color: red; }
+
+        .ease-in { transition: all ease-in 3s; } /* FIXME */
+
+        .video_thumbnail {
+            float: left;
+        }
     ",
     )
 }
