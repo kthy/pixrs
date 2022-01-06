@@ -10,13 +10,16 @@ on:
     branches:
       - '**'
 
+env:
+  FFMPEG_DEPS: clang libavcodec-dev libavfilter-dev libavformat-dev libavutil-dev pkg-config
+
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
       - name: Install FFmpeg prerequisites
-        run: sudo apt install -y clang libavcodec-dev libavformat-dev libavutil-dev pkg-config
+        run: sudo apt install -y ${{ FFMPEG_DEPS }}
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
@@ -35,7 +38,7 @@ jobs:
         rust: [stable, nightly]
     steps:
       - name: Install FFmpeg prerequisites
-        run: sudo apt install -y clang libavcodec-dev libavformat-dev libavutil-dev pkg-config
+        run: sudo apt install -y ${{ FFMPEG_DEPS }}
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
