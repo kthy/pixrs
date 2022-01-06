@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install FFmpeg prerequisites
-        run: sudo apt install -y ${{ FFMPEG_DEPS }}
+        run: sudo apt install -y ${{ env.FFMPEG_DEPS }}
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
@@ -38,7 +38,7 @@ jobs:
         rust: [stable, nightly]
     steps:
       - name: Install FFmpeg prerequisites
-        run: sudo apt install -y ${{ FFMPEG_DEPS }}
+        run: sudo apt install -y ${{ env.FFMPEG_DEPS }}
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
