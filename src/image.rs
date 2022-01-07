@@ -70,22 +70,26 @@ where
 
     html! {
         h2 { "Images" }
-        @if items.len() > 0 {
+        @if items.is_empty() {
+            p .clear-both { "No image files found." }
+        } @else {
             @for item in items { (item) }
-            @if dupes.len() > 0 {
+            @if !dupes.is_empty() {
                 ul {
                     @for item in dupes { li { (item) } }
                 }
             }
-        } @else {
-            p .clear-both { "No image files found." }
         }
     }
 }
 /// Generate HTML for a single file to place in index.html.
 fn html_for_index(inv_item: &InventoryItem) -> Markup {
     let src = format!("{}{}", SERVER_URL, &inv_item.local_path);
-    let caption = &inv_item.path.split(std::path::MAIN_SEPARATOR).next_back().unwrap();
+    let caption = &inv_item
+        .path
+        .split(std::path::MAIN_SEPARATOR)
+        .next_back()
+        .unwrap();
     let t = &inv_item.path;
     html! {
         #(inv_item.uuid) .thumbnail {

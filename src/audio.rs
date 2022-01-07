@@ -77,15 +77,15 @@ where
 
     html! {
         h2 { "Audio" }
-        @if items.len() > 0 {
+        @if items.is_empty() {
+            p .clear-both { "No audio files found." }
+        } @else {
             @for item in items { (item) }
-            @if dupes.len() > 0 {
+            @if !dupes.is_empty() {
                 ul {
                     @for item in dupes { li { (item) } }
                 }
             }
-        } @else {
-            p .clear-both { "No audio files found." }
         }
     }
 }
@@ -108,7 +108,11 @@ fn html_for_htmx(inv_item: &InventoryItem) -> Markup {
 /// Generate HTML for a single file to place in index.html.
 fn html_for_index(inv_item: &InventoryItem) -> Markup {
     let hx_get_url = format!("/audio/{}.html", &inv_item.uuid);
-    let text = &inv_item.path.split(std::path::MAIN_SEPARATOR).next_back().unwrap();
+    let text = &inv_item
+        .path
+        .split(std::path::MAIN_SEPARATOR)
+        .next_back()
+        .unwrap();
     html! {
         #(inv_item.uuid) .thumbnail {
             span .clickable hx-get=(hx_get_url) hx-swap="outerHTML" title=(inv_item.path) {
