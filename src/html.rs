@@ -146,16 +146,34 @@ fn stylesheet() -> String {
             padding: 2px 4px;
         }
 
+        figcaption {
+            background-color: #ddd;
+            border-radius: 6px;
+            color: #222;
+            font-size: 80%;
+            margin-bottom: 2px;
+            padding: 2px 4px;
+            text-align: center;
+        }
+
         li { padding: 2px 0; }
+
+        ul {
+            clear: both;
+            padding-top: 8px;
+        }
 
         .clickable { cursor: pointer; }
 
         .dupe { color: red; }
 
-        .ease-in { transition: all ease-in 3s; } /* FIXME */
+        h1, h2, .clear-both {
+            clear: both;
+        }
 
-        .video_thumbnail {
+        .thumbnail {
             float: left;
+            margin: 2px;
         }
     ",
     )

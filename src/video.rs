@@ -10,12 +10,10 @@ use crate::statics::SERVER_URL;
 use crate::structs::{InventoryItem, PixrsOpt};
 use crate::{create_inventory_item, create_progress_bar, find_files, sha256_digest};
 use log::{debug, info, trace};
-use maud::{html, Markup, PreEscaped};
+use maud::{html, Markup};
 use std::collections::HashMap;
-use std::fs::{create_dir_all, remove_dir_all, File};
-use std::io::Write;
+use std::fs::{create_dir_all, remove_dir_all};
 use std::path::PathBuf;
-use uuid::Uuid;
 
 pub(crate) fn into_html<F>(opt: &PixrsOpt, glob_pattern: &str, on_err: F) -> Markup
 where
@@ -30,6 +28,7 @@ where
 
     // Collection of HTML snippets for video files
     let mut items: Vec<Markup> = vec![];
+    let mut dupes: Vec<Markup> = vec![];
 
     let file_extensions = vec!["avi", "m4v", "mp4", "mpeg", "mpg", "webm"];
     let files: Vec<PathBuf> = find_files(file_extensions, glob_pattern, on_err);
@@ -41,7 +40,6 @@ where
         String::from("Processing video files …"),
     );
     let mut map_digest_to_item = HashMap::with_capacity(num_files);
-    // let mut map_uuid_to_item = HashMap::with_capacity(num_files);
 
     for file in files {
         debug!("Processing video: {:?}", file);
@@ -53,18 +51,14 @@ where
         #[allow(clippy::map_entry)]
         if !map_digest_to_item.contains_key(&digest) {
             // Insert new inventory item
-            let (inv_item, uuid) = create_inventory_item(&digest, &file, glob_pattern);
+            let (inv_item, _) = create_inventory_item(&digest, &file, glob_pattern);
             map_digest_to_item.insert(digest, inv_item.clone());
-            // map_uuid_to_item.insert(uuid, inv_item.clone());
-
-            // Write HTML snippet to local file
-            write_snippet(&base_snippet_path, &uuid, html_for_htmx(&inv_item));
 
             // Push initial HTML for main page to list of snippets
             items.push(html_for_index(&inv_item));
         } else {
             // Push duplicate warning to list of snippets
-            items.push(html_index_dupe(
+            dupes.push(html_index_dupe(
                 &file.display().to_string(),
                 &map_digest_to_item[&digest].path,
             ));
@@ -76,45 +70,31 @@ where
 
     html! {
         h2 { "Video" }
-        @for item in items { (item) }
-    }
-}
-
-/// Generate HTML for a single file to load into index.html.
-fn html_for_htmx(inv_item: &InventoryItem) -> Markup {
-    let src = format!("{}{}", SERVER_URL, &inv_item.local_path);
-    html! {
-        #(inv_item.uuid) {
-            figure {
-                figcaption { code { (inv_item.path) } }
-                // FIXME generate thumbnail and add poster attribute
-                // <https://developer.mozilla.org/en-US/docs/Web/HTML/Element/video#attr-poster>
-                video controls muted preload="metadata" src=(src) width="256" {
-                    "Your browser does not support embedded videos."
+        @if items.len() > 0 {
+            @for item in items { (item) }
+            @if dupes.len() > 0 {
+                ul {
+                    @for item in dupes { li { (item) } }
                 }
             }
+        } @else {
+            p .clear-both { "No video files found." }
         }
     }
 }
 
 /// Generate HTML for a single file to place in index.html.
 fn html_for_index(inv_item: &InventoryItem) -> Markup {
-    let hx_get_url = format!("/video/{}.html", &inv_item.uuid);
+    let src = format!("{}{}", SERVER_URL, &inv_item.local_path);
+    let caption = &inv_item.path.split(std::path::MAIN_SEPARATOR).next_back().unwrap();
     html! {
-        #(inv_item.uuid) .video_thumbnail {
-            span .clickable hx-get=(hx_get_url) hx-swap="outerHTML" {
-                (PreEscaped("&#9654;&nbsp;"))
+        #(inv_item.uuid) .thumbnail {
+            figure {
+                video controls muted preload="metadata" src=(src) title=(inv_item.path) height="128" {
+                    "Your browser does not support embedded videos."
+                }
+                figcaption{ (caption) }
             }
-            code { (inv_item.path) }
         }
     }
-}
-
-/// Write HTML snippet to a file.
-fn write_snippet(base_snippet_path: &str, uuid: &Uuid, markup: Markup) {
-    let snippet_path = format!("{}/{}.html", &base_snippet_path, uuid);
-    let mut snippet_file =
-        File::create(&snippet_path).expect("Couldn't create video file HTML snippet!");
-    write!(snippet_file, "{}", markup.into_string())
-        .expect("Couldn't write video file HTML snippet!");
 }

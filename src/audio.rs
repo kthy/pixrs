@@ -28,8 +28,9 @@ where
     let _ = remove_dir_all(&base_snippet_path);
     create_dir_all(&base_snippet_path).expect("Unable to create audio output directory!");
 
-    // Collection of HTML snippets for audio files
+    // Collections of HTML snippets for audio files
     let mut items: Vec<Markup> = vec![];
+    let mut dupes: Vec<Markup> = vec![];
 
     let file_extensions = vec!["mp3", "ogg", "wav"];
     let files: Vec<PathBuf> = find_files(file_extensions, glob_pattern, on_err);
@@ -64,7 +65,7 @@ where
             items.push(html_for_index(&inv_item));
         } else {
             // Push duplicate warning to list of snippets
-            items.push(html_index_dupe(
+            dupes.push(html_index_dupe(
                 &file.display().to_string(),
                 &map_digest_to_item[&digest].path,
             ));
@@ -75,10 +76,16 @@ where
     pb.finish_with_message("done");
 
     html! {
-        ul {
-            @for item in items {
-                li { (item) }
+        h2 { "Audio" }
+        @if items.len() > 0 {
+            @for item in items { (item) }
+            @if dupes.len() > 0 {
+                ul {
+                    @for item in dupes { li { (item) } }
+                }
             }
+        } @else {
+            p .clear-both { "No audio files found." }
         }
     }
 }
@@ -89,10 +96,10 @@ fn html_for_htmx(inv_item: &InventoryItem) -> Markup {
     html! {
         #(inv_item.uuid) {
             figure {
-                figcaption { code { (inv_item.path) } }
                 audio controls preload="metadata" src=(src) {
                     "Your browser does not support embedded audio."
                 }
+                figcaption { (inv_item.path) }
             }
         }
     }
@@ -101,12 +108,12 @@ fn html_for_htmx(inv_item: &InventoryItem) -> Markup {
 /// Generate HTML for a single file to place in index.html.
 fn html_for_index(inv_item: &InventoryItem) -> Markup {
     let hx_get_url = format!("/audio/{}.html", &inv_item.uuid);
+    let text = &inv_item.path.split(std::path::MAIN_SEPARATOR).next_back().unwrap();
     html! {
-        #(inv_item.uuid) {
-            span .clickable hx-get=(hx_get_url) hx-swap="outerHTML" {
-                (PreEscaped("&#9654;&nbsp;"))
+        #(inv_item.uuid) .thumbnail {
+            span .clickable hx-get=(hx_get_url) hx-swap="outerHTML" title=(inv_item.path) {
+                code { (PreEscaped("&nbsp;&#9654;&nbsp;"))(text) }
             }
-            code { (inv_item.path) }
         }
     }
 }

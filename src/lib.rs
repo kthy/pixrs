@@ -19,10 +19,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.                         *
  *************************************************************************************************/
 
-use crate::statics::GLOPTS;
 use crate::structs::{InventoryItem, PixrsOpt};
-use data_encoding::HEXLOWER;
-use glob::glob_with;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, trace};
 use ring::digest::{Context, SHA256};
@@ -90,7 +87,7 @@ where
     let mut files: Vec<PathBuf> = vec![];
     for extension in extensions {
         let pattern = &(glob_pattern.to_owned() + extension);
-        let entries = glob_with(pattern, GLOPTS);
+        let entries = glob::glob_with(pattern, statics::GLOPTS);
         match entries {
             Ok(entries) => {
                 for entry in entries {
@@ -149,7 +146,7 @@ fn sha256_digest(path: &Path) -> String {
         context.update(&buffer[..count]);
     }
 
-    HEXLOWER.encode(context.finish().as_ref())
+    data_encoding::HEXLOWER.encode(context.finish().as_ref())
 }
 
 /// If `path` is not an existing directory, execute the provided callback function.
