@@ -118,7 +118,7 @@ fn serve(assets_path: String, local_assets_path: String, url: String) -> Respons
     println!("Press Ctrl-C in this window to stop serving.");
     start_server(
         SERVER_URL
-            .strip_prefix(&PROTOCOL)
+            .strip_prefix(PROTOCOL)
             .unwrap_or_else(|| panic!("Expected SERVER_URL to start with '{}'", PROTOCOL)),
         move |req| {
             router!(req,
