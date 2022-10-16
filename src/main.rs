@@ -107,7 +107,7 @@ fn main() {
 }
 
 fn open_in_browser(url: &str) {
-    open::that(&url).unwrap_or_else(|e| {
+    open::that(url).unwrap_or_else(|e| {
         error!("{:?}", e);
         eprintln!("Error opening output: {}", e);
     });
@@ -119,7 +119,7 @@ fn serve(assets_path: String, local_assets_path: String, url: String) -> Respons
     start_server(
         SERVER_URL
             .strip_prefix(&PROTOCOL)
-            .unwrap_or_else(|| panic!("Expected SERVER_URL to start with '{}'", &PROTOCOL)),
+            .unwrap_or_else(|| panic!("Expected SERVER_URL to start with '{}'", PROTOCOL)),
         move |req| {
             router!(req,
                 (GET) (/) => { Response::redirect_303("/index.html") },
