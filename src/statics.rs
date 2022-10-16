@@ -34,9 +34,9 @@ pub static SERVER_URL: &str = "http://localhost:2635";
 
 /// HTMX SRI hash.
 pub static HTMX_SRI: &str =
-    "sha384-tvG/2mnCFmGQzYC1Oh3qxQ7CkQ9kMzYjWZSNtrRZygHPDDqottzEJsqS4oUVodhW";
+    "sha384-+8ISc/waZcRdXCLxVgbsLzay31nCdyZXQxnsUy++HJzJliTzxKWr0m1cIEMyUzQu";
 /// HTMX unpkg URL.
-pub static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.6.1";
+pub static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.8.2";
 
 /// Lightbox2 JS SRI hash.
 pub static LIGHTBOX_CSS_SRI: &str =

@@ -71,6 +71,7 @@ fn create_progress_bar(opt: &PixrsOpt, len: u64, prefix: String) -> ProgressBar 
         pb.set_style(
             ProgressStyle::default_bar()
                 .template(t)
+                .expect("Expected a ProgressStyle!")
                 .progress_chars("##-"),
         );
         pb
