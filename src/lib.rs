@@ -217,7 +217,7 @@ where
 
     let index_html = html::html_index(opt, on_err);
 
-    let mut out_file = match File::create(&path) {
+    let mut out_file = match File::create(path) {
         Err(why) => panic!("Couldn't create {}: {}", path, why),
         Ok(file) => file,
     };
