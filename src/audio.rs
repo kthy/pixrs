@@ -126,7 +126,7 @@ fn html_for_index(inv_item: &InventoryItem) -> Markup {
 fn write_snippet(base_snippet_path: &str, uuid: &Uuid, markup: Markup) {
     let snippet_path = format!("{}/{}.html", &base_snippet_path, uuid);
     let mut snippet_file =
-        File::create(&snippet_path).expect("Couldn't create audio file HTML snippet!");
+        File::create(snippet_path).expect("Couldn't create audio file HTML snippet!");
     write!(snippet_file, "{}", markup.into_string())
         .expect("Couldn't write audio file HTML snippet!");
 }

@@ -16,7 +16,7 @@ use time::{macros::format_description, OffsetDateTime};
 /// Generate an emoji favicon as inline SVG.
 fn favicon(emoji: &str, x: i8, y: i8) -> Markup {
     trace!("favicon({:?})", emoji);
-    let data = vec![
+    let data = [
         "data:image/svg+xml,",
         "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Ctext",
         &format!("%20x='{}'", x),
