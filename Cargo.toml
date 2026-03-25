@@ -30,7 +30,7 @@ exitcode = "1.1"                                                                
 # ffmpeg-next = { version = "4.4", features = ["codec", "format"] }               # GPL-3.0-or-later
 glob = "0.3"                                                                    # MIT OR Apache-2.0
 # id3 = "0.6"                                                                     # MIT
-indicatif = "0.17"                                                              # MIT
+indicatif = "0.18"                                                              # MIT
 # kamadak-exif = "0.5.4"                                                          # BSD-2-Clause
 log = "0.4"                                                                     # MIT OR Apache-2.0
 maud = "0.23"                                                                   # MIT OR Apache-2.0
