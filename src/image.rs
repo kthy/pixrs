@@ -1,7 +1,7 @@
 //! Code for handling image files.
 
 /*************************************************************************************************
- * Copyright © 2022 Kristian Thy (<k@pyxy.dk>)                                                   *
+ * Copyright © 2022, 2023, 2024 Kristian Thy (<k@pyxy.dk>)                                       *
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *************************************************************************************************/
 
@@ -9,7 +9,7 @@ use crate::html::html_index_dupe;
 use crate::statics::SERVER_URL;
 use crate::structs::{InventoryItem, PixrsOpt};
 use crate::{create_inventory_item, create_progress_bar, find_files, sha256_digest};
-use log::{debug, info, trace};
+use log::{debug, info};
 use maud::{html, Markup};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, remove_dir_all};
@@ -19,12 +19,10 @@ pub(crate) fn into_html<F>(opt: &PixrsOpt, glob_pattern: &str, on_err: F) -> Mar
 where
     F: Fn(i32),
 {
-    trace!("into_html({:?}, {:?}, _)", opt, glob_pattern);
-
     // Prepare output directory
-    let base_snippet_path = format!("{}/video", opt.out_path.display());
+    let base_snippet_path = format!("{}/images", opt.out_path.display());
     let _ = remove_dir_all(&base_snippet_path);
-    create_dir_all(&base_snippet_path).expect("Unable to create video output directory!");
+    create_dir_all(&base_snippet_path).expect("Unable to create image output directory!");
 
     // Collection of HTML snippets for video files
     let mut items: Vec<Markup> = vec![];
@@ -33,16 +31,16 @@ where
     let file_extensions = vec!["gif", "jpg", "jpeg", "png"];
     let files: Vec<PathBuf> = find_files(file_extensions, glob_pattern, on_err);
     let num_files = files.len();
-    info!("Found {} video files", num_files);
+    info!("Found {} image files", num_files);
     let pb = create_progress_bar(
         opt,
         num_files as u64,
-        String::from("Processing video files …"),
+        String::from("Processing image files …"),
     );
     let mut map_digest_to_item = HashMap::with_capacity(num_files);
 
     for file in files {
-        debug!("Processing video: {:?}", file);
+        debug!("Processing image: {:?}", file);
 
         let digest = sha256_digest(&file);
 
@@ -82,6 +80,7 @@ where
         }
     }
 }
+
 /// Generate HTML for a single file to place in index.html.
 fn html_for_index(inv_item: &InventoryItem) -> Markup {
     let src = format!("{}{}", SERVER_URL, &inv_item.local_path);

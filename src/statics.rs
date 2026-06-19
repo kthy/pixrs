@@ -1,7 +1,7 @@
 //! Static definitions for PixRS.
 
 /*************************************************************************************************
- * Copyright © 2022 Kristian Thy (<k@pyxy.dk>)                                                   *
+ * Copyright © 2022, 2023, 2024 Kristian Thy (<k@pyxy.dk>)                                       *
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *************************************************************************************************/
 
@@ -34,21 +34,22 @@ pub static SERVER_URL: &str = "http://localhost:2635";
 
 /// HTMX SRI hash.
 pub static HTMX_SRI: &str =
-    "sha384-+8ISc/waZcRdXCLxVgbsLzay31nCdyZXQxnsUy++HJzJliTzxKWr0m1cIEMyUzQu";
-/// HTMX unpkg URL.
-pub static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.8.2";
+    "sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2";
 
-/// Lightbox2 JS SRI hash.
+/// HTMX unpkg URL.
+pub static HTMX_URL: &str = "https://unpkg.com/htmx.org@1.9.12/dist/htmx.min.js";
+
+/// Lightbox2 CSS SRI hash.
 pub static LIGHTBOX_CSS_SRI: &str =
     "sha384-MzHT0pgTPI8fjMvEz54yA7HmSVjLLsxl+ytGS13+EOr/L5uLaBakmchzKgDYsSQz";
 
 /// Lightbox2 CSS unpkg URL.
-pub static LIGHTBOX_CSS_URL: &str = "https://unpkg.com/lightbox2@2.11.3/dist/css/lightbox.min.css";
+pub static LIGHTBOX_CSS_URL: &str = "https://unpkg.com/lightbox2@2.11.4/dist/css/lightbox.min.css";
 
 /// Lightbox2 JS SRI hash.
 pub static LIGHTBOX_JS_SRI: &str =
-    "sha384-wiGTgQvE7f6PIrSpsBWk8EB5jmwOU6icSFbmocq5bMw/sUKpySMRR4JLw3aSuy/5";
+    "sha384-uTmpRFR0EdFNfmq7QDdVBqyOmvNYqjnAtF/pfcyZSXCCBkirh2VWddSoaQHW8dN1";
 
 /// Lightbox2 JS unpkg URL.
 pub static LIGHTBOX_JS_URL: &str =
-    "https://unpkg.com/lightbox2@2.11.3/dist/js/lightbox-plus-jquery.min.js";
+    "https://unpkg.com/lightbox2@2.11.4/dist/js/lightbox-plus-jquery.min.js";

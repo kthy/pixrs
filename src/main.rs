@@ -1,7 +1,7 @@
 //! Present a bunch of media files in a reasonable manner.
 
 /*************************************************************************************************
- * Copyright © 2022 Kristian Thy (<k@pyxy.dk>)                                                   *
+ * Copyright © 2022, 2023, 2024 Kristian Thy (<k@pyxy.dk>)                                       *
  *                                                                                               *
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *                                                                                               *
@@ -23,7 +23,7 @@ use indicatif::HumanDuration;
 use log::{error, info};
 use pixrs::statics::{PROTOCOL, SERVER_URL};
 use pixrs::structs::PixrsOpt;
-use pixrs::{validate_input, validate_output, write_html};
+use pixrs::{validate_base_path_exists, create_out_path_unless_no_clobber, write_html};
 use rouille::{match_assets, router, start_server, Response};
 use std::env;
 use std::process::exit;
@@ -38,12 +38,7 @@ fn main() {
     // Initialize logger from RUST_LOG environment variable
     env_logger::init();
 
-    // Set Ctrl-C handler
-    ctrlc::set_handler(move || {
-        println!("Ctrl-C received, stopping.");
-        exit(exitcode::OK);
-    })
-    .expect("Error setting Ctrl-C handler");
+    set_ctrlc_handler();
 
     // Load command line arguments
     let opt = PixrsOpt::from_args();
@@ -53,20 +48,10 @@ fn main() {
         panic!("FIXME: --license option not implemented");
     }
 
-    // Infer current working directory
-    let cwd = format!(
-        "{}",
-        env::current_dir()
-            .expect("Unable to retrieve current directory!")
-            .as_path()
-            .display()
-    );
-
-    // Construct path to index page
-    let idx = format!("{}/index.html", opt.out_path.display());
+    let cwd = infer_current_working_dir();
 
     // Callback to stop the timer and exit with the given code.
-    let pixrs_exit = |code| {
+    let callback_to_exit = |code| {
         info!(
             "Execution interrupted after {}",
             HumanDuration(now.elapsed())
@@ -77,18 +62,21 @@ fn main() {
     // Initial skirmish ends, now engage the enemy's main force!
     info!("Executing: {:?}", opt);
 
-    validate_input(&cwd, &opt.base_path, pixrs_exit);
+    // Construct path to index page
+    let idx = format!("{}/index.html", opt.out_path.display());
 
-    validate_output(
+    validate_base_path_exists(&cwd, &opt.base_path, callback_to_exit);
+
+    create_out_path_unless_no_clobber(
         &cwd,
         &opt.out_path,
         &idx,
         opt.clobber,
         opt.create_output_dir,
-        pixrs_exit,
+        callback_to_exit,
     );
 
-    write_html(&opt, &idx, pixrs_exit);
+    write_html(&opt, &idx, callback_to_exit);
 
     info!(
         "HTML generation finished in {}",
@@ -104,6 +92,18 @@ fn main() {
     if !opt.no_server {
         serve(opt.out_path.display().to_string(), opt.base_path, url);
     }
+}
+
+/// Infer current working directory
+fn infer_current_working_dir() -> String {
+    let cwd = format!(
+        "{}",
+        env::current_dir()
+            .expect("Unable to retrieve current directory!")
+            .as_path()
+            .display()
+    );
+    cwd
 }
 
 fn open_in_browser(url: &str) {
@@ -133,4 +133,13 @@ fn serve(assets_path: String, local_assets_path: String, url: String) -> Respons
             )
         },
     );
+}
+
+/// Set Ctrl-C handler
+fn set_ctrlc_handler() {
+    ctrlc::set_handler(move || {
+        println!("Ctrl-C received, stopping.");
+        exit(exitcode::OK);
+    })
+    .expect("Error setting Ctrl-C handler");
 }

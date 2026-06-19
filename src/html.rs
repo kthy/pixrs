@@ -9,13 +9,12 @@ use crate::statics::{
     HTMX_SRI, HTMX_URL, LIGHTBOX_CSS_SRI, LIGHTBOX_CSS_URL, LIGHTBOX_JS_SRI, LIGHTBOX_JS_URL,
 };
 use crate::structs::PixrsOpt;
-use log::{error, trace};
+use log::error;
 use maud::{html, Markup, DOCTYPE};
 use time::{macros::format_description, OffsetDateTime};
 
 /// Generate an emoji favicon as inline SVG.
 fn favicon(emoji: &str, x: i8, y: i8) -> Markup {
-    trace!("favicon({:?})", emoji);
     let data = [
         "data:image/svg+xml,",
         "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Ctext",
@@ -40,8 +39,6 @@ fn favicon(emoji: &str, x: i8, y: i8) -> Markup {
 ///                                      </span>");
 /// ```
 pub fn html_index_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
-    trace!("html_index_dupe({:?}, {:?})", the_real_deal, the_impostor);
-
     html! {
         span .dupe {
             "The file "
@@ -54,8 +51,6 @@ pub fn html_index_dupe(the_real_deal: &str, the_impostor: &str) -> Markup {
 
 /// Generate HTML header markup.
 fn html_index_head() -> Markup {
-    trace!("html_index_head()");
-
     html!(
         meta charset="utf-8";
         title { "PixRS output" }
@@ -69,8 +64,6 @@ fn html_index_head() -> Markup {
 
 /// Generate HTML header markup.
 fn html_index_header(from_path: &str) -> Markup {
-    trace!("html_index_header({:?})", from_path);
-
     let dt = OffsetDateTime::now_local().unwrap_or_else(|e| {
         error!("Unable to get local time (defaulting to UTC): {:?}", e);
         OffsetDateTime::now_utc()
@@ -91,8 +84,6 @@ pub fn html_index<F>(opt: &PixrsOpt, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
-    trace!("html_index({:?}, _)", opt);
-
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -116,8 +107,6 @@ fn html_index_main<F>(opt: &PixrsOpt, on_err: F) -> Markup
 where
     F: Fn(i32),
 {
-    trace!("html_index_main({:?}, _)", opt);
-
     let glob_pattern = crate::create_glob_pattern(&opt.base_path, opt.recurse);
 
     html!(
@@ -130,8 +119,6 @@ where
 
 /// Generate inline CSS.
 fn stylesheet() -> String {
-    trace!("stylesheet()");
-
     String::from(
         "
         audio {

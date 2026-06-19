@@ -1,9 +1,9 @@
 [package]
 name = "pixrs"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Kristian Thy <k@pyxy.dk>"]
 edition = "2021"
-description = "A command-line program to present a bunch of media files in a reasonable manner"
+description = "A command-line program to manage your media files"
 repository = "https://github.com/pyxy-dk/pixrs/"
 license = "AGPL-3.0-or-later"
 keywords = [
@@ -23,26 +23,27 @@ categories = [
 publish = false
 
 [dependencies]
-ctrlc = { version = "3.2", features = ["termination"] }                         # MIT OR Apache-2.0
-data-encoding = "2.3"                                                           # MIT
-env_logger = "0.9"                                                              # MIT OR Apache-2.0
-exitcode = "1.1"                                                                # Apache-2.0
+ctrlc = { version = "3", features = ["termination"] }                           # MIT OR Apache-2.0
+data-encoding = "2"                                                             # MIT
+env_logger = "0.11"                                                             # MIT OR Apache-2.0
+exitcode = "1"                                                                  # Apache-2.0
 # ffmpeg-next = { version = "4.4", features = ["codec", "format"] }               # GPL-3.0-or-later
 glob = "0.3"                                                                    # MIT OR Apache-2.0
 # id3 = "0.6"                                                                     # MIT
 indicatif = "0.17"                                                              # MIT
 # kamadak-exif = "0.5.4"                                                          # BSD-2-Clause
 log = "0.4"                                                                     # MIT OR Apache-2.0
-maud = "0.23"                                                                   # MIT OR Apache-2.0
-open = "2.0"                                                                    # MIT
-ring = "0.16"                                                                   # It's complicated
+maud = "0.26"                                                                   # MIT OR Apache-2.0
+open = "5"                                                                      # MIT
+polars = { version = "0.39.2", features = ["lazy"] }
+ring = "0.17"                                                                   # It's complicated
 rouille = "3.6"                                                                 # MIT OR Apache-2.0
 structopt = "0.3"                                                               # MIT OR Apache-2.0
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] } # MIT OR Apache-2.0
-unicode-segmentation = "1.10"                                                   # MIT OR Apache-2.0
-urlencoding = "2.1"                                                             # MIT
-uuid = { version = "1.2", features = ["v4"] }                                   # MIT OR Apache-2.0
+unicode-segmentation = "1"                                                      # MIT OR Apache-2.0
+urlencoding = "2"                                                               # MIT
+uuid = { version = "1", features = ["v4"] }                                     # MIT OR Apache-2.0
 
 [dev-dependencies]
-pretty_assertions = "1.3"
-tempfile = "3.3"
+pretty_assertions = "1.4"
+tempfile = "3.10"

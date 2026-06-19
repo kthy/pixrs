@@ -9,7 +9,7 @@ use crate::html::html_index_dupe;
 use crate::statics::SERVER_URL;
 use crate::structs::{InventoryItem, PixrsOpt};
 use crate::{create_inventory_item, create_progress_bar, find_files, sha256_digest};
-use log::{debug, info, trace};
+use log::{debug, info};
 use maud::{html, Markup, PreEscaped};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, remove_dir_all, File};
@@ -21,8 +21,6 @@ pub(crate) fn into_html<F>(opt: &PixrsOpt, glob_pattern: &str, on_err: F) -> Mar
 where
     F: Fn(i32),
 {
-    trace!("into_html({:?}, {:?}, _)", opt, glob_pattern);
-
     // Prepare output directory
     let base_snippet_path = format!("{}/audio", opt.out_path.display());
     let _ = remove_dir_all(&base_snippet_path);

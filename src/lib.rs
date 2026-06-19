@@ -1,7 +1,7 @@
 //! The meat of the matter.
 
 /*************************************************************************************************
- * Copyright © 2022 Kristian Thy (<k@pyxy.dk>)                                                   *
+ * Copyright © 2022, 2023, 2024 Kristian Thy (<k@pyxy.dk>)                                       *
  *                                                                                               *
  * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
  *                                                                                               *
@@ -21,7 +21,7 @@
 
 use crate::structs::{InventoryItem, PixrsOpt};
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{error, info, trace};
+use log::{debug, error, info};
 use ring::digest::{Context, SHA256};
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Read, Write};
@@ -38,8 +38,6 @@ pub mod video;
 
 /// Create a glob pattern.
 fn create_glob_pattern(path: &str, recurse: bool) -> String {
-    trace!("create_glob_pattern({:?}, {:?})", path, recurse);
-
     format!(
         "{}{}/*.",
         path.replace('\\', "/")
@@ -83,8 +81,6 @@ fn find_files<F>(extensions: Vec<&str>, glob_pattern: &str, on_err: F) -> Vec<Pa
 where
     F: Fn(i32),
 {
-    trace!("find_files({:?}, {:?}, _)", extensions, glob_pattern);
-
     let mut files: Vec<PathBuf> = vec![];
     for extension in extensions {
         let pattern = &(glob_pattern.to_owned() + extension);
@@ -113,8 +109,7 @@ where
 
 /// Make a `/local/` URL-encoded path out of an `InventoryItem`'s path.
 fn path_to_local(path: &Path, glob_pattern: &str) -> String {
-    trace!("path_to_local({:?}, {:?})", path, glob_pattern);
-
+    debug!("path_to_local({:?}, {:?})", path, glob_pattern);
     let fwd_pattern = glob_pattern.replace('\\', "/");
     let pattern_graphemes = fwd_pattern.graphemes(true).collect::<Vec<&str>>();
     let wildcard_position = pattern_graphemes
@@ -124,16 +119,22 @@ fn path_to_local(path: &Path, glob_pattern: &str) -> String {
     let fwd_path = path.display().to_string().replace('\\', "/");
     let path_graphemes = fwd_path.graphemes(true).collect::<Vec<&str>>();
     let final_path = path_graphemes[wildcard_position..].concat();
-    format!(
+    let retval = format!(
         "/local/{}",
         urlencoding::encode(&final_path).replace("%2F", "/")
-    )
+    );
+    debug!("fwd_pattern={:?}", fwd_pattern);
+    debug!("pattern_graphemes={:?}", pattern_graphemes);
+    debug!("wildcard_position={:?}", wildcard_position);
+    debug!("fwd_path={:?}", fwd_path);
+    debug!("path_graphemes={:?}", path_graphemes);
+    debug!("final_path={:?}", final_path);
+    debug!("retval={:?}", retval);
+    retval
 }
 
 /// Calculate the SHA256 digest of the file at `path`.
 fn sha256_digest(path: &Path) -> String {
-    trace!("sha256_digest({:?})", path);
-
     let input = File::open(path).unwrap();
     let mut reader = BufReader::new(input);
     let mut context = Context::new(&SHA256);
@@ -151,12 +152,10 @@ fn sha256_digest(path: &Path) -> String {
 }
 
 /// If `path` is not an existing directory, execute the provided callback function.
-pub fn validate_input<F>(cwd: &str, path: &str, on_err: F)
+pub fn validate_base_path_exists<F>(cwd: &str, path: &str, on_err: F)
 where
     F: Fn(i32),
 {
-    trace!("exit_if_nonexisting_input({:?}, {:?}, _)", cwd, path);
-
     if !Path::new(path).is_dir() {
         error!("{:?} is not a directory", path);
         eprintln!(
@@ -169,7 +168,7 @@ where
 
 /// If `path`/index.html exists and `clobber` is not `True`, execute the provided callback
 /// function. If `path` does not exist and `create_dir` is `True`, create it.
-pub fn validate_output<F>(
+pub fn create_out_path_unless_no_clobber<F>(
     cwd: &str,
     path: &Path,
     idx: &str,
@@ -179,14 +178,6 @@ pub fn validate_output<F>(
 ) where
     F: Fn(i32),
 {
-    trace!(
-        "exit_if_existing_output({:?}, {:?}, {:?}, {:?}, _)",
-        cwd,
-        path,
-        idx,
-        clobber
-    );
-
     if path.is_dir() {
         if !clobber && Path::new(&idx).exists() {
             error!("{:?} exists and clobber is false", idx);
@@ -213,8 +204,6 @@ pub fn write_html<F>(opt: &PixrsOpt, path: &str, on_err: F)
 where
     F: Fn(i32),
 {
-    trace!("write_html({:?}, {:?})", &opt, &path);
-
     let index_html = html::html_index(opt, on_err);
 
     let mut out_file = match File::create(path) {
@@ -237,8 +226,12 @@ mod tests {
 
     #[test]
     fn test_create_glob_pattern() {
-        let mut expected = "foo/*.";
-        let mut actual = create_glob_pattern("foo", false);
+        let mut expected = "./*.";
+        let mut actual = create_glob_pattern(".", false);
+        assert_eq!(actual, expected);
+
+        expected = "foo/*.";
+        actual = create_glob_pattern("foo", false);
         assert_eq!(actual, expected);
 
         expected = "foo/**/*.";
@@ -268,10 +261,16 @@ mod tests {
 
     #[test]
     fn test_path_to_local() {
-        let expected = "/local/audio/Birk%20CTG.mp3";
-        let p = Path::new("tests\\files\\audio/Birk CTG.mp3");
-        let g = "tests/files/**/*.mp3";
-        let actual = path_to_local(&p, &g);
+        let mut expected = "/local/audio/Birk%20CTG.mp3";
+        let mut p = Path::new("tests\\files\\audio/Birk CTG.mp3");
+        let mut g = "tests/files/**/*.mp3";
+        let mut actual = path_to_local(&p, &g);
+        assert_eq!(actual, expected);
+
+        expected = "/local/foo.png";
+        p = Path::new("foo.png");
+        g = "./*.";
+        actual = path_to_local(&p, &g);
         assert_eq!(actual, expected);
     }
 
