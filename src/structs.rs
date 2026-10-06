@@ -6,8 +6,8 @@
  *************************************************************************************************/
 
 use crate::statics::{ABOUT, AFTER_HELP};
+use clap::Parser;
 use std::path::PathBuf;
-use structopt::StructOpt;
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -19,42 +19,42 @@ pub struct InventoryItem {
 }
 
 /// Command-line options.
-#[derive(Debug, StructOpt)]
-#[structopt(about = ABOUT, after_help = AFTER_HELP, set_term_width = 80)]
+#[derive(Debug, Parser)]
+#[command(version, about = ABOUT, after_help = AFTER_HELP, term_width = 80)]
 pub struct PixrsOpt {
     /// The base path to search
-    #[structopt(default_value = ".", required_unless = "license")]
+    #[arg(default_value = ".", required_unless_present = "license")]
     pub base_path: String,
 
     /// Clobber output file if it exists
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub clobber: bool,
 
     /// Create output directory if it does not exist
-    #[structopt(short = "d", long = "create-dir")]
+    #[arg(short = 'd', long = "create-dir")]
     pub create_output_dir: bool,
 
     /// Display full license notice
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub license: bool,
 
     /// Do not start local server when finished (conflicts with --open)
-    #[structopt(short, long, conflicts_with = "open")]
+    #[arg(short, long, conflicts_with = "open")]
     pub no_server: bool,
 
     /// Open output in default browser when finished (conflicts with --no-server)
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub open: bool,
 
     /// The path where the output is placed
-    #[structopt(default_value = ".", parse(from_os_str), required_unless = "license")]
+    #[arg(default_value = ".", required_unless_present = "license")]
     pub out_path: PathBuf,
 
     /// Disable progress bars
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub quiet: bool, // TODO: implement
 
     /// Recurse into subdirs below the base path
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub recurse: bool,
 }

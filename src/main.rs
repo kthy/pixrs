@@ -19,6 +19,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.                         *
  *************************************************************************************************/
 
+use clap::Parser;
 use indicatif::HumanDuration;
 use log::{error, info};
 use pixrs::statics::{PROTOCOL, SERVER_URL};
@@ -28,7 +29,6 @@ use rouille::{match_assets, router, start_server, Response};
 use std::env;
 use std::process::exit;
 use std::time::Instant;
-use structopt::StructOpt;
 
 /// This is where the magic happens.
 fn main() {
@@ -41,7 +41,7 @@ fn main() {
     set_ctrlc_handler();
 
     // Load command line arguments
-    let opt = PixrsOpt::from_args();
+    let opt = PixrsOpt::parse();
 
     // Short circuit to license display
     if opt.license {
