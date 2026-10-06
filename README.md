@@ -8,25 +8,24 @@ A command-line utility to present a bunch of media files in a reasonable manner.
 ## Usage
 
 ```text
-USAGE:
-    pixrs.exe [FLAGS] <base-path> <out-path>
+Usage: pixrs [OPTIONS] [BASE_PATH] [OUT_PATH]
 
-FLAGS:
-    -c, --clobber       Clobber output file if it exists
-    -d, --create-dir    Create output directory if it does not exist
-    -h, --help          Prints help information
-    -l, --license       Display full license notice
-    -n, --no-server     Do not start local server when finished (forbidden if
-                        --open is set)
-    -o, --open          Open output in default browser when finished (forbidden
-                        if --no-server is set)
-    -q, --quiet         Disable progress bars
-    -r, --recurse       Recurse into subdirs below the base path
-    -V, --version       Prints version information
+Arguments:
+  [BASE_PATH]  The base path to search [default: .]
+  [OUT_PATH]   The path where the output is placed [default: .]
 
-ARGS:
-    <base-path>    The base path to search [default: .]
-    <out-path>     The path where the output is placed [default: .]
+Options:
+  -c, --clobber     Clobber output file if it exists
+  -d, --create-dir  Create output directory if it does not exist
+  -l, --license     Display full license notice
+  -n, --no-server   Do not start local server when finished (conflicts with
+                    --open)
+  -o, --open        Open output in default browser when finished (conflicts with
+                    --no-server)
+  -q, --quiet       Disable progress bars
+  -r, --recurse     Recurse into subdirs below the base path
+  -h, --help        Print help
+  -V, --version     Print version
 ```
 
 ## Building on Windows
