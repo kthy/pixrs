@@ -52,7 +52,7 @@ pub struct PixrsOpt {
 
     /// Disable progress bars
     #[arg(short, long)]
-    pub quiet: bool, // TODO: implement
+    pub quiet: bool,
 
     /// Recurse into subdirs below the base path
     #[arg(short, long)]

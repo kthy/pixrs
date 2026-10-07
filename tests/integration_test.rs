@@ -16,5 +16,5 @@ fn e2e() {
     };
     let idx = format!("{}/index.html", opt.out_path.display());
     let on_err = |_| panic!("at the callback");
-    let _ = write_html(&opt, &idx, on_err);
+    write_html(&opt, &idx, on_err);
 }

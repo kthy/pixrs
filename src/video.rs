@@ -83,7 +83,7 @@ where
 
 /// Generate HTML for a single file to place in index.html.
 fn html_for_index(inv_item: &InventoryItem) -> Markup {
-    let src = format!("{}{}", SERVER_URL, &inv_item.local_path);
+    let src = format!("{}{}", SERVER_URL, inv_item.local_path);
     let caption = &inv_item
         .path
         .split(std::path::MAIN_SEPARATOR)

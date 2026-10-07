@@ -19,16 +19,22 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.                         *
  *************************************************************************************************/
 
+use axum::http::{header, HeaderValue};
+use axum::response::Redirect;
+use axum::routing::get;
+use axum::Router;
 use clap::Parser;
 use indicatif::HumanDuration;
 use log::{error, info};
-use pixrs::statics::{PROTOCOL, SERVER_URL};
+use pixrs::statics::{LICENSE, PROTOCOL, SERVER_URL};
 use pixrs::structs::PixrsOpt;
-use pixrs::{validate_base_path_exists, create_out_path_unless_no_clobber, write_html};
-use rouille::{match_assets, router, start_server, Response};
+use pixrs::{create_out_path_unless_no_clobber, validate_base_path_exists, write_html};
 use std::env;
 use std::process::exit;
 use std::time::Instant;
+use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeader;
 
 /// This is where the magic happens.
 fn main() {
@@ -45,7 +51,8 @@ fn main() {
 
     // Short circuit to license display
     if opt.license {
-        panic!("FIXME: --license option not implemented");
+        println!("{}", LICENSE);
+        exit(exitcode::OK);
     }
 
     let cwd = infer_current_working_dir();
@@ -113,26 +120,30 @@ fn open_in_browser(url: &str) {
     });
 }
 
-fn serve(assets_path: String, local_assets_path: String, url: String) -> Response {
-    println!("\nNow serving your media files at {}", &url);
-    println!("Press Ctrl-C in this window to stop serving.");
-    start_server(
-        SERVER_URL
-            .strip_prefix(PROTOCOL)
-            .unwrap_or_else(|| panic!("Expected SERVER_URL to start with '{}'", PROTOCOL)),
-        move |req| {
-            router!(req,
-                (GET) (/) => { Response::redirect_303("/index.html") },
-                _ => {
-                    if let Some(req) = req.remove_prefix("/local") {
-                        match_assets(&req, &local_assets_path)
-                    } else {
-                        match_assets(req, &assets_path).with_unique_header("Cache-Control", "no-store")
-                    }
-                },
-            )
-        },
+fn serve(assets_path: String, local_assets_path: String, url: String) {
+    let addr = SERVER_URL
+        .strip_prefix(PROTOCOL)
+        .unwrap_or_else(|| panic!("Expected SERVER_URL to start with '{}'", PROTOCOL));
+    let assets = SetResponseHeader::overriding(
+        ServeDir::new(assets_path),
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
     );
+    let app = Router::new()
+        .route("/", get(|| async { Redirect::to("/index.html") }))
+        .nest_service("/local", ServeDir::new(local_assets_path))
+        .fallback_service(assets);
+
+    tokio::runtime::Runtime::new()
+        .expect("Unable to start async runtime!")
+        .block_on(async {
+            let listener = TcpListener::bind(addr)
+                .await
+                .unwrap_or_else(|e| panic!("Unable to bind to {}: {}", addr, e));
+            println!("\nNow serving your media files at {}", url);
+            println!("Press Ctrl-C in this window to stop serving.");
+            axum::serve(listener, app).await.expect("Server error!");
+        });
 }
 
 /// Set Ctrl-C handler

@@ -111,12 +111,14 @@ where
 fn path_to_local(path: &Path, glob_pattern: &str) -> String {
     debug!("path_to_local({:?}, {:?})", path, glob_pattern);
     let fwd_pattern = glob_pattern.replace('\\', "/");
+    let fwd_pattern = fwd_pattern.trim_start_matches("./");
     let pattern_graphemes = fwd_pattern.graphemes(true).collect::<Vec<&str>>();
     let wildcard_position = pattern_graphemes
         .iter()
         .position(|grapheme| *grapheme == "*")
         .unwrap();
     let fwd_path = path.display().to_string().replace('\\', "/");
+    let fwd_path = fwd_path.trim_start_matches("./");
     let path_graphemes = fwd_path.graphemes(true).collect::<Vec<&str>>();
     let final_path = path_graphemes[wildcard_position..].concat();
     let retval = format!(
@@ -264,13 +266,13 @@ mod tests {
         let mut expected = "/local/audio/Birk%20CTG.mp3";
         let mut p = Path::new("tests\\files\\audio/Birk CTG.mp3");
         let mut g = "tests/files/**/*.mp3";
-        let mut actual = path_to_local(&p, &g);
+        let mut actual = path_to_local(p, g);
         assert_eq!(actual, expected);
 
         expected = "/local/foo.png";
         p = Path::new("foo.png");
         g = "./*.";
-        actual = path_to_local(&p, &g);
+        actual = path_to_local(p, g);
         assert_eq!(actual, expected);
     }
 
@@ -279,7 +281,7 @@ mod tests {
         let expected = "/local/%E3%83%AF%E3%82%A4%E3%83%95/bl%C3%A5%20b%C3%A6r%20gr%C3%B8d.txt";
         let p = Path::new(".\\tästs\\漢字\\ワイフ\\blå bær grød.txt");
         let g = ".\\tästs\\漢字\\**/*.txt";
-        let actual = path_to_local(&p, &g);
+        let actual = path_to_local(p, g);
         assert_eq!(actual, expected);
     }
 
@@ -288,7 +290,7 @@ mod tests {
         let expected = "dbd318c1c462aee872f41109a4dfd3048871a03dedd0fe0e757ced57dad6f2d7";
         let mut temp_file = NamedTempFile::new().expect("Couldn't create temp file!");
         write!(temp_file, "foo bar baz").expect("Couldn't write test file!");
-        let actual = sha256_digest(&temp_file.path());
+        let actual = sha256_digest(temp_file.path());
         let _ = temp_file.close();
         assert_eq!(actual, expected);
     }
