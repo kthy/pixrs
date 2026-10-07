@@ -9,8 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `pixrs scan` catalogs a media library in SQLite: path, size, mtime and EXIF/track metadata
+  (date taken, camera, dimensions). Files that share their size with another cataloged file are
+  hashed (SHA-256) as duplicate candidates. Rescans only read new or changed files.
+
 ### Changed
 
+- The gallery generator moved to the `pixrs gallery` subcommand.
 - Replace the `rouille` web server with `axum`.
 - CI runs tests on Linux, Windows and macOS, and uses maintained actions instead of `actions-rs`.
 - Build instructions no longer require LLVM or FFmpeg.

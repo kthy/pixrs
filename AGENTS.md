@@ -19,11 +19,12 @@ optimize beyond that without a measured need.
 
 ## Direction
 
-The current code is the 2022 version: it globs a directory and writes one static `index.html`.
-The planned shape:
+The `gallery` subcommand is the 2022 version: it globs a directory and writes one static
+`index.html`. The planned shape, tracked in GitHub issues #32 to #37 (one per step):
 
-- `scan`: walk the library into a SQLite catalog (path, size, mtime, hash, media type, EXIF
-  fields). Incremental: only rehash files whose path, size or mtime changed.
+- `scan`: walk the library into a SQLite catalog (path, size, mtime, media type, EXIF fields),
+  then hash only files whose size matches another cataloged file. Incremental: only reread files
+  whose path, size or mtime changed.
 - `dupes`: tiered matching. Group by size, then content hash, then hash of decoded pixels
   (same image, different metadata), then perceptual hash (resized or recompressed copies).
   Fuzzy video and audio matching comes last.
@@ -57,8 +58,8 @@ Decided details:
 ## Invariants
 
 - **The library is read-only** except during `organize --apply`. Nothing else may write,
-  rename, delete or touch timestamps in the library. The catalog, thumbnails and reports live
-  outside it.
+  rename, delete or touch timestamps in the library. (Access times updated by the OS when files
+  are read are unavoidable and accepted.) The catalog, thumbnails and reports live outside it.
 - **Never delete user files.** Quarantine moves files; it does not delete them.
 - **Every move is journaled before it happens**, so `--apply` can be undone.
 - **Cross-platform**: Windows, Linux and macOS. Use `Path`/`PathBuf` operations, not string
@@ -71,7 +72,8 @@ Decided details:
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # CI enforces this
 cargo test
-cargo run -- -cdor tests/files target/output  # serves at http://localhost:2635
+cargo run -- gallery -cdor tests/files target/output  # serves at http://localhost:2635
+cargo run -- scan tests/files --catalog target/catalog.sqlite
 ```
 
 `just pre-commit` runs lint, a clean build and the tests.
@@ -89,6 +91,8 @@ on the LFS files.
 - `Cargo.toml` dependencies: major-version spec where possible, with the crate's license as a
   trailing comment aligned with the others. New dependencies must have AGPL-3.0-compatible
   licenses.
+- Catalog schema changes bump `SCHEMA_VERSION` in `src/catalog.rs` and must migrate existing
+  catalogs; users' catalogs hold hours of hashing.
 - Conventional Commits: `feat`, `fix`, `chore`, `chore(deps)`, `docs`, `ci`, `test`.
 - Add user-visible changes to `[Unreleased]` in `CHANGELOG.md` (Keep a Changelog format).
 - Keep the usage block in `README.md` identical to `pixrs --help` output.

@@ -30,8 +30,12 @@ use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 pub mod audio;
+pub mod catalog;
+pub mod error;
 pub mod html;
 pub mod image;
+pub mod media;
+pub mod scan;
 pub mod statics;
 pub mod structs;
 pub mod video;
