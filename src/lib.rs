@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 pub mod audio;
 pub mod catalog;
+pub mod dupes;
 pub mod error;
 pub mod html;
 pub mod image;

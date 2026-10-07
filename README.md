@@ -11,6 +11,7 @@ A command-line utility to present a bunch of media files in a reasonable manner.
 Usage: pixrs [OPTIONS] [COMMAND]
 
 Commands:
+  dupes    Report exact duplicates in the catalog
   gallery  Generate a static HTML gallery and serve it
   scan     Scan a media library into the catalog
   help     Print this message or the help of the given subcommand(s)
@@ -41,6 +42,42 @@ them, date taken, camera and dimensions. Only files that share their size with a
 file can be exact duplicates, so only those are hashed (SHA-256); files with a unique size are
 never read in full. Rescanning only reads files that are new or whose size or modification time
 changed. The library itself is never modified.
+
+### Report exact duplicates
+
+```text
+Usage: pixrs dupes [OPTIONS] [LIBRARIES]...
+
+Arguments:
+  [LIBRARIES]...
+          Only report duplicates of files in these libraries [default: all
+          scanned libraries]
+
+Options:
+      --catalog <CATALOG>
+          The catalog file [default: catalog.sqlite in the OS data directory]
+
+      --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: For people to read
+          - json: One object with all groups and a summary
+          - csv:  One row per file
+
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
+Duplicates are files with the same size and SHA-256, in any scanned library. In each group the
+file with the earliest modification time is marked `keep`; ties go to the first path in sort
+order. Naming libraries shows only groups with a file in them, but with all copies: for example,
+`pixrs dupes /mnt/old-disk` lists what on the old disk also exists elsewhere.
+
+The report comes from the catalog as of each library's last scan, so rescan libraries that have
+changed. It never touches the library.
 
 ### Generate a static gallery
 

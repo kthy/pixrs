@@ -8,7 +8,9 @@
 use crate::error::Error;
 use crate::media::MediaType;
 use directories::ProjectDirs;
-use rusqlite::{params, Connection, Row, Transaction};
+use rusqlite::{
+    params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row, Transaction,
+};
 use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
@@ -75,6 +77,17 @@ pub struct FileRecord {
     pub meta: MediaMeta,
 }
 
+/// A hashed file, with the root of the library it is in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashedFile {
+    pub library_id: i64,
+    pub root: String,
+    pub path: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub sha256: String,
+}
+
 /// An open catalog.
 pub struct Catalog {
     conn: Connection,
@@ -117,6 +130,32 @@ impl Catalog {
         Ok(Catalog { conn })
     }
 
+    /// Open the catalog at `path` read-only. It must exist and have the current schema.
+    pub fn open_existing(path: &Path) -> Result<Self, Error> {
+        if !path.is_file() {
+            return Err(Error::Usage(format!(
+                "There is no catalog at {}. Run `pixrs scan <LIBRARY>` first.",
+                path.display()
+            )));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(Error::Usage(format!(
+                "{} is not a catalog this version of pixrs understands (schema version {}, \
+                 expected {})",
+                path.display(),
+                version,
+                SCHEMA_VERSION
+            )));
+        }
+        Ok(Catalog { conn })
+    }
+
     /// Start a transaction. Catalog writes made while it is alive are part of it.
     pub fn transaction(&self) -> rusqlite::Result<Transaction<'_>> {
         self.conn.unchecked_transaction()
@@ -132,6 +171,15 @@ impl Catalog {
             .query_row("SELECT id FROM libraries WHERE root = ?1", [root], |row| {
                 row.get(0)
             })
+    }
+
+    /// The ID of the library at `root`, if it has been scanned.
+    pub fn find_library(&self, root: &str) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row("SELECT id FROM libraries WHERE root = ?1", [root], |row| {
+                row.get(0)
+            })
+            .optional()
     }
 
     /// Record that the library was just scanned.
@@ -221,6 +269,54 @@ impl Catalog {
         rows.collect()
     }
 
+    /// Number of files in the given libraries (all if empty) that share their size with another
+    /// file but have no hash yet, because their library has not been scanned since the size
+    /// became shared.
+    pub fn count_unhashed_with_shared_size(&self, libraries: &[i64]) -> rusqlite::Result<usize> {
+        let in_libraries = if libraries.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "AND library_id IN ({})",
+                vec!["?"; libraries.len()].join(", ")
+            )
+        };
+        self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM files
+                 WHERE sha256 IS NULL
+                   AND size IN (SELECT size FROM files GROUP BY size HAVING count(*) > 1)
+                   {}",
+                in_libraries
+            ),
+            params_from_iter(libraries),
+            |row| row.get::<_, i64>(0).map(|n| n as usize),
+        )
+    }
+
+    /// Every file, in any library, whose size and hash match another file's.
+    pub fn duplicate_candidates(&self) -> rusqlite::Result<Vec<HashedFile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256
+             FROM files f JOIN libraries l ON l.id = f.library_id
+             WHERE (f.size, f.sha256) IN (
+                 SELECT size, sha256 FROM files WHERE sha256 IS NOT NULL
+                 GROUP BY size, sha256 HAVING count(*) > 1
+             )",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(HashedFile {
+                library_id: row.get(0)?,
+                root: row.get(1)?,
+                path: row.get(2)?,
+                size: row.get::<_, i64>(3)? as u64,
+                mtime_ns: row.get(4)?,
+                sha256: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Remove a file from the catalog.
     pub fn remove(&self, library_id: i64, path: &str) -> rusqlite::Result<()> {
         self.conn.execute(
@@ -239,6 +335,25 @@ impl Catalog {
         )?;
         let rows = stmt.query_map([library_id], file_record)?;
         rows.collect()
+    }
+}
+
+/// The file at the `/`-separated relative path `rel` below `root`. Joins part by part, because
+/// Windows does not translate `/` in verbatim (`\\?\`) paths like a canonical root.
+pub fn library_path(root: &Path, rel: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    path.extend(rel.split('/'));
+    path
+}
+
+/// A library root as users know it: without the `\\?\` prefix Windows puts on canonical paths.
+pub fn display_root(root: &str) -> String {
+    if let Some(unc) = root.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", unc)
+    } else if let Some(local) = root.strip_prefix(r"\\?\") {
+        String::from(local)
+    } else {
+        String::from(root)
     }
 }
 
@@ -294,6 +409,36 @@ mod tests {
         let catalog = Catalog::open(&path).unwrap();
         let id = catalog.library_id("/lib").unwrap();
         assert_eq!(catalog.files(id).unwrap(), vec![record("a.jpg", 1)]);
+    }
+
+    #[test]
+    fn test_open_existing_requires_a_catalog() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        assert!(matches!(
+            Catalog::open_existing(&path),
+            Err(Error::Usage(_))
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_open_existing_refuses_empty_file_without_writing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        std::fs::write(&path, b"").unwrap();
+        assert!(matches!(
+            Catalog::open_existing(&path),
+            Err(Error::Usage(_))
+        ));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_display_root() {
+        assert_eq!(display_root(r"\\?\C:\Photos"), r"C:\Photos");
+        assert_eq!(display_root(r"\\?\UNC\nas\share"), r"\\nas\share");
+        assert_eq!(display_root("/home/me/Photos"), "/home/me/Photos");
     }
 
     #[test]
