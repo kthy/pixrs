@@ -32,7 +32,7 @@ exitcode = "1"                                                                  
 glob = "0.3"                                                                    # MIT OR Apache-2.0
 indicatif = "0.18"                                                              # MIT
 log = "0.4"                                                                     # MIT OR Apache-2.0
-maud = "0.26"                                                                   # MIT OR Apache-2.0
+maud = "0.27"                                                                   # MIT OR Apache-2.0
 open = "5"                                                                      # MIT
 ring = "0.17"                                                                   # It's complicated
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] } # MIT OR Apache-2.0
