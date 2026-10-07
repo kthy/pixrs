@@ -1,7 +1,7 @@
 [package]
 name = "pixrs"
 version = "0.1.2"
-authors = ["Kristian Thy <k@pyxy.dk>"]
+authors = ["Kristian Thy <thy@42.dk>"]
 edition = "2021"
 description = "A command-line program to manage your media files"
 repository = "https://github.com/kthy/pixrs/"

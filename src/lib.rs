@@ -1,7 +1,7 @@
 //! The meat of the matter.
 
 /*************************************************************************************************
- * Copyright © 2022, 2023, 2024 Kristian Thy (<k@pyxy.dk>)                                       *
+ * Copyright © 2022-2026 Kristian Thy (<thy@42.dk>)                                              *
  *                                                                                               *
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *                                                                                               *
