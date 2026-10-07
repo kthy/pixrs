@@ -2,7 +2,7 @@
 
 /*************************************************************************************************
  * Copyright © 2022, 2023, 2024 Kristian Thy (<k@pyxy.dk>)                                       *
- * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
+ * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
 /// Clap about text.
@@ -16,7 +16,7 @@ pub static AFTER_HELP: &str = "LEGAL NOTICE:
     TODO \"contains software from\"
 
     You may obtain a copy of the Software's corresponding source code from
-    <https://github.com/pyxy-dk/pixrs>. To read the full license notices, run
+    <https://github.com/kthy/pixrs>. To read the full license notices, run
     the Software with the `--license` flag.
 ";
 

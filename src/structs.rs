@@ -2,7 +2,7 @@
 
 /*************************************************************************************************
  * Copyright © 2022 Kristian Thy (<k@pyxy.dk>)                                                   *
- * This file is part of PixRS: <https://github.com/pyxy-dk/pixrs>                                *
+ * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
 use crate::statics::{ABOUT, AFTER_HELP};

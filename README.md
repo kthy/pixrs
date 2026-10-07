@@ -56,10 +56,10 @@ cargo run -- -cdor .\tests\files\ target/output
 
 ...
 
-[badge-audit-href]: https://github.com/pyxy-dk/pixrs/actions/workflows/audit.yml
-[badge-audit-svg]: https://github.com/pyxy-dk/pixrs/actions/workflows/audit.yml/badge.svg
-[badge-ci-href]: https://github.com/pyxy-dk/pixrs/actions/workflows/ci.yml
-[badge-ci-svg]: https://github.com/pyxy-dk/pixrs/actions/workflows/ci.yml/badge.svg
+[badge-audit-href]: https://github.com/kthy/pixrs/actions/workflows/audit.yml
+[badge-audit-svg]: https://github.com/kthy/pixrs/actions/workflows/audit.yml/badge.svg
+[badge-ci-href]: https://github.com/kthy/pixrs/actions/workflows/ci.yml
+[badge-ci-svg]: https://github.com/kthy/pixrs/actions/workflows/ci.yml/badge.svg
 [ffmpeg-win]: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z
 [llvm]: https://github.com/llvm/llvm-project/releases
 [rustup]: https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe
