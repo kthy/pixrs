@@ -27,10 +27,13 @@ use clap::{CommandFactory, Parser};
 use indicatif::HumanDuration;
 use log::{debug, error, info};
 use pixrs::catalog::Catalog;
+use pixrs::dupes::{find_dupes, write_csv, write_json, write_text};
 use pixrs::statics::{LICENSE, PROTOCOL, SERVER_URL};
-use pixrs::structs::{Cli, Command, PixrsOpt, ScanOpt};
+use pixrs::structs::{Cli, Command, DupesOpt, Format, PixrsOpt, ScanOpt};
 use pixrs::{create_out_path_unless_no_clobber, validate_base_path_exists, write_html};
 use std::env;
+use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
 use std::process::exit;
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -57,6 +60,7 @@ fn main() {
     }
 
     match cli.command {
+        Some(Command::Dupes(opt)) => dupes(opt),
         Some(Command::Gallery(opt)) => gallery(opt, now),
         Some(Command::Scan(opt)) => scan(opt, now),
         None => {
@@ -114,15 +118,77 @@ fn gallery(opt: PixrsOpt, now: Instant) {
     }
 }
 
+/// The catalog path given on the command line, or the default one.
+fn catalog_path(given: Option<PathBuf>) -> PathBuf {
+    given.or_else(Catalog::default_path).unwrap_or_else(|| {
+        eprintln!("Unable to find a data directory for the catalog; pass --catalog");
+        exit(exitcode::USAGE)
+    })
+}
+
+/// Print an error and exit with its exit code.
+fn fail(context: &str, e: pixrs::error::Error) -> ! {
+    debug!("{:?}", e);
+    eprintln!("{}: {}", context, e);
+    exit(e.exit_code())
+}
+
+/// Report exact duplicates in the catalog.
+fn dupes(opt: DupesOpt) {
+    let catalog_path = catalog_path(opt.catalog);
+    let catalog =
+        Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail("Dupes failed", e));
+    let mut libraries: Vec<i64> = vec![];
+    for library in &opt.libraries {
+        let root = library
+            .canonicalize()
+            .ok()
+            .and_then(|root| root.to_str().map(String::from));
+        let id = match root.map(|root| catalog.find_library(&root)).transpose() {
+            Ok(id) => id.flatten(),
+            Err(e) => fail("Dupes failed", e.into()),
+        };
+        match id {
+            Some(id) => libraries.push(id),
+            None => {
+                eprintln!(
+                    "{} has not been scanned. Run `pixrs scan {}` first.",
+                    library.display(),
+                    library.display()
+                );
+                exit(exitcode::USAGE)
+            }
+        }
+    }
+    let report = match find_dupes(&catalog, &libraries) {
+        Ok(report) => report,
+        Err(e) => fail("Dupes failed", e.into()),
+    };
+
+    let mut out = BufWriter::new(io::stdout().lock());
+    let written = match opt.format {
+        Format::Text => write_text(&report, &mut out),
+        Format::Json => write_json(&report, &mut out),
+        Format::Csv => write_csv(&report, &mut out),
+    }
+    .and_then(|_| out.flush());
+    if let Err(e) = written {
+        fail("Dupes failed", e.into());
+    }
+
+    let unhashed = report.summary.unhashed_candidates;
+    if unhashed > 0 {
+        eprintln!(
+            "Note: {} files share their size with another file but are not hashed yet, so \
+             there may be more duplicates. Scan their libraries again to hash them.",
+            unhashed
+        );
+    }
+}
+
 /// Scan a media library into the catalog and print a summary.
 fn scan(opt: ScanOpt, now: Instant) {
-    let catalog = opt
-        .catalog
-        .or_else(Catalog::default_path)
-        .unwrap_or_else(|| {
-            eprintln!("Unable to find a data directory for the catalog; pass --catalog");
-            exit(exitcode::USAGE)
-        });
+    let catalog = catalog_path(opt.catalog);
     match pixrs::scan::scan(&opt.library, &catalog, opt.quiet) {
         Ok(s) => {
             println!(
@@ -139,11 +205,7 @@ fn scan(opt: ScanOpt, now: Instant) {
             );
             println!("Catalog: {}", catalog.display());
         }
-        Err(e) => {
-            debug!("{:?}", e);
-            eprintln!("Scan failed: {}", e);
-            exit(e.exit_code())
-        }
+        Err(e) => fail("Scan failed", e),
     }
 }
 

@@ -5,7 +5,7 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::catalog::{Catalog, FileRecord, MediaMeta, Stamp};
+use crate::catalog::{library_path, Catalog, FileRecord, MediaMeta, Stamp};
 use crate::error::Error;
 use crate::media::MediaType;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -218,14 +218,6 @@ pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSumm
     tx.commit()?;
 
     Ok(summary)
-}
-
-/// The file at the `/`-separated relative path `rel` below `root`. Joins part by part, because
-/// Windows does not translate `/` in verbatim (`\\?\`) paths like a canonical root.
-fn library_path(root: &Path, rel: &str) -> PathBuf {
-    let mut path = root.to_path_buf();
-    path.extend(rel.split('/'));
-    path
 }
 
 /// `path` made absolute, with its longest existing prefix canonicalized so that symlinks and `..`

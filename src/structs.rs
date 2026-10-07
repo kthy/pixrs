@@ -6,7 +6,7 @@
  *************************************************************************************************/
 
 use crate::statics::{ABOUT, AFTER_HELP};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -39,6 +39,8 @@ pub struct Cli {
 /// Subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Report exact duplicates in the catalog
+    Dupes(DupesOpt),
     /// Generate a static HTML gallery and serve it
     Gallery(PixrsOpt),
     /// Scan a media library into the catalog
@@ -94,4 +96,30 @@ pub struct ScanOpt {
     /// Disable progress bars
     #[arg(short, long)]
     pub quiet: bool,
+}
+
+/// Options for `pixrs dupes`.
+#[derive(Debug, Args)]
+pub struct DupesOpt {
+    /// Only report duplicates of files in these libraries [default: all scanned libraries]
+    pub libraries: Vec<PathBuf>,
+
+    /// The catalog file [default: catalog.sqlite in the OS data directory]
+    #[arg(long)]
+    pub catalog: Option<PathBuf>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    pub format: Format,
+}
+
+/// Report output formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Format {
+    /// For people to read
+    Text,
+    /// One object with all groups and a summary
+    Json,
+    /// One row per file
+    Csv,
 }
