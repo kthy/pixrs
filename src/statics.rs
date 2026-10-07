@@ -6,7 +6,7 @@
  *************************************************************************************************/
 
 /// Clap about text.
-pub static ABOUT: &str = "A CLI tool that presents a bunch of media files in a reasonable manner.";
+pub static ABOUT: &str = "View, deduplicate and organize your media files.";
 
 /// Clap after-help text.
 pub static AFTER_HELP: &str = "LEGAL NOTICE:

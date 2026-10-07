@@ -23,11 +23,12 @@ use axum::http::{header, HeaderValue};
 use axum::response::Redirect;
 use axum::routing::get;
 use axum::Router;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use indicatif::HumanDuration;
-use log::{error, info};
+use log::{debug, error, info};
+use pixrs::catalog::Catalog;
 use pixrs::statics::{LICENSE, PROTOCOL, SERVER_URL};
-use pixrs::structs::PixrsOpt;
+use pixrs::structs::{Cli, Command, PixrsOpt, ScanOpt};
 use pixrs::{create_out_path_unless_no_clobber, validate_base_path_exists, write_html};
 use std::env;
 use std::process::exit;
@@ -47,14 +48,26 @@ fn main() {
     set_ctrlc_handler();
 
     // Load command line arguments
-    let opt = PixrsOpt::parse();
+    let cli = Cli::parse();
 
     // Short circuit to license display
-    if opt.license {
+    if cli.license {
         println!("{}", LICENSE);
         exit(exitcode::OK);
     }
 
+    match cli.command {
+        Some(Command::Gallery(opt)) => gallery(opt, now),
+        Some(Command::Scan(opt)) => scan(opt, now),
+        None => {
+            Cli::command().print_help().expect("Unable to print help!");
+            exit(exitcode::USAGE);
+        }
+    }
+}
+
+/// Generate a static HTML gallery, then optionally open and serve it.
+fn gallery(opt: PixrsOpt, now: Instant) {
     let cwd = infer_current_working_dir();
 
     // Callback to stop the timer and exit with the given code.
@@ -98,6 +111,39 @@ fn main() {
 
     if !opt.no_server {
         serve(opt.out_path.display().to_string(), opt.base_path, url);
+    }
+}
+
+/// Scan a media library into the catalog and print a summary.
+fn scan(opt: ScanOpt, now: Instant) {
+    let catalog = opt
+        .catalog
+        .or_else(Catalog::default_path)
+        .unwrap_or_else(|| {
+            eprintln!("Unable to find a data directory for the catalog; pass --catalog");
+            exit(exitcode::USAGE)
+        });
+    match pixrs::scan::scan(&opt.library, &catalog, opt.quiet) {
+        Ok(s) => {
+            println!(
+                "Scanned {} in {}: {} added, {} updated, {} removed, {} unchanged, {} hashed, \
+                 {} skipped",
+                opt.library.display(),
+                HumanDuration(now.elapsed()),
+                s.added,
+                s.updated,
+                s.removed,
+                s.unchanged,
+                s.hashed,
+                s.skipped
+            );
+            println!("Catalog: {}", catalog.display());
+        }
+        Err(e) => {
+            debug!("{:?}", e);
+            eprintln!("Scan failed: {}", e);
+            exit(e.exit_code())
+        }
     }
 }
 
