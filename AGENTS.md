@@ -92,5 +92,7 @@ on the LFS files.
 - Conventional Commits: `feat`, `fix`, `chore`, `chore(deps)`, `docs`, `ci`, `test`.
 - Add user-visible changes to `[Unreleased]` in `CHANGELOG.md` (Keep a Changelog format).
 - Keep the usage block in `README.md` identical to `pixrs --help` output.
-- GitHub Actions are pinned to commit SHAs with the version as a trailing comment.
+- GitHub Actions are pinned to commit SHAs with the version as a trailing comment. Workflow
+  changes must pass `zizmor --persona=auditor --strict-collection .github/` (run locally with
+  `uvx zizmor ...`); CI enforces it.
 - `CLAUDE.md` is a symlink to this file.
