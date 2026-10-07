@@ -20,6 +20,9 @@ pub static AFTER_HELP: &str = "LEGAL NOTICE:
     the Software with the `--license` flag.
 ";
 
+/// Full license text, displayed by `--license`.
+pub static LICENSE: &str = include_str!("../LICENSE.md");
+
 /// Glob options.
 pub static GLOPTS: glob::MatchOptions = glob::MatchOptions {
     case_sensitive: false,

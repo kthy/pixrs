@@ -28,38 +28,23 @@ Options:
   -V, --version     Print version
 ```
 
-## Building on Windows
+## Building
 
-### Prerequisites
-
-#### Rust
-
-Download and run the [`rustup-init.exe`][rustup] installer.
-
-#### LLVM
-
-Download and run the [`LLVM-x.y.z-win64.exe`][llvm] installer. Add LLVM to the system PATH for all
-users during installation.
-
-#### FFmpeg
-
-Download the newest [`ffmpeg-release-full-shared.7z`][ffmpeg-win] from gyan.dev, unpack it and
-set the `FFMPEG_DIR` environment variable to the directory containing `include` and `lib`.
-
-### Build, Test and Run
+Install Rust with [rustup]. There are no other build dependencies.
 
 ```bash
 cargo build
 cargo test
-cargo run -- -cdor .\tests\files\ target/output
+cargo run -- -cdor tests/files target/output
 ```
 
-...
+The test media files are stored with [Git LFS][git-lfs]. Without it they are checked out as small
+pointer files; the tests still pass, but the generated gallery shows broken media. Install Git LFS
+and run `git lfs pull` to fetch the real files.
 
 [badge-audit-href]: https://github.com/kthy/pixrs/actions/workflows/audit.yml
 [badge-audit-svg]: https://github.com/kthy/pixrs/actions/workflows/audit.yml/badge.svg
 [badge-ci-href]: https://github.com/kthy/pixrs/actions/workflows/ci.yml
 [badge-ci-svg]: https://github.com/kthy/pixrs/actions/workflows/ci.yml/badge.svg
-[ffmpeg-win]: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z
-[llvm]: https://github.com/llvm/llvm-project/releases
-[rustup]: https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe
+[git-lfs]: https://git-lfs.com/
+[rustup]: https://rustup.rs/

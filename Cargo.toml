@@ -23,23 +23,21 @@ categories = [
 publish = false
 
 [dependencies]
+axum = "0.8"                                                                    # MIT
 clap = { version = "4", features = ["derive", "wrap_help"] }                    # MIT OR Apache-2.0
 ctrlc = { version = "3", features = ["termination"] }                           # MIT OR Apache-2.0
 data-encoding = "2"                                                             # MIT
 env_logger = "0.11"                                                             # MIT OR Apache-2.0
 exitcode = "1"                                                                  # Apache-2.0
-# ffmpeg-next = { version = "4.4", features = ["codec", "format"] }               # GPL-3.0-or-later
 glob = "0.3"                                                                    # MIT OR Apache-2.0
-# id3 = "0.6"                                                                     # MIT
 indicatif = "0.18"                                                              # MIT
-# kamadak-exif = "0.5.4"                                                          # BSD-2-Clause
 log = "0.4"                                                                     # MIT OR Apache-2.0
 maud = "0.26"                                                                   # MIT OR Apache-2.0
 open = "5"                                                                      # MIT
-polars = { version = "0.55.2", features = ["lazy"] }
 ring = "0.17"                                                                   # It's complicated
-rouille = "3.6"                                                                 # MIT OR Apache-2.0
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] } # MIT OR Apache-2.0
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }             # MIT
+tower-http = { version = "0.7", features = ["fs", "set-header"] }               # MIT
 unicode-segmentation = "1"                                                      # MIT OR Apache-2.0
 urlencoding = "2"                                                               # MIT
 uuid = { version = "1", features = ["v4"] }                                     # MIT OR Apache-2.0

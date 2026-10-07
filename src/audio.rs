@@ -90,7 +90,7 @@ where
 
 /// Generate HTML for a single file to load into index.html.
 fn html_for_htmx(inv_item: &InventoryItem) -> Markup {
-    let src = format!("{}{}", SERVER_URL, &inv_item.local_path);
+    let src = format!("{}{}", SERVER_URL, inv_item.local_path);
     html! {
         #(inv_item.uuid) {
             figure {
@@ -105,7 +105,7 @@ fn html_for_htmx(inv_item: &InventoryItem) -> Markup {
 
 /// Generate HTML for a single file to place in index.html.
 fn html_for_index(inv_item: &InventoryItem) -> Markup {
-    let hx_get_url = format!("/audio/{}.html", &inv_item.uuid);
+    let hx_get_url = format!("/audio/{}.html", inv_item.uuid);
     let text = &inv_item
         .path
         .split(std::path::MAIN_SEPARATOR)
@@ -122,7 +122,7 @@ fn html_for_index(inv_item: &InventoryItem) -> Markup {
 
 /// Write HTML snippet to a file.
 fn write_snippet(base_snippet_path: &str, uuid: &Uuid, markup: Markup) {
-    let snippet_path = format!("{}/{}.html", &base_snippet_path, uuid);
+    let snippet_path = format!("{}/{}.html", base_snippet_path, uuid);
     let mut snippet_file =
         File::create(snippet_path).expect("Couldn't create audio file HTML snippet!");
     write!(snippet_file, "{}", markup.into_string())
