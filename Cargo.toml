@@ -36,7 +36,7 @@ indicatif = "0.17"                                                              
 log = "0.4"                                                                     # MIT OR Apache-2.0
 maud = "0.26"                                                                   # MIT OR Apache-2.0
 open = "5"                                                                      # MIT
-polars = { version = "0.39.2", features = ["lazy"] }
+polars = { version = "0.55.2", features = ["lazy"] }
 ring = "0.17"                                                                   # It's complicated
 rouille = "3.6"                                                                 # MIT OR Apache-2.0
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] } # MIT OR Apache-2.0
