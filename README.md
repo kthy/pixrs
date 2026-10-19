@@ -11,10 +11,10 @@ A command-line utility to present a bunch of media files in a reasonable manner.
 Usage: pixrs [OPTIONS] [COMMAND]
 
 Commands:
-  dupes    Report exact duplicates in the catalog
-  gallery  Generate a static HTML gallery and serve it
-  scan     Scan a media library into the catalog
-  help     Print this message or the help of the given subcommand(s)
+  dupes  Report exact duplicates in the catalog
+  scan   Scan a media library into the catalog
+  serve  Browse the catalog in a local web viewer
+  help   Print this message or the help of the given subcommand(s)
 
 Options:
   -l, --license  Display full license notice
@@ -79,26 +79,39 @@ order. Naming libraries shows only groups with a file in them, but with all copi
 The report comes from the catalog as of each library's last scan, so rescan libraries that have
 changed. It never touches the library.
 
-### Generate a static gallery
+### Browse the catalog
 
 ```text
-Usage: pixrs gallery [OPTIONS] [BASE_PATH] [OUT_PATH]
+Usage: pixrs serve [OPTIONS] [LIBRARIES]...
 
 Arguments:
-  [BASE_PATH]  The base path to search [default: .]
-  [OUT_PATH]   The path where the output is placed [default: .]
+  [LIBRARIES]...  Only show files in these libraries [default: all scanned
+                  libraries]
 
 Options:
-  -c, --clobber     Clobber output file if it exists
-  -d, --create-dir  Create output directory if it does not exist
-  -n, --no-server   Do not start local server when finished (conflicts with
-                    --open)
-  -o, --open        Open output in default browser when finished (conflicts with
-                    --no-server)
-  -q, --quiet       Disable progress bars
-  -r, --recurse     Recurse into subdirs below the base path
-  -h, --help        Print help
+      --catalog <CATALOG>  The catalog file [default: catalog.sqlite in the OS
+                           data directory]
+      --cache <CACHE>      The thumbnail cache folder [default: thumbnails in
+                           the OS cache directory]
+      --port <PORT>        The port to listen on, on localhost only [default:
+                           2635]
+  -o, --open               Open the viewer in the default browser
+  -h, --help               Print help
 ```
+
+Starts a viewer at `http://127.0.0.1:2635/`: browse by folder or by date (date taken, or the
+modification time if that is unknown), view images, play audio and video, and compare duplicate
+groups side by side with the copy to keep marked. It only reads from the libraries and the
+catalog, so it can run while a scan is going on.
+
+Thumbnails are cached outside the libraries. JPEG, PNG, GIF, WebP, BMP and TIFF are decoded
+in-process. HEIC, AVIF and video thumbnails need [FFmpeg][ffmpeg] (HEIC tested with 7.1) on
+`PATH`; without it, and for RAW files, the viewer shows placeholders. Images that browsers cannot
+show (HEIC, TIFF) are shown as a large JPEG preview. Videos are not transcoded: if the browser
+cannot play one, the viewer says so and links to the original.
+
+The viewer only listens on localhost and only answers requests addressed to `localhost` or
+`127.0.0.1`.
 
 ## Building
 
@@ -109,16 +122,18 @@ command line tools on macOS, or `gcc`/`clang` on Linux.
 ```bash
 cargo build
 cargo test
-cargo run -- gallery -cdor tests/files target/output
+cargo run -- scan tests/files --catalog target/catalog.sqlite
+cargo run -- serve --catalog target/catalog.sqlite --open
 ```
 
 The test media files are stored with [Git LFS][git-lfs]. Without it they are checked out as small
-pointer files; the tests still pass, but the generated gallery shows broken media. Install Git LFS
+pointer files; the tests still pass, but the viewer shows placeholders for them. Install Git LFS
 and run `git lfs pull` to fetch the real files.
 
 [badge-audit-href]: https://github.com/kthy/pixrs/actions/workflows/audit.yml
 [badge-audit-svg]: https://github.com/kthy/pixrs/actions/workflows/audit.yml/badge.svg
 [badge-ci-href]: https://github.com/kthy/pixrs/actions/workflows/ci.yml
 [badge-ci-svg]: https://github.com/kthy/pixrs/actions/workflows/ci.yml/badge.svg
+[ffmpeg]: https://ffmpeg.org/
 [git-lfs]: https://git-lfs.com/
 [rustup]: https://rustup.rs/

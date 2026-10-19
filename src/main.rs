@@ -19,26 +19,18 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.                         *
  *************************************************************************************************/
 
-use axum::http::{header, HeaderValue};
-use axum::response::Redirect;
-use axum::routing::get;
-use axum::Router;
 use clap::{CommandFactory, Parser};
 use indicatif::HumanDuration;
-use log::{debug, error, info};
+use log::{debug, error};
 use pixrs::catalog::Catalog;
 use pixrs::dupes::{find_dupes, write_csv, write_json, write_text};
-use pixrs::statics::{LICENSE, PROTOCOL, SERVER_URL};
-use pixrs::structs::{Cli, Command, DupesOpt, Format, PixrsOpt, ScanOpt};
-use pixrs::{create_out_path_unless_no_clobber, validate_base_path_exists, write_html};
-use std::env;
+use pixrs::serve::{default_cache_dir, Config};
+use pixrs::statics::LICENSE;
+use pixrs::structs::{Cli, Command, DupesOpt, Format, ScanOpt, ServeOpt};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::exit;
 use std::time::Instant;
-use tokio::net::TcpListener;
-use tower_http::services::ServeDir;
-use tower_http::set_header::SetResponseHeader;
 
 /// This is where the magic happens.
 fn main() {
@@ -61,60 +53,12 @@ fn main() {
 
     match cli.command {
         Some(Command::Dupes(opt)) => dupes(opt),
-        Some(Command::Gallery(opt)) => gallery(opt, now),
         Some(Command::Scan(opt)) => scan(opt, now),
+        Some(Command::Serve(opt)) => serve(opt),
         None => {
             Cli::command().print_help().expect("Unable to print help!");
             exit(exitcode::USAGE);
         }
-    }
-}
-
-/// Generate a static HTML gallery, then optionally open and serve it.
-fn gallery(opt: PixrsOpt, now: Instant) {
-    let cwd = infer_current_working_dir();
-
-    // Callback to stop the timer and exit with the given code.
-    let callback_to_exit = |code| {
-        info!(
-            "Execution interrupted after {}",
-            HumanDuration(now.elapsed())
-        );
-        exit(code)
-    };
-
-    // Initial skirmish ends, now engage the enemy's main force!
-    info!("Executing: {:?}", opt);
-
-    // Construct path to index page
-    let idx = format!("{}/index.html", opt.out_path.display());
-
-    validate_base_path_exists(&cwd, &opt.base_path, callback_to_exit);
-
-    create_out_path_unless_no_clobber(
-        &cwd,
-        &opt.out_path,
-        &idx,
-        opt.clobber,
-        opt.create_output_dir,
-        callback_to_exit,
-    );
-
-    write_html(&opt, &idx, callback_to_exit);
-
-    info!(
-        "HTML generation finished in {}",
-        HumanDuration(now.elapsed())
-    );
-
-    let url = format!("{}/index.html", SERVER_URL);
-
-    if opt.open {
-        open_in_browser(&url);
-    }
-
-    if !opt.no_server {
-        serve(opt.out_path.display().to_string(), opt.base_path, url);
     }
 }
 
@@ -133,23 +77,20 @@ fn fail(context: &str, e: pixrs::error::Error) -> ! {
     exit(e.exit_code())
 }
 
-/// Report exact duplicates in the catalog.
-fn dupes(opt: DupesOpt) {
-    let catalog_path = catalog_path(opt.catalog);
-    let catalog =
-        Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail("Dupes failed", e));
-    let mut libraries: Vec<i64> = vec![];
-    for library in &opt.libraries {
+/// The catalog IDs of the given libraries. Exits if one has not been scanned.
+fn library_ids(catalog: &Catalog, libraries: &[PathBuf], context: &str) -> Vec<i64> {
+    let mut ids: Vec<i64> = vec![];
+    for library in libraries {
         let root = library
             .canonicalize()
             .ok()
             .and_then(|root| root.to_str().map(String::from));
         let id = match root.map(|root| catalog.find_library(&root)).transpose() {
             Ok(id) => id.flatten(),
-            Err(e) => fail("Dupes failed", e.into()),
+            Err(e) => fail(context, e.into()),
         };
         match id {
-            Some(id) => libraries.push(id),
+            Some(id) => ids.push(id),
             None => {
                 eprintln!(
                     "{} has not been scanned. Run `pixrs scan {}` first.",
@@ -160,6 +101,15 @@ fn dupes(opt: DupesOpt) {
             }
         }
     }
+    ids
+}
+
+/// Report exact duplicates in the catalog.
+fn dupes(opt: DupesOpt) {
+    let catalog_path = catalog_path(opt.catalog);
+    let catalog =
+        Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail("Dupes failed", e));
+    let libraries = library_ids(&catalog, &opt.libraries, "Dupes failed");
     let report = match find_dupes(&catalog, &libraries) {
         Ok(report) => report,
         Err(e) => fail("Dupes failed", e.into()),
@@ -209,49 +159,35 @@ fn scan(opt: ScanOpt, now: Instant) {
     }
 }
 
-/// Infer current working directory
-fn infer_current_working_dir() -> String {
-    let cwd = format!(
-        "{}",
-        env::current_dir()
-            .expect("Unable to retrieve current directory!")
-            .as_path()
-            .display()
-    );
-    cwd
-}
-
-fn open_in_browser(url: &str) {
-    open::that(url).unwrap_or_else(|e| {
-        error!("{:?}", e);
-        eprintln!("Error opening output: {}", e);
-    });
-}
-
-fn serve(assets_path: String, local_assets_path: String, url: String) {
-    let addr = SERVER_URL
-        .strip_prefix(PROTOCOL)
-        .unwrap_or_else(|| panic!("Expected SERVER_URL to start with '{}'", PROTOCOL));
-    let assets = SetResponseHeader::overriding(
-        ServeDir::new(assets_path),
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
-    let app = Router::new()
-        .route("/", get(|| async { Redirect::to("/index.html") }))
-        .nest_service("/local", ServeDir::new(local_assets_path))
-        .fallback_service(assets);
-
-    tokio::runtime::Runtime::new()
-        .expect("Unable to start async runtime!")
-        .block_on(async {
-            let listener = TcpListener::bind(addr)
-                .await
-                .unwrap_or_else(|e| panic!("Unable to bind to {}: {}", addr, e));
-            println!("\nNow serving your media files at {}", url);
-            println!("Press Ctrl-C in this window to stop serving.");
-            axum::serve(listener, app).await.expect("Server error!");
-        });
+/// Browse the catalog in the local viewer until stopped.
+fn serve(opt: ServeOpt) {
+    let catalog_path = catalog_path(opt.catalog);
+    let catalog =
+        Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail("Serve failed", e));
+    let libraries = library_ids(&catalog, &opt.libraries, "Serve failed");
+    let cache_dir = opt.cache.or_else(default_cache_dir);
+    if cache_dir.is_none() {
+        eprintln!("No cache directory found; pass --cache to get thumbnails");
+    }
+    let config = Config {
+        catalog,
+        libraries,
+        cache_dir,
+        port: opt.port,
+    };
+    let ready = |url: &str| {
+        println!("Serving the catalog at {}", url);
+        println!("Press Ctrl-C to stop.");
+        if opt.open {
+            open::that(url).unwrap_or_else(|e| {
+                error!("{:?}", e);
+                eprintln!("Unable to open a browser: {}", e);
+            });
+        }
+    };
+    if let Err(e) = pixrs::serve::run(config, ready) {
+        fail("Serve failed", e);
+    }
 }
 
 /// Set Ctrl-C handler

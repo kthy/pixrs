@@ -8,6 +8,7 @@
 use crate::error::Error;
 use crate::media::MediaType;
 use directories::ProjectDirs;
+use rusqlite::types::Value;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row, Transaction,
 };
@@ -328,14 +329,341 @@ impl Catalog {
 
     /// Every cataloged file in the library, ordered by path.
     pub fn files(&self, library_id: i64) -> rusqlite::Result<Vec<FileRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, size, mtime_ns, media_type, sha256, taken_at, camera_make,
-                    camera_model, width, height
-             FROM files WHERE library_id = ?1 ORDER BY path",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM files WHERE library_id = ?1 ORDER BY path",
+            FILE_COLUMNS
+        ))?;
         let rows = stmt.query_map([library_id], file_record)?;
         rows.collect()
     }
+
+    /// Every library with its file count, ordered by root.
+    pub fn libraries(&self) -> rusqlite::Result<Vec<Library>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.id, l.root, l.scanned_at, count(f.path)
+             FROM libraries l LEFT JOIN files f ON f.library_id = l.id
+             GROUP BY l.id ORDER BY l.root",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Library {
+                id: row.get(0)?,
+                root: row.get(1)?,
+                scanned_at: row.get(2)?,
+                files: row.get::<_, i64>(3)? as usize,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The root of a library, if it is in the catalog.
+    pub fn library_root(&self, library_id: i64) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT root FROM libraries WHERE id = ?1",
+                [library_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// One cataloged file, if it is in the catalog.
+    pub fn file(&self, library_id: i64, path: &str) -> rusqlite::Result<Option<FileRecord>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM files WHERE library_id = ?1 AND path = ?2",
+                    FILE_COLUMNS
+                ),
+                params![library_id, path],
+                file_record,
+            )
+            .optional()
+    }
+
+    /// The folders directly inside the folder `dir` of a library (`""` is the root), with the
+    /// number of files below each, ordered by name.
+    pub fn subfolders(
+        &self,
+        library_id: i64,
+        dir: &str,
+        media_type: Option<MediaType>,
+    ) -> rusqlite::Result<Vec<(String, usize)>> {
+        let (cond, mut values) = below(library_id, dir, media_type);
+        values.insert(0, Value::from(dir_prefix_len(dir) + 1));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT substr(rest, 1, instr(rest, '/') - 1) AS name, count(*)
+             FROM (SELECT substr(path, ?) AS rest FROM files WHERE {})
+             WHERE instr(rest, '/') > 0
+             GROUP BY name ORDER BY name",
+            cond
+        ))?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok((row.get(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        rows.collect()
+    }
+
+    /// The files directly inside the folder `dir` of a library, ordered by path.
+    pub fn folder_files(
+        &self,
+        library_id: i64,
+        dir: &str,
+        media_type: Option<MediaType>,
+        page: Page,
+    ) -> rusqlite::Result<Vec<FileRecord>> {
+        let (cond, mut values) = in_folder(library_id, dir, media_type);
+        values.extend([Value::from(page.limit), Value::from(page.offset)]);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM files WHERE {} ORDER BY path LIMIT ? OFFSET ?",
+            FILE_COLUMNS, cond
+        ))?;
+        let rows = stmt.query_map(params_from_iter(values), file_record)?;
+        rows.collect()
+    }
+
+    /// The paths before and after `path` among the files in its folder, in folder order.
+    pub fn folder_neighbors(
+        &self,
+        library_id: i64,
+        path: &str,
+        media_type: Option<MediaType>,
+    ) -> rusqlite::Result<(Option<String>, Option<String>)> {
+        let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let (cond, values) = in_folder(library_id, dir, media_type);
+        let neighbor = |op: &str, order: &str| -> rusqlite::Result<Option<String>> {
+            let mut values = values.clone();
+            values.push(Value::from(String::from(path)));
+            self.conn
+                .query_row(
+                    &format!(
+                        "SELECT path FROM files WHERE {} AND path {} ? ORDER BY path {} LIMIT 1",
+                        cond, op, order
+                    ),
+                    params_from_iter(values),
+                    |row| row.get(0),
+                )
+                .optional()
+        };
+        Ok((neighbor("<", "DESC")?, neighbor(">", "ASC")?))
+    }
+
+    /// Months (`YYYY-MM`) that have files, newest first, with the number of files in each.
+    /// A file's date is when it was taken, or its mtime in local time if that is unknown.
+    pub fn months(&self, filter: &Filter) -> rusqlite::Result<Vec<(String, usize)>> {
+        let (cond, values) = filter.condition();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT substr({}, 1, 7) AS month, count(*) FROM files WHERE {}
+             GROUP BY month ORDER BY month DESC",
+            DATE_KEY, cond
+        ))?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok((row.get(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        rows.collect()
+    }
+
+    /// The files dated in `month` (`YYYY-MM`), newest first.
+    pub fn month_files(
+        &self,
+        filter: &Filter,
+        month: &str,
+        page: Page,
+    ) -> rusqlite::Result<Vec<DatedFile>> {
+        let (cond, mut values) = filter.condition();
+        values.extend([
+            Value::from(String::from(month)),
+            Value::from(page.limit),
+            Value::from(page.offset),
+        ]);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {}, library_id, {} AS date FROM files
+             WHERE {} AND substr(date, 1, 7) = ?
+             ORDER BY date DESC, library_id DESC, path DESC LIMIT ? OFFSET ?",
+            FILE_COLUMNS, DATE_KEY, cond
+        ))?;
+        let rows = stmt.query_map(params_from_iter(values), dated_file)?;
+        rows.collect()
+    }
+
+    /// When a file was taken, or its mtime in local time, as `YYYY-MM-DDTHH:MM:SS`.
+    pub fn date(&self, library_id: i64, path: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM files WHERE library_id = ?1 AND path = ?2",
+                    DATE_KEY
+                ),
+                params![library_id, path],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// The files before and after a file in date order (newest first), as library ID and path.
+    pub fn date_neighbors(
+        &self,
+        filter: &Filter,
+        library_id: i64,
+        path: &str,
+    ) -> rusqlite::Result<(Option<FileRef>, Option<FileRef>)> {
+        let Some(date) = self.date(library_id, path)? else {
+            return Ok((None, None));
+        };
+        let (cond, values) = filter.condition();
+        let neighbor = |op: &str, order: &str| -> rusqlite::Result<Option<FileRef>> {
+            let mut values = values.clone();
+            values.extend([
+                Value::from(date.clone()),
+                Value::from(library_id),
+                Value::from(String::from(path)),
+            ]);
+            self.conn
+                .query_row(
+                    &format!(
+                        "SELECT library_id, path FROM files
+                         WHERE {} AND ({}, library_id, path) {} (?, ?, ?)
+                         ORDER BY {} {o}, library_id {o}, path {o} LIMIT 1",
+                        cond,
+                        DATE_KEY,
+                        op,
+                        DATE_KEY,
+                        o = order
+                    ),
+                    params_from_iter(values),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+        };
+        Ok((neighbor(">", "ASC")?, neighbor("<", "DESC")?))
+    }
+
+    /// Every file, in any library, with the given size and hash.
+    pub fn copies(&self, size: u64, sha256: &str) -> rusqlite::Result<Vec<HashedFile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256
+             FROM files f JOIN libraries l ON l.id = f.library_id
+             WHERE f.size = ?1 AND f.sha256 = ?2",
+        )?;
+        let rows = stmt.query_map(params![size as i64, sha256], |row| {
+            Ok(HashedFile {
+                library_id: row.get(0)?,
+                root: row.get(1)?,
+                path: row.get(2)?,
+                size: row.get::<_, i64>(3)? as u64,
+                mtime_ns: row.get(4)?,
+                sha256: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+/// A library ID and a path in that library.
+pub type FileRef = (i64, String);
+
+/// A scanned library.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Library {
+    pub id: i64,
+    /// Canonical root path, as stored.
+    pub root: String,
+    /// When the last scan finished, RFC 3339 in UTC.
+    pub scanned_at: Option<String>,
+    pub files: usize,
+}
+
+/// A file with the library it is in and its date (see `Catalog::months`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatedFile {
+    pub library_id: i64,
+    pub file: FileRecord,
+    pub date: String,
+}
+
+/// Which files a listing shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// Only files in these libraries; all if empty.
+    pub libraries: Vec<i64>,
+    pub media_type: Option<MediaType>,
+}
+
+impl Filter {
+    /// The SQL condition selecting the files, with its parameters.
+    fn condition(&self) -> (String, Vec<Value>) {
+        let mut cond = String::from("1");
+        let mut values: Vec<Value> = vec![];
+        if !self.libraries.is_empty() {
+            cond.push_str(&format!(
+                " AND library_id IN ({})",
+                vec!["?"; self.libraries.len()].join(", ")
+            ));
+            values.extend(self.libraries.iter().map(|&id| Value::from(id)));
+        }
+        if let Some(media_type) = self.media_type {
+            cond.push_str(" AND media_type = ?");
+            values.push(Value::from(String::from(media_type.as_str())));
+        }
+        (cond, values)
+    }
+}
+
+/// A slice of a listing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Page {
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Columns read by `file_record`, in its order.
+const FILE_COLUMNS: &str =
+    "path, size, mtime_ns, media_type, sha256, taken_at, camera_make, camera_model, width, height";
+
+/// SQL for a file's date: the first 19 characters of `taken_at` (the camera's local time in both
+/// stored formats), or else the mtime in local time.
+const DATE_KEY: &str = "coalesce(substr(taken_at, 1, 19), \
+     strftime('%Y-%m-%dT%H:%M:%S', mtime_ns / 1000000000, 'unixepoch', 'localtime'))";
+
+/// Number of characters before the names of a folder's children: `dir/`, or none for the root.
+/// SQLite counts characters, not bytes, in `substr` on text.
+fn dir_prefix_len(dir: &str) -> i64 {
+    if dir.is_empty() {
+        0
+    } else {
+        dir.chars().count() as i64 + 1
+    }
+}
+
+/// The condition selecting a library's files below the folder `dir`, with its parameters.
+/// Everything below `a/b` sorts between `a/b/` and `a/b0`, so this is a range on the primary key.
+fn below(library_id: i64, dir: &str, media_type: Option<MediaType>) -> (String, Vec<Value>) {
+    let mut cond = String::from("library_id = ?");
+    let mut values = vec![Value::from(library_id)];
+    if !dir.is_empty() {
+        cond.push_str(" AND path >= ? AND path < ?");
+        values.extend([
+            Value::from(format!("{}/", dir)),
+            Value::from(format!("{}0", dir)),
+        ]);
+    }
+    if let Some(media_type) = media_type {
+        cond.push_str(" AND media_type = ?");
+        values.push(Value::from(String::from(media_type.as_str())));
+    }
+    (cond, values)
+}
+
+/// The condition selecting a library's files directly inside the folder `dir`.
+fn in_folder(library_id: i64, dir: &str, media_type: Option<MediaType>) -> (String, Vec<Value>) {
+    let (cond, values) = below(library_id, dir, media_type);
+    (
+        format!(
+            "{} AND instr(substr(path, {}), '/') = 0",
+            cond,
+            dir_prefix_len(dir) + 1
+        ),
+        values,
+    )
 }
 
 /// The file at the `/`-separated relative path `rel` below `root`. Joins part by part, because
@@ -357,7 +685,16 @@ pub fn display_root(root: &str) -> String {
     }
 }
 
-/// Build a `FileRecord` from a row selected in `Catalog::files` column order.
+/// Build a `DatedFile` from a row selected as `FILE_COLUMNS, library_id, date`.
+fn dated_file(row: &Row) -> rusqlite::Result<DatedFile> {
+    Ok(DatedFile {
+        file: file_record(row)?,
+        library_id: row.get(10)?,
+        date: row.get(11)?,
+    })
+}
+
+/// Build a `FileRecord` from a row selected in `FILE_COLUMNS` order.
 fn file_record(row: &Row) -> rusqlite::Result<FileRecord> {
     let media_type: String = row.get(3)?;
     Ok(FileRecord {
@@ -480,5 +817,184 @@ mod tests {
         catalog.remove(id, "c.jpg").unwrap();
         assert!(catalog.files(id).unwrap().is_empty());
         assert_eq!(catalog.files(other).unwrap().len(), 2);
+    }
+
+    /// 2020-06-15T12:00:00Z, in mid-month so the local-time month is June in every timezone.
+    const JUNE_2020_NS: i64 = 1_592_222_400_000_000_000;
+
+    /// A catalog with one library of nested folders, and another library with one file.
+    fn browse_fixture() -> (tempfile::TempDir, Catalog, i64, i64) {
+        let dir = tempdir().unwrap();
+        let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+        let id = catalog.library_id("/lib").unwrap();
+        let other = catalog.library_id("/other").unwrap();
+        let taken = [
+            ("a.jpg", Some("2024-05-01T10:00:00+02:00")),
+            ("b.mp4", Some("2023-01-01T00:00:00")),
+            ("x.jpg", None),
+            ("x0.jpg", None),
+            ("x/1.jpg", Some("2024-05-03T09:00:00")),
+            ("x/2.jpg", None),
+            ("x/y/3.jpg", None),
+            ("ø/4.jpg", None),
+            ("ø/z/5.jpg", None),
+        ];
+        for (path, taken_at) in taken {
+            let mut file = record(path, 1);
+            file.stamp.mtime_ns = JUNE_2020_NS;
+            file.meta.taken_at = taken_at.map(String::from);
+            if path.ends_with(".mp4") {
+                file.media_type = MediaType::Video;
+            }
+            catalog.upsert(id, &file).unwrap();
+        }
+        let mut file = record("elsewhere.jpg", 1);
+        file.stamp.mtime_ns = JUNE_2020_NS;
+        catalog.upsert(other, &file).unwrap();
+        (dir, catalog, id, other)
+    }
+
+    fn paths(files: Vec<FileRecord>) -> Vec<String> {
+        files.into_iter().map(|f| f.path).collect()
+    }
+
+    fn all() -> Page {
+        Page {
+            limit: 100,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn test_folders() {
+        let (_dir, catalog, id, _) = browse_fixture();
+        let names = |dir| catalog.subfolders(id, dir, None).unwrap();
+        assert_eq!(
+            names(""),
+            vec![(String::from("x"), 3), (String::from("ø"), 2)]
+        );
+        assert_eq!(names("x"), vec![(String::from("y"), 1)]);
+        assert_eq!(names("ø"), vec![(String::from("z"), 1)]);
+        assert_eq!(names("ø/z"), vec![]);
+        assert_eq!(
+            catalog.subfolders(id, "", Some(MediaType::Video)).unwrap(),
+            vec![]
+        );
+
+        let files = |dir, media_type, page| {
+            paths(catalog.folder_files(id, dir, media_type, page).unwrap())
+        };
+        assert_eq!(
+            files("", None, all()),
+            ["a.jpg", "b.mp4", "x.jpg", "x0.jpg"]
+        );
+        assert_eq!(files("x", None, all()), ["x/1.jpg", "x/2.jpg"]);
+        assert_eq!(files("ø", None, all()), ["ø/4.jpg"]);
+        assert_eq!(files("", Some(MediaType::Video), all()), ["b.mp4"]);
+        let page = Page {
+            limit: 2,
+            offset: 1,
+        };
+        assert_eq!(files("", None, page), ["b.mp4", "x.jpg"]);
+
+        let neighbors = |path| catalog.folder_neighbors(id, path, None).unwrap();
+        assert_eq!(neighbors("x/1.jpg"), (None, Some(String::from("x/2.jpg"))));
+        assert_eq!(
+            neighbors("b.mp4"),
+            (Some(String::from("a.jpg")), Some(String::from("x.jpg")))
+        );
+    }
+
+    #[test]
+    fn test_dates() {
+        let (_dir, catalog, id, other) = browse_fixture();
+        let mine = Filter {
+            libraries: vec![id],
+            media_type: None,
+        };
+        assert_eq!(
+            catalog.months(&mine).unwrap(),
+            vec![
+                (String::from("2024-05"), 2),
+                (String::from("2023-01"), 1),
+                (String::from("2020-06"), 6),
+            ]
+        );
+        assert_eq!(catalog.months(&Filter::default()).unwrap()[2].1, 7);
+        let videos = Filter {
+            libraries: vec![],
+            media_type: Some(MediaType::Video),
+        };
+        assert_eq!(
+            catalog.months(&videos).unwrap(),
+            vec![(String::from("2023-01"), 1)]
+        );
+
+        let may: Vec<String> = catalog
+            .month_files(&mine, "2024-05", all())
+            .unwrap()
+            .into_iter()
+            .map(|f| format!("{} {}", f.date, f.file.path))
+            .collect();
+        assert_eq!(
+            may,
+            ["2024-05-03T09:00:00 x/1.jpg", "2024-05-01T10:00:00 a.jpg"]
+        );
+
+        let neighbors = |path| catalog.date_neighbors(&mine, id, path).unwrap();
+        assert_eq!(
+            neighbors("a.jpg"),
+            (
+                Some((id, String::from("x/1.jpg"))),
+                Some((id, String::from("b.mp4")))
+            )
+        );
+        assert_eq!(neighbors("x/1.jpg").0, None);
+        // Files with the same date are ordered by library, then path, both descending.
+        assert_eq!(
+            neighbors("x/2.jpg"),
+            (
+                Some((id, String::from("x/y/3.jpg"))),
+                Some((id, String::from("x.jpg")))
+            )
+        );
+        let everything = |path| {
+            catalog
+                .date_neighbors(&Filter::default(), id, path)
+                .unwrap()
+        };
+        assert_eq!(
+            everything("ø/z/5.jpg").0,
+            Some((other, String::from("elsewhere.jpg")))
+        );
+        assert_eq!(catalog.date(id, "missing.jpg").unwrap(), None);
+    }
+
+    #[test]
+    fn test_libraries_and_copies() {
+        let (_dir, catalog, id, other) = browse_fixture();
+        let libraries = catalog.libraries().unwrap();
+        assert_eq!(
+            libraries
+                .iter()
+                .map(|l| (l.id, l.files))
+                .collect::<Vec<_>>(),
+            vec![(id, 9), (other, 1)]
+        );
+        catalog.set_sha256(id, "a.jpg", "abc").unwrap();
+        catalog.set_sha256(other, "elsewhere.jpg", "abc").unwrap();
+        let copies = catalog.copies(1, "abc").unwrap();
+        assert_eq!(copies.len(), 2);
+        assert!(catalog.copies(2, "abc").unwrap().is_empty());
+        assert_eq!(
+            catalog.file(id, "x/y/3.jpg").unwrap().unwrap().path,
+            "x/y/3.jpg"
+        );
+        assert_eq!(catalog.file(other, "x/y/3.jpg").unwrap(), None);
+        assert_eq!(
+            catalog.library_root(other).unwrap().as_deref(),
+            Some("/other")
+        );
+        assert_eq!(catalog.library_root(other + 1).unwrap(), None);
     }
 }

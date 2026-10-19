@@ -1,0 +1,481 @@
+//! Thumbnails and previews, cached outside the library.
+
+/*************************************************************************************************
+ * Copyright © 2022-2026 Kristian Thy (<thy@42.dk>)                                              *
+ * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
+ *************************************************************************************************/
+
+use super::Located;
+use crate::catalog::FileRecord;
+use crate::media::MediaType;
+use image::codecs::jpeg::JpegEncoder;
+use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage};
+use log::{debug, warn};
+use ring::digest::{digest, SHA256};
+use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::thread::available_parallelism;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+
+/// How long `ffmpeg` and `ffprobe` may take for one file.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The error of a tool that ran out of time. Not remembered as a failure: the system may only
+/// have been busy.
+const TIMED_OUT: &str = "timed out";
+
+/// Image extensions the `image` crate decodes, lowercase.
+const DECODED_IN_PROCESS: &[&str] = &["bmp", "gif", "jpeg", "jpg", "png", "tif", "tiff", "webp"];
+
+/// Image extensions only `ffmpeg` decodes, lowercase.
+const DECODED_BY_FFMPEG: &[&str] = &["avif", "heic", "heif"];
+
+/// Image extensions browsers show, lowercase.
+const SHOWN_BY_BROWSERS: &[&str] = &["avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"];
+
+/// Image extensions browsers cannot show but the viewer can make a preview of, lowercase.
+const SHOWN_AS_PREVIEW: &[&str] = &["heic", "heif", "tif", "tiff"];
+
+/// The renditions the viewer makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Size {
+    /// For listings.
+    Thumb,
+    /// For viewing an image the browser cannot show.
+    Preview,
+}
+
+impl Size {
+    /// Longest side in pixels.
+    fn pixels(self) -> u32 {
+        match self {
+            Size::Thumb => 320,
+            Size::Preview => 2048,
+        }
+    }
+
+    /// Cache subfolder.
+    fn dir(self) -> &'static str {
+        match self {
+            Size::Thumb => "320",
+            Size::Preview => "2048",
+        }
+    }
+}
+
+/// How a file is turned into a JPEG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decoder {
+    InProcess,
+    FfmpegImage,
+    FfmpegVideo,
+}
+
+/// The lowercase extension of a cataloged path.
+fn extension(file: &FileRecord) -> String {
+    Path::new(&file.path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// What the viewer shows for an image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewSource {
+    Original,
+    Preview,
+    Placeholder,
+}
+
+/// What the viewer shows for an image: the original if browsers can show it, otherwise a
+/// preview if one can be made, otherwise the placeholder (e.g. RAW files).
+pub fn view_source(file: &FileRecord) -> ViewSource {
+    let ext = extension(file);
+    if SHOWN_BY_BROWSERS.contains(&ext.as_str()) {
+        ViewSource::Original
+    } else if SHOWN_AS_PREVIEW.contains(&ext.as_str()) {
+        ViewSource::Preview
+    } else {
+        ViewSource::Placeholder
+    }
+}
+
+/// How the viewer makes renditions of the file, if it can.
+fn decoder(file: &FileRecord) -> Option<Decoder> {
+    let ext = extension(file);
+    match file.media_type {
+        MediaType::Image if DECODED_IN_PROCESS.contains(&ext.as_str()) => Some(Decoder::InProcess),
+        MediaType::Image if DECODED_BY_FFMPEG.contains(&ext.as_str()) => {
+            Some(Decoder::FfmpegImage)
+        }
+        MediaType::Video => Some(Decoder::FfmpegVideo),
+        _ => None,
+    }
+}
+
+/// Makes and caches renditions.
+pub struct Thumbnailer {
+    cache_dir: Option<PathBuf>,
+    ffmpeg: Option<PathBuf>,
+    /// Limits how many renditions are made at once.
+    permits: Semaphore,
+    /// Cache keys of files that could not be decoded, so they are not retried on every request.
+    failed: Mutex<HashSet<String>>,
+}
+
+impl Thumbnailer {
+    pub fn new(cache_dir: Option<PathBuf>, ffmpeg: Option<PathBuf>) -> Self {
+        let workers = available_parallelism().map_or(2, |n| n.get());
+        Thumbnailer {
+            cache_dir,
+            ffmpeg,
+            permits: Semaphore::new(workers),
+            failed: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// A JPEG of the file at `size`, from the cache or made now. `None` if the file cannot be
+    /// decoded, or there is no cache.
+    pub async fn get(&self, located: &Located, size: Size) -> Option<Vec<u8>> {
+        let cache_dir = self.cache_dir.as_ref()?;
+        let decoder = decoder(&located.file)?;
+        let ffmpeg = match decoder {
+            Decoder::InProcess => None,
+            Decoder::FfmpegImage | Decoder::FfmpegVideo => Some(self.ffmpeg.clone()?),
+        };
+        let key = cache_key(located, size);
+        let cached = cache_dir
+            .join(size.dir())
+            .join(&key[..2])
+            .join(format!("{}.jpg", key));
+        if let Ok(jpeg) = tokio::fs::read(&cached).await {
+            return Some(jpeg);
+        }
+        if self.failed().contains(&key) {
+            return None;
+        }
+
+        let _permit = self.permits.acquire().await.ok()?;
+        // Another request may have made it while this one waited.
+        if let Ok(jpeg) = tokio::fs::read(&cached).await {
+            return Some(jpeg);
+        }
+        let source = located.full_path.clone();
+        let made = match ffmpeg {
+            None => tokio::task::spawn_blocking(move || decode_in_process(&source, size.pixels()))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|made| made),
+            Some(ffmpeg) => {
+                decode_with_ffmpeg(&ffmpeg, &source, size, decoder == Decoder::FfmpegVideo).await
+            }
+        };
+        match made {
+            Ok(jpeg) => {
+                let written = tokio::task::spawn_blocking(move || {
+                    let written = write_atomically(&cached, &jpeg);
+                    (written, cached, jpeg)
+                })
+                .await
+                .ok()?;
+                if let (Err(e), cached, _) = &written {
+                    warn!("Unable to cache {}: {}", cached.display(), e);
+                }
+                Some(written.2)
+            }
+            Err(e) => {
+                warn!("No thumbnail for {}: {}", located.full_path.display(), e);
+                if e != TIMED_OUT {
+                    self.failed().insert(key);
+                }
+                None
+            }
+        }
+    }
+
+    /// The video codec of a file, from `ffprobe`. Shares the limit on concurrent tool runs.
+    pub async fn video_codec(&self, ffprobe: &Path, source: &Path) -> Option<String> {
+        let _permit = self.permits.acquire().await.ok()?;
+        let mut command = Command::new(ffprobe);
+        command
+            .args([
+                "-v",
+                "error",
+                "-protocol_whitelist",
+                "file",
+                "-select_streams",
+                "v:0",
+            ])
+            .args(["-show_entries", "stream=codec_name"])
+            .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(file_url(source));
+        let output = run(command).await.ok()?;
+        let codec = String::from_utf8_lossy(&output).trim().to_string();
+        (!codec.is_empty()).then_some(codec)
+    }
+
+    /// Files that could not be decoded. A panic elsewhere does not invalidate the set.
+    fn failed(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.failed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The cache file name: a hash of where the file is and what it looked like when scanned, so a
+/// changed file gets a new rendition.
+fn cache_key(located: &Located, size: Size) -> String {
+    let id = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        located.root,
+        located.file.path,
+        located.file.stamp.size,
+        located.file.stamp.mtime_ns,
+        size.pixels()
+    );
+    data_encoding::HEXLOWER.encode(digest(&SHA256, id.as_bytes()).as_ref())
+}
+
+/// Decode an image with the `image` crate, upright, shrunk to fit `max` pixels, as JPEG.
+fn decode_in_process(source: &Path, max: u32) -> Result<Vec<u8>, String> {
+    let mut decoder = ImageReader::open(source)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?
+        .into_decoder()
+        .map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    if img.width() > max || img.height() > max {
+        img = img.thumbnail(max, max);
+    }
+    let rgb = flatten(&img);
+    let mut jpeg = vec![];
+    JpegEncoder::new_with_quality(&mut jpeg, 80)
+        .encode_image(&rgb)
+        .map_err(|e| e.to_string())?;
+    Ok(jpeg)
+}
+
+/// The image without transparency, on a white background.
+fn flatten(img: &DynamicImage) -> RgbImage {
+    if !img.color().has_alpha() {
+        return img.to_rgb8();
+    }
+    let rgba = img.to_rgba8();
+    RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let [r, g, b, a] = rgba.get_pixel(x, y).0;
+        let blend =
+            |c: u8| ((u16::from(c) * u16::from(a) + 255 * (255 - u16::from(a))) / 255) as u8;
+        image::Rgb([blend(r), blend(g), blend(b)])
+    })
+}
+
+/// Decode the first frame of an image, or a frame one second into a video, with `ffmpeg`.
+async fn decode_with_ffmpeg(
+    ffmpeg: &Path,
+    source: &Path,
+    size: Size,
+    video: bool,
+) -> Result<Vec<u8>, String> {
+    let max = size.pixels();
+    let attempt = |seek: bool| {
+        let mut command = Command::new(ffmpeg);
+        command.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+        // Media files can reference other resources; only ever read local files.
+        command.args(["-protocol_whitelist", "file"]);
+        if seek {
+            command.args(["-ss", "1"]);
+        }
+        command
+            .arg("-i")
+            .arg(file_url(source))
+            .args(["-frames:v", "1", "-vf"])
+            .arg(format!(
+                "scale='min({m},iw)':'min({m},ih)':force_original_aspect_ratio=decrease",
+                m = max
+            ))
+            .args(["-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "3", "-"]);
+        run(command)
+    };
+    let jpeg = if video {
+        // Videos shorter than a second have no frame there.
+        match attempt(true).await {
+            Ok(jpeg) if !jpeg.is_empty() => jpeg,
+            _ => attempt(false).await?,
+        }
+    } else {
+        attempt(false).await?
+    };
+    if jpeg.is_empty() {
+        Err(String::from("ffmpeg produced no frame"))
+    } else {
+        Ok(jpeg)
+    }
+}
+
+/// `source` as an `ffmpeg` input. The `file:` prefix keeps names like `a:b.mov` from being read
+/// as a protocol.
+fn file_url(source: &Path) -> OsString {
+    let mut url = OsString::from("file:");
+    url.push(source);
+    url
+}
+
+/// Run a tool and return its standard output, or an error with its standard error.
+async fn run(mut command: Command) -> Result<Vec<u8>, String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    debug!("Running {:?}", command);
+    let output = timeout(TOOL_TIMEOUT, command.output())
+        .await
+        .map_err(|_| String::from(TIMED_OUT))?
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Number for temporary file names, unique within the process.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write `path` so that readers never see a partial file.
+fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let dir = path.parent().expect("cache files are in a folder");
+    fs::create_dir_all(dir)?;
+    let temp = dir.join(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&temp, contents)?;
+    fs::rename(&temp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
+}
+
+/// An SVG placeholder showing the file's extension.
+pub fn placeholder(file: &FileRecord) -> String {
+    let label: String = extension(file)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(5)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let fill = match file.media_type {
+        MediaType::Image => "#d8dee4",
+        MediaType::Video => "#d4d8ee",
+        MediaType::Audio => "#dcecd8",
+    };
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" width="320" height="320"><rect width="320" height="320" fill="{}"/><text x="160" y="175" font-family="sans-serif" font-size="48" text-anchor="middle" fill="#57606a">{}</text></svg>"##,
+        fill, label
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::catalog::{MediaMeta, Stamp};
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    fn record(path: &str, media_type: MediaType) -> FileRecord {
+        FileRecord {
+            path: String::from(path),
+            stamp: Stamp {
+                size: 1,
+                mtime_ns: 1,
+            },
+            media_type,
+            sha256: None,
+            meta: MediaMeta::default(),
+        }
+    }
+
+    #[test]
+    fn test_decoder_choice() {
+        assert_eq!(
+            decoder(&record("a/B.JPG", MediaType::Image)),
+            Some(Decoder::InProcess)
+        );
+        assert_eq!(
+            decoder(&record("b.heic", MediaType::Image)),
+            Some(Decoder::FfmpegImage)
+        );
+        assert_eq!(
+            decoder(&record("c.mov", MediaType::Video)),
+            Some(Decoder::FfmpegVideo)
+        );
+        assert_eq!(decoder(&record("d.cr2", MediaType::Image)), None);
+        assert_eq!(decoder(&record("e.mp3", MediaType::Audio)), None);
+        assert_eq!(
+            view_source(&record("f.TIFF", MediaType::Image)),
+            ViewSource::Preview
+        );
+        assert_eq!(
+            view_source(&record("g.webp", MediaType::Image)),
+            ViewSource::Original
+        );
+        assert_eq!(
+            view_source(&record("h.nef", MediaType::Image)),
+            ViewSource::Placeholder
+        );
+    }
+
+    #[test]
+    fn test_in_process_applies_size_and_alpha() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("clear.png");
+        image::RgbaImage::from_pixel(1000, 500, image::Rgba([0, 0, 0, 0]))
+            .save(&path)
+            .unwrap();
+        let jpeg = decode_in_process(&path, 320).unwrap();
+        let img = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (320, 160));
+        assert!(img.get_pixel(10, 10).0.iter().all(|&c| c > 240));
+    }
+
+    #[tokio::test]
+    async fn test_video_poster_with_ffmpeg() {
+        let ffmpeg = Path::new("ffmpeg");
+        let dir = tempdir().unwrap();
+        let video = dir.path().join("short clip.mp4");
+        // A half-second clip, so the frame at one second does not exist and the fallback runs.
+        let mut command = Command::new(ffmpeg);
+        command
+            .args(["-nostdin", "-loglevel", "error", "-f", "lavfi"])
+            .args(["-i", "testsrc=duration=0.5:size=640x360:rate=10"])
+            .arg(&video);
+        if run(command).await.is_err() {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        }
+        let jpeg = decode_with_ffmpeg(ffmpeg, &video, Size::Thumb, true)
+            .await
+            .unwrap();
+        let img = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!((img.width(), img.height()), (320, 180));
+    }
+
+    #[test]
+    fn test_placeholder_label() {
+        let svg = placeholder(&record("x/y.Cr2", MediaType::Image));
+        assert!(svg.contains(">CR2<"));
+    }
+}
