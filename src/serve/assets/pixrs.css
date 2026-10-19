@@ -1,0 +1,190 @@
+/* PixRS viewer styles. */
+
+:root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #59636e;
+    --line: #d1d9e0;
+    --tile: #f6f8fa;
+    --accent: #0969da;
+    --keep: #1a7f37;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0d1117;
+        --fg: #e6edf3;
+        --muted: #9198a1;
+        --line: #3d444d;
+        --tile: #151b23;
+        --accent: #4493f8;
+        --keep: #3fb950;
+    }
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.4 system-ui, sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0.5rem 1.5rem;
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid var(--line);
+}
+
+header nav { display: flex; gap: 1rem; align-items: baseline; }
+header .brand { font-weight: 700; color: var(--fg); }
+header .types a { color: var(--muted); }
+header .types a.active { color: var(--fg); font-weight: 600; }
+
+main { padding: 1rem; }
+
+h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+h2 { font-size: 1.05rem; margin: 0 0 0.5rem; }
+h3 { font-size: 1rem; margin: 1rem 0 0.25rem; }
+
+.count, .meta, .note { color: var(--muted); }
+.count { font-size: 0.85em; font-weight: 400; }
+
+.crumbs { margin-bottom: 1rem; }
+
+.folders {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 1rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.folders li {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0.3rem 0.6rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 0.5rem;
+}
+
+.tile {
+    position: relative;
+    display: block;
+    background: var(--tile);
+    border-radius: 4px;
+    overflow: hidden;
+    color: var(--fg);
+}
+
+.tile img, .copy img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    background: var(--tile);
+}
+
+.tile .name {
+    display: block;
+    padding: 0.2rem 0.4rem;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.badge {
+    display: inline-block;
+    padding: 0 0.4rem;
+    border-radius: 3px;
+    font-size: 0.75rem;
+    background: var(--fg);
+    color: var(--bg);
+}
+
+.tile .badge { position: absolute; top: 0.3rem; left: 0.3rem; }
+.badge.keep { background: var(--keep); color: #ffffff; }
+
+.more {
+    grid-column: 1 / -1;
+    display: block;
+    padding: 1rem;
+    text-align: center;
+}
+
+.dates { display: flex; gap: 1.5rem; align-items: flex-start; }
+.dates section { flex: 1; min-width: 0; }
+
+.months {
+    flex: 0 0 11rem;
+    position: sticky;
+    top: 1rem;
+    max-height: calc(100vh - 2rem);
+    overflow-y: auto;
+}
+
+.months ul { list-style: none; padding: 0; margin: 0; }
+.months li { padding: 0.1rem 0.5rem; }
+.months li.active { background: var(--tile); border-radius: 4px; font-weight: 600; }
+
+.group { margin-bottom: 2rem; }
+
+.copies { display: flex; flex-wrap: wrap; gap: 1rem; }
+
+.copy {
+    margin: 0;
+    width: 220px;
+    border: 2px solid transparent;
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--tile);
+}
+
+.copy.keep { border-color: var(--keep); }
+.copy figcaption { padding: 0.4rem; font-size: 0.8rem; overflow-wrap: anywhere; }
+
+.pager {
+    display: grid;
+    grid-template-columns: 6rem 1fr 6rem;
+    align-items: baseline;
+    margin-bottom: 0.5rem;
+}
+
+.pager .path { text-align: center; overflow-wrap: anywhere; }
+.pager [rel="next"] { text-align: right; }
+
+.stage { text-align: center; margin-bottom: 1rem; }
+
+.stage img, .stage video {
+    max-width: 100%;
+    max-height: calc(100vh - 8rem);
+}
+
+.stage audio { width: min(40rem, 100%); margin: 3rem 0; }
+
+.details {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.2rem 1rem;
+}
+
+.details dt { color: var(--muted); }
+.details dd { margin: 0; overflow-wrap: anywhere; }
+.hash { font-family: ui-monospace, monospace; font-size: 0.85em; }

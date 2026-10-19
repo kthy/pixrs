@@ -17,10 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pixrs dupes` reports exact duplicates from the catalog across all scanned libraries, or those
   involving given libraries, with the copy to keep marked (earliest mtime, then path order).
   Text, JSON and CSV output.
+- `pixrs serve` starts a local web viewer on the catalog: browse by folder or date, view images,
+  play audio and video, and compare duplicate groups. Thumbnails are cached outside the
+  libraries; HEIC, AVIF and video thumbnails use `ffmpeg` if it is on `PATH`. Works offline.
 
 ### Changed
 
-- The gallery generator moved to the `pixrs gallery` subcommand.
 - Replace the `rouille` web server with `axum`.
 - CI runs tests on Linux, Windows and macOS, and uses maintained actions instead of `actions-rs`.
 - Build instructions no longer require LLVM or FFmpeg.
@@ -28,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `--license` prints the license instead of panicking.
-- Local media URLs were truncated when the base path was `.`.
 
 ### Removed
 
+- The static HTML gallery generator. `pixrs serve` replaces it.
 - Unused `polars` dependency.

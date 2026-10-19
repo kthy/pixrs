@@ -222,7 +222,7 @@ pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSumm
 
 /// `path` made absolute, with its longest existing prefix canonicalized so that symlinks and `..`
 /// cannot hide where it really is. The parts that do not exist yet are applied lexically.
-fn resolve(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn resolve(path: &Path) -> io::Result<PathBuf> {
     let path = absolute(path)?;
     for ancestor in path.ancestors() {
         if let Ok(mut resolved) = ancestor.canonicalize() {

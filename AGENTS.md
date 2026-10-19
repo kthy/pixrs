@@ -19,8 +19,7 @@ optimize beyond that without a measured need.
 
 ## Direction
 
-The `gallery` subcommand is the 2022 version: it globs a directory and writes one static
-`index.html`. The planned shape, tracked in GitHub issues #32 to #37 (one per step):
+The planned shape, tracked in GitHub issues #32 to #37 (one per step):
 
 - `scan`: walk the library into a SQLite catalog (path, size, mtime, media type, EXIF fields),
   then hash only files whose size matches another cataloged file. Incremental: only reread files
@@ -54,6 +53,17 @@ Decided details:
   gracefully if not. Do not link against libav: it complicates the build on Windows and its GPL
   licensing does not sit well with linking into this AGPL program.
 - Metadata: `nom-exif` (covers JPEG, HEIC and MP4/MOV).
+- Viewer: binds to `127.0.0.1` and rejects requests whose `Host` header is not
+  `localhost:PORT` or `127.0.0.1:PORT` (DNS rebinding). Files are served only if they are a row
+  in the catalog. HTMX 4 and all other assets are compiled into the binary.
+- Viewer listings: HTMX infinite scroll, 200 items per page, with a plain "Next" link when
+  JavaScript is off.
+- Viewer images: thumbnails (320 px) and, for formats browsers cannot show (HEIC, TIFF), a
+  2048 px JPEG preview, both cached outside the library. JPEG, PNG, GIF, WebP, BMP and TIFF
+  are decoded in-process with the `image` crate; HEIC, AVIF and video poster frames via
+  `ffmpeg`; RAW formats and everything without a decoder get a placeholder.
+- Viewer video: no transcoding. Videos the browser cannot play show their codec (from
+  `ffprobe`) and an "Open original" link.
 
 ## Invariants
 
@@ -72,8 +82,8 @@ Decided details:
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings   # CI enforces this
 cargo test
-cargo run -- gallery -cdor tests/files target/output  # serves at http://localhost:2635
 cargo run -- scan tests/files --catalog target/catalog.sqlite
+cargo run -- serve --catalog target/catalog.sqlite  # serves at http://127.0.0.1:2635
 ```
 
 `just pre-commit` runs lint, a clean build and the tests.

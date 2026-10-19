@@ -18,6 +18,8 @@ use time::OffsetDateTime;
 /// A file in a duplicate group.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DupeFile {
+    #[serde(skip)]
+    pub library_id: i64,
     /// Root of the library the file is in.
     pub library: String,
     /// Path relative to the library root, with `/` separators.
@@ -102,6 +104,7 @@ pub fn find_dupes(catalog: &Catalog, libraries: &[i64]) -> rusqlite::Result<Dupe
                 .into_iter()
                 .enumerate()
                 .map(|(i, f)| DupeFile {
+                    library_id: f.library_id,
                     library: display_root(&f.root),
                     path: f.path,
                     mtime: format_mtime(f.mtime_ns),
@@ -140,7 +143,7 @@ fn format_mtime(mtime_ns: i64) -> String {
 }
 
 /// An mtime shortened to minutes for people: `2021-12-23 14:02 UTC`.
-fn human_mtime(mtime_ns: i64) -> String {
+pub fn human_mtime(mtime_ns: i64) -> String {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(mtime_ns))
         .ok()
         .and_then(|dt| {
