@@ -9,6 +9,7 @@ mod pages;
 mod thumbs;
 
 use crate::catalog::{library_path, Catalog, FileRecord};
+use crate::dupes::{group_dupes, load_dupes, DupeReport};
 use crate::error::Error;
 use crate::scan::resolve;
 use axum::body::Body;
@@ -19,10 +20,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use directories::ProjectDirs;
-use log::{debug, warn};
+use log::warn;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use thumbs::{Size, Thumbnailer};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
@@ -43,6 +44,9 @@ pub struct Config {
     /// Where thumbnails are cached. Without one, every file gets a placeholder.
     pub cache_dir: Option<PathBuf>,
     pub port: u16,
+    /// Perceptual hash distance up to which images count as similar; `None` to not look for
+    /// similar images.
+    pub similar: Option<u32>,
 }
 
 /// Shared state of the running viewer.
@@ -54,6 +58,21 @@ pub(crate) struct AppState {
     ffprobe: Option<PathBuf>,
     /// The `Host` header values the viewer answers to.
     hosts: Vec<String>,
+    pub(crate) similar: Option<u32>,
+    /// The last duplicate report, so paging through it does not compare every pair of images
+    /// again. An async lock, held while a report is made, so concurrent requests share it.
+    dupes: tokio::sync::Mutex<Option<CachedDupes>>,
+}
+
+/// How often the duplicate report is made again at most while the catalog keeps changing.
+const DUPES_REFRESH: Duration = Duration::from_secs(30);
+
+/// A duplicate report and when it was made.
+pub(crate) struct CachedDupes {
+    /// The catalog's `data_version` when it was made.
+    version: i64,
+    made: Instant,
+    report: Arc<DupeReport>,
 }
 
 /// An error answered to the browser.
@@ -105,6 +124,42 @@ impl AppState {
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .map_err(AppError::from)
+    }
+
+    /// The duplicate report for the libraries shown. With `fresh` (the first page), it is made
+    /// again if the catalog changed, but at most every `DUPES_REFRESH` while a scan keeps
+    /// changing it; later pages always use the report the first page showed, so paging through
+    /// it cannot skip or repeat groups. One report is made at a time and shared by every request
+    /// waiting for it. Only reading the catalog holds it; comparing the images does not, so
+    /// other pages stay responsive meanwhile.
+    pub(crate) async fn dupes(self: &Arc<Self>, fresh: bool) -> Result<Arc<DupeReport>, AppError> {
+        let mut cached = self.dupes.lock().await;
+        if let Some(c) = cached.as_mut() {
+            if !fresh || c.made.elapsed() < DUPES_REFRESH {
+                return Ok(Arc::clone(&c.report));
+            }
+            if self.query(|catalog| catalog.data_version()).await? == c.version {
+                c.made = Instant::now();
+                return Ok(Arc::clone(&c.report));
+            }
+        }
+        let version = self.query(|catalog| catalog.data_version()).await?;
+        let (libraries, similar) = (self.libraries.clone(), self.similar.is_some());
+        let input = self
+            .query(move |catalog| load_dupes(catalog, &libraries, similar))
+            .await?;
+        let state = Arc::clone(self);
+        let report = tokio::task::spawn_blocking(move || {
+            Arc::new(group_dupes(input, &state.libraries, state.similar))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+        *cached = Some(CachedDupes {
+            version,
+            made: Instant::now(),
+            report: Arc::clone(&report),
+        });
+        Ok(report)
     }
 
     /// Whether the listings show the library.
@@ -175,6 +230,8 @@ impl AppState {
             thumbs: Thumbnailer::new(config.cache_dir, ffmpeg),
             ffprobe,
             hosts: allowed_hosts(port),
+            similar: config.similar,
+            dupes: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -204,25 +261,16 @@ fn check_cache_outside_libraries(catalog: &Catalog, cache_dir: &Path) -> Result<
     Ok(())
 }
 
-/// `name` if it is a program on `PATH` that runs.
+/// `name` if it is on `PATH`, with a note if it is not.
 fn find_tool(name: &str) -> Option<PathBuf> {
-    let found = Command::new(name)
-        .arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if found {
-        debug!("Found {} on PATH", name);
-        Some(PathBuf::from(name))
-    } else {
+    let found = crate::decode::find_tool(name);
+    if found.is_none() {
         eprintln!(
             "{} not found on PATH; some thumbnails will be placeholders",
             name
         );
-        None
     }
+    found
 }
 
 /// All routes, behind the `Host` check.
@@ -409,6 +457,7 @@ mod tests {
             libraries: vec![],
             cache_dir: Some(cache.clone()),
             port: 2635,
+            similar: Some(crate::dupes::DEFAULT_THRESHOLD),
         };
         let ffmpeg = ffmpeg.then(|| PathBuf::from("ffmpeg"));
         let app = router(Arc::new(AppState::new(config, 2635, ffmpeg, None)));

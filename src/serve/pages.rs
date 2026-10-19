@@ -8,7 +8,7 @@
 use super::thumbs::{self, ViewSource};
 use super::{AppError, AppState};
 use crate::catalog::{display_root, FileRecord, Filter, Page};
-use crate::dupes::{find_dupes, human_mtime, DupeGroup};
+use crate::dupes::{human_mtime, plural, DupeGroup, Tier};
 use crate::media::MediaType;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -536,8 +536,15 @@ fn dupe_group(group: &DupeGroup) -> Markup {
     html! {
         section.group {
             h2 {
-                (HumanBytes(group.size)) " x " (group.files.len()) " copies, "
-                (HumanBytes(group.reclaimable_bytes())) " reclaimable"
+                @match group.tier {
+                    Tier::Exact => {
+                        (HumanBytes(group.files[0].size)) " x " (group.files.len()) " exact copies, "
+                    }
+                    Tier::SamePixels => { (group.files.len()) " images with the same pixels, " }
+                    Tier::Similar => { (group.files.len()) " similar images, " }
+                }
+                (HumanBytes(group.reclaimable_bytes())) " reclaimable "
+                span.badge.tier { (group.tier.as_str()) }
             }
             div.copies {
                 @for f in &group.files {
@@ -547,9 +554,15 @@ fn dupe_group(group: &DupeGroup) -> Markup {
                         }
                         figcaption {
                             @if f.keep { span.badge.keep { "keep" } }
+                            @if let (Some(matches), true) = (f.matches, group.tier != Tier::Exact) {
+                                span.badge.tier { (matches.as_str()) }
+                            }
                             div.library { (f.library) }
                             div.path { (f.path) }
-                            div.meta { (human_mtime(f.mtime_ns)) }
+                            div.meta {
+                                (human_mtime(f.mtime_ns))
+                                @if group.tier != Tier::Exact { ", " (HumanBytes(f.size)) }
+                            }
                         }
                     }
                 }
@@ -558,16 +571,13 @@ fn dupe_group(group: &DupeGroup) -> Markup {
     }
 }
 
-/// `/dupes`: exact duplicate groups, largest reclaimable size first.
+/// `/dupes`: duplicate groups, exact first, then same pixels, then similar.
 pub async fn dupes(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
-    let libraries = state.libraries.clone();
-    let report = state
-        .query(move |catalog| find_dupes(catalog, &libraries))
-        .await?;
     let page = query.page();
+    let report = state.dupes(page == 1).await?;
     let start = (page - 1) * DUPE_PAGE_SIZE;
     let groups = report.groups.get(start..).unwrap_or_default();
     let has_more = groups.len() > DUPE_PAGE_SIZE;
@@ -583,7 +593,9 @@ pub async fn dupes(
         let content = html! {
             h1 { "Duplicates" }
             p {
-                (summary.groups) " groups, " (summary.redundant_files) " redundant files, "
+                (summary.groups) " " (plural(summary.groups, "group", "groups")) ", "
+                (summary.redundant_files) " redundant "
+                (plural(summary.redundant_files, "file", "files")) ", "
                 (HumanBytes(summary.reclaimable_bytes)) " reclaimable."
             }
             @if summary.unhashed_candidates > 0 {
@@ -591,6 +603,19 @@ pub async fn dupes(
                     (summary.unhashed_candidates) " files share their size with another file but are \
                      not hashed yet, so there may be more duplicates. Scan their libraries again \
                      to hash them."
+                }
+            }
+            @if summary.unhashed_images > 0 {
+                p.note {
+                    (summary.unhashed_images) " images have no pixel or perceptual hash yet (not \
+                     scanned since they changed, RAW, or HEIC/AVIF without ffmpeg), so there may \
+                     be more same-pixel or similar images."
+                }
+            }
+            @if state.similar.is_none() {
+                p.note {
+                    "Similar images (resized or recompressed copies) are not shown. Start the \
+                     viewer with --similar to include them; expect burst shots among them."
                 }
             }
             div.groups { (items) }

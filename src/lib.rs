@@ -20,8 +20,10 @@
  *************************************************************************************************/
 
 pub mod catalog;
+pub mod decode;
 pub mod dupes;
 pub mod error;
+pub mod imagehash;
 pub mod media;
 pub mod scan;
 pub mod serve;

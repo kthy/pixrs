@@ -6,6 +6,7 @@
  *************************************************************************************************/
 
 use crate::error::Error;
+use crate::imagehash::ImageHashes;
 use crate::media::MediaType;
 use directories::ProjectDirs;
 use rusqlite::types::Value;
@@ -39,6 +40,14 @@ CREATE TABLE files (
     camera_model TEXT,
     width INTEGER,
     height INTEGER,
+    -- The hash and decoder versions the image hash pass decoded (or failed to decode) the file
+    -- with; NULL if it has not. A file decoded with other versions is decoded again.
+    image_hash_version TEXT,
+    pixel_hash TEXT,
+    -- Perceptual hash: 64 bits stored as a signed integer.
+    phash INTEGER,
+    -- 32 x 32 grayscale pixels, to confirm that images with close perceptual hashes are copies.
+    fingerprint BLOB,
     PRIMARY KEY (library_id, path)
 );
 CREATE INDEX files_size ON files (size);
@@ -79,7 +88,7 @@ pub struct FileRecord {
 }
 
 /// A hashed file, with the root of the library it is in.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HashedFile {
     pub library_id: i64,
     pub root: String,
@@ -210,7 +219,7 @@ impl Catalog {
         rows.collect()
     }
 
-    /// Insert or replace a file.
+    /// Insert or replace a file. A replaced file loses its image hashes until it is hashed again.
     pub fn upsert(&self, library_id: i64, file: &FileRecord) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO files (library_id, path, size, mtime_ns, media_type, sha256, taken_at,
@@ -225,7 +234,11 @@ impl Catalog {
                 camera_make = excluded.camera_make,
                 camera_model = excluded.camera_model,
                 width = excluded.width,
-                height = excluded.height",
+                height = excluded.height,
+                image_hash_version = NULL,
+                pixel_hash = NULL,
+                phash = NULL,
+                fingerprint = NULL",
             params![
                 library_id,
                 file.path,
@@ -335,6 +348,110 @@ impl Catalog {
         ))?;
         let rows = stmt.query_map([library_id], file_record)?;
         rows.collect()
+    }
+
+    /// Every image in the library with the versions the image hash pass decoded it with, if it
+    /// has, ordered by path.
+    pub fn image_hash_versions(
+        &self,
+        library_id: i64,
+    ) -> rusqlite::Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, image_hash_version FROM files
+             WHERE library_id = ?1 AND media_type = 'image'
+             ORDER BY path",
+        )?;
+        let rows = stmt.query_map([library_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Number of images in the given libraries (all if empty) the image hash pass has not
+    /// decoded: not scanned since they changed, or no decoder for them (RAW, or HEIC without
+    /// `ffmpeg`).
+    pub fn count_unhashed_images(&self, libraries: &[i64]) -> rusqlite::Result<usize> {
+        let filter = Filter {
+            libraries: libraries.to_vec(),
+            media_type: Some(MediaType::Image),
+        };
+        let (cond, values) = filter.condition();
+        self.conn.query_row(
+            &format!(
+                "SELECT count(*) FROM files WHERE {} AND image_hash_version IS NULL",
+                cond
+            ),
+            params_from_iter(values),
+            |row| row.get::<_, i64>(0).map(|n| n as usize),
+        )
+    }
+
+    /// Record that an image was decoded with `version`, with its hashes and decoded
+    /// dimensions, or without if decoding failed.
+    pub fn set_image_hashes(
+        &self,
+        library_id: i64,
+        path: &str,
+        version: &str,
+        hashes: Option<&ImageHashes>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET image_hash_version = ?3, pixel_hash = ?4, phash = ?5,
+                              fingerprint = ?6,
+                              width = coalesce(?7, width), height = coalesce(?8, height)
+             WHERE library_id = ?1 AND path = ?2",
+            params![
+                library_id,
+                path,
+                version,
+                hashes.map(|h| h.pixels.as_str()),
+                hashes.and_then(|h| h.perceptual).map(|p| p as i64),
+                hashes.and_then(|h| h.fingerprint.as_deref()),
+                hashes.map(|h| h.width),
+                hashes.map(|h| h.height),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every image, in any library, that has image hashes. Without `visual`, perceptual hashes
+    /// and fingerprints are left out (`None`), which saves reading about 1 KB per image when
+    /// similar images are not looked for.
+    pub fn hashed_images(&self, visual: bool) -> rusqlite::Result<Vec<HashedImage>> {
+        let visual_columns = if visual {
+            "f.phash, f.fingerprint"
+        } else {
+            "NULL, NULL"
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256, f.pixel_hash,
+                    coalesce(f.width, 0), coalesce(f.height, 0), {}
+             FROM files f JOIN libraries l ON l.id = f.library_id
+             WHERE f.pixel_hash IS NOT NULL",
+            visual_columns
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(HashedImage {
+                file: HashedFile {
+                    library_id: row.get(0)?,
+                    root: row.get(1)?,
+                    path: row.get(2)?,
+                    size: row.get::<_, i64>(3)? as u64,
+                    mtime_ns: row.get(4)?,
+                    sha256: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                },
+                pixel_hash: row.get(6)?,
+                width: row.get(7)?,
+                height: row.get(8)?,
+                phash: row.get::<_, Option<i64>>(9)?.map(|p| p as u64),
+                fingerprint: row.get(10)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// A number that changes whenever another connection commits to the catalog, e.g. a scan.
+    pub fn data_version(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
     }
 
     /// Every library with its file count, ordered by root.
@@ -556,6 +673,21 @@ impl Catalog {
         })?;
         rows.collect()
     }
+}
+
+/// An image with its pixel and perceptual hashes. `file.sha256` is empty if the file has no
+/// content hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashedImage {
+    pub file: HashedFile,
+    pub pixel_hash: String,
+    /// `None` for images with almost no detail.
+    pub phash: Option<u64>,
+    /// Size of the upright image; 0 if unknown.
+    pub width: u32,
+    pub height: u32,
+    /// `None` when `phash` is.
+    pub fingerprint: Option<Vec<u8>>,
 }
 
 /// A library ID and a path in that library.
@@ -968,6 +1100,54 @@ mod tests {
             Some((other, String::from("elsewhere.jpg")))
         );
         assert_eq!(catalog.date(id, "missing.jpg").unwrap(), None);
+    }
+
+    #[test]
+    fn test_image_hashes_are_reset_when_a_file_changes() {
+        let dir = tempdir().unwrap();
+        let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+        let id = catalog.library_id("/lib").unwrap();
+        catalog.upsert(id, &record("a.jpg", 1)).unwrap();
+        catalog.upsert(id, &record("b.jpg", 1)).unwrap();
+        let versions = |catalog: &Catalog| {
+            catalog
+                .image_hash_versions(id)
+                .unwrap()
+                .into_iter()
+                .map(|(path, v)| format!("{} {}", path, v.unwrap_or_default()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(versions(&catalog), ["a.jpg ", "b.jpg "]);
+
+        let hashes = ImageHashes {
+            pixels: String::from("ppp"),
+            perceptual: Some(u64::MAX),
+            fingerprint: Some(vec![7; 4]),
+            width: 30,
+            height: 20,
+        };
+        catalog
+            .set_image_hashes(id, "a.jpg", "v1", Some(&hashes))
+            .unwrap();
+        catalog.set_image_hashes(id, "b.jpg", "v1", None).unwrap();
+        assert_eq!(versions(&catalog), ["a.jpg v1", "b.jpg v1"]);
+        let images = catalog.hashed_images(true).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            (
+                images[0].pixel_hash.as_str(),
+                images[0].phash,
+                images[0].width,
+                images[0].height
+            ),
+            ("ppp", Some(u64::MAX), 30, 20)
+        );
+        assert_eq!(catalog.count_unhashed_images(&[]).unwrap(), 0);
+
+        catalog.upsert(id, &record("a.jpg", 2)).unwrap();
+        assert_eq!(versions(&catalog), ["a.jpg ", "b.jpg v1"]);
+        assert!(catalog.hashed_images(true).unwrap().is_empty());
+        assert_eq!(catalog.count_unhashed_images(&[id]).unwrap(), 1);
     }
 
     #[test]

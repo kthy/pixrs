@@ -30,6 +30,7 @@ data-encoding = "2"                                                             
 directories = "6"                                                                                    # MIT OR Apache-2.0
 env_logger = "0.11"                                                                                  # MIT OR Apache-2.0
 exitcode = "1"                                                                                       # Apache-2.0
+image_hasher = "3"                                                                                   # MIT OR Apache-2.0
 indicatif = "0.18"                                                                                   # MIT
 log = "0.4"                                                                                          # MIT OR Apache-2.0
 maud = "0.27"                                                                                        # MIT OR Apache-2.0
