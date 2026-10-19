@@ -37,4 +37,13 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
+      # Tests that need ffmpeg skip themselves without it; this shows which case applies.
+      - name: Show ffmpeg version
+        shell: bash
+        run: |
+          if command -v ffmpeg > /dev/null; then
+            ffmpeg -version | sed -n 1p
+          else
+            echo "ffmpeg is not on PATH: the tests that need it skip"
+          fi
       - run: cargo test
