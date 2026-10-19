@@ -7,13 +7,13 @@
 
 use super::Located;
 use crate::catalog::FileRecord;
+use crate::decode::{self, decode_in_process, file_url, image_decoder, TOOL_TIMEOUT};
 use crate::media::MediaType;
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage};
+use image::{DynamicImage, RgbImage};
 use log::{debug, warn};
 use ring::digest::{digest, SHA256};
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,29 +21,19 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread::available_parallelism;
-use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
-
-/// How long `ffmpeg` and `ffprobe` may take for one file.
-const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The error of a tool that ran out of time. Not remembered as a failure: the system may only
-/// have been busy.
-const TIMED_OUT: &str = "timed out";
-
-/// Image extensions the `image` crate decodes, lowercase.
-const DECODED_IN_PROCESS: &[&str] = &["bmp", "gif", "jpeg", "jpg", "png", "tif", "tiff", "webp"];
-
-/// Image extensions only `ffmpeg` decodes, lowercase.
-const DECODED_BY_FFMPEG: &[&str] = &["avif", "heic", "heif"];
 
 /// Image extensions browsers show, lowercase.
 const SHOWN_BY_BROWSERS: &[&str] = &["avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"];
 
 /// Image extensions browsers cannot show but the viewer can make a preview of, lowercase.
 const SHOWN_AS_PREVIEW: &[&str] = &["heic", "heif", "tif", "tiff"];
+
+/// The error of a tool that ran out of time. Not remembered as a failure: the system may only
+/// have been busy.
+const TIMED_OUT: &str = "timed out";
 
 /// The renditions the viewer makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,13 +70,9 @@ enum Decoder {
     FfmpegVideo,
 }
 
-/// The lowercase extension of a cataloged path.
+/// The lowercase extension of a cataloged file.
 fn extension(file: &FileRecord) -> String {
-    Path::new(&file.path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
+    decode::extension(&file.path)
 }
 
 /// What the viewer shows for an image.
@@ -112,14 +98,13 @@ pub fn view_source(file: &FileRecord) -> ViewSource {
 
 /// How the viewer makes renditions of the file, if it can.
 fn decoder(file: &FileRecord) -> Option<Decoder> {
-    let ext = extension(file);
     match file.media_type {
-        MediaType::Image if DECODED_IN_PROCESS.contains(&ext.as_str()) => Some(Decoder::InProcess),
-        MediaType::Image if DECODED_BY_FFMPEG.contains(&ext.as_str()) => {
-            Some(Decoder::FfmpegImage)
-        }
+        MediaType::Image => match image_decoder(&file.path)? {
+            decode::Decoder::InProcess => Some(Decoder::InProcess),
+            decode::Decoder::Ffmpeg => Some(Decoder::FfmpegImage),
+        },
         MediaType::Video => Some(Decoder::FfmpegVideo),
-        _ => None,
+        MediaType::Audio => None,
     }
 }
 
@@ -172,7 +157,7 @@ impl Thumbnailer {
         }
         let source = located.full_path.clone();
         let made = match ffmpeg {
-            None => tokio::task::spawn_blocking(move || decode_in_process(&source, size.pixels()))
+            None => tokio::task::spawn_blocking(move || render_in_process(&source, size.pixels()))
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|made| made),
@@ -245,15 +230,8 @@ fn cache_key(located: &Located, size: Size) -> String {
 }
 
 /// Decode an image with the `image` crate, upright, shrunk to fit `max` pixels, as JPEG.
-fn decode_in_process(source: &Path, max: u32) -> Result<Vec<u8>, String> {
-    let mut decoder = ImageReader::open(source)
-        .map_err(|e| e.to_string())?
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?
-        .into_decoder()
-        .map_err(|e| e.to_string())?;
-    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
-    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+fn render_in_process(source: &Path, max: u32) -> Result<Vec<u8>, String> {
+    let (mut img, orientation) = decode_in_process(source).map_err(|e| e.to_string())?;
     img.apply_orientation(orientation);
     if img.width() > max || img.height() > max {
         img = img.thumbnail(max, max);
@@ -321,14 +299,6 @@ async fn decode_with_ffmpeg(
     } else {
         Ok(jpeg)
     }
-}
-
-/// `source` as an `ffmpeg` input. The `file:` prefix keeps names like `a:b.mov` from being read
-/// as a protocol.
-fn file_url(source: &Path) -> OsString {
-    let mut url = OsString::from("file:");
-    url.push(source);
-    url
 }
 
 /// Run a tool and return its standard output, or an error with its standard error.
@@ -445,7 +415,7 @@ mod tests {
         image::RgbaImage::from_pixel(1000, 500, image::Rgba([0, 0, 0, 0]))
             .save(&path)
             .unwrap();
-        let jpeg = decode_in_process(&path, 320).unwrap();
+        let jpeg = render_in_process(&path, 320).unwrap();
         let img = image::load_from_memory(&jpeg).unwrap().to_rgb8();
         assert_eq!(img.dimensions(), (320, 160));
         assert!(img.get_pixel(10, 10).0.iter().all(|&c| c > 240));

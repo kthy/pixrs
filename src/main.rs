@@ -110,7 +110,8 @@ fn dupes(opt: DupesOpt) {
     let catalog =
         Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail("Dupes failed", e));
     let libraries = library_ids(&catalog, &opt.libraries, "Dupes failed");
-    let report = match find_dupes(&catalog, &libraries) {
+    let similar = opt.similar.then_some(opt.threshold);
+    let report = match find_dupes(&catalog, &libraries, similar) {
         Ok(report) => report,
         Err(e) => fail("Dupes failed", e.into()),
     };
@@ -143,7 +144,7 @@ fn scan(opt: ScanOpt, now: Instant) {
         Ok(s) => {
             println!(
                 "Scanned {} in {}: {} added, {} updated, {} removed, {} unchanged, {} hashed, \
-                 {} skipped",
+                 {} images decoded, {} skipped",
                 opt.library.display(),
                 HumanDuration(now.elapsed()),
                 s.added,
@@ -151,8 +152,23 @@ fn scan(opt: ScanOpt, now: Instant) {
                 s.removed,
                 s.unchanged,
                 s.hashed,
+                s.images_hashed,
                 s.skipped
             );
+            if s.images_undecodable > 0 {
+                println!(
+                    "{} images could not be decoded; they are left out of similarity matching \
+                     until they or the decoders change.",
+                    s.images_undecodable
+                );
+            }
+            if s.images_without_decoder > 0 {
+                println!(
+                    "{} images have no decoder (RAW, or HEIC/AVIF without ffmpeg 7.1 or later on \
+                     PATH); they are left out of same-pixel and similarity matching.",
+                    s.images_without_decoder
+                );
+            }
             println!("Catalog: {}", catalog.display());
         }
         Err(e) => fail("Scan failed", e),
@@ -174,6 +190,7 @@ fn serve(opt: ServeOpt) {
         libraries,
         cache_dir,
         port: opt.port,
+        similar: opt.similar.then_some(opt.threshold),
     };
     let ready = |url: &str| {
         println!("Serving the catalog at {}", url);

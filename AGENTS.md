@@ -48,7 +48,8 @@ Decided details:
   folder in place of the date folders, e.g. `video/undated/DSC0047.mp4`.
 - Duplicates: report only by default. A flag enables quarantine, which keeps the oldest file and
   moves the others to a quarantine folder. "Oldest" means earliest mtime, with path order as
-  the tie-breaker.
+  the tie-breaker. Exception: in groups of similar images the largest image is kept (most
+  pixels, then most bytes, then oldest), since similar copies are often scaled down.
 - Media probing: call the `ffmpeg`/`ffprobe` binaries if they are on `PATH`, and degrade
   gracefully if not. Do not link against libav: it complicates the build on Windows and its GPL
   licensing does not sit well with linking into this AGPL program.
@@ -64,6 +65,29 @@ Decided details:
   `ffmpeg`; RAW formats and everything without a decoder get a placeholder.
 - Viewer video: no transcoding. Videos the browser cannot play show their codec (from
   `ffprobe`) and an "Open original" link.
+- Image hashes: every image is decoded, in a separate scan pass after content hashing, in
+  parallel. Pixel hash = hash of the decoded pixels before EXIF orientation, so a copy that only
+  changed its rotation tag counts as "same pixels". Perceptual hash = `image_hasher` gradient,
+  64 bits, of the upright image shrunk to 256 px; images with almost no detail (blank, black,
+  one color) get none, since their hashes are all alike. Each image also stores a 32 x 32
+  grayscale fingerprint. "Similar" = Hamming distance at most `--threshold`, aspect ratios
+  within 3%, and matching fingerprints, found by comparing all pairs on all cores. The
+  fingerprint check exists because the 64-bit hash alone cannot tell burst shots apart: on the
+  owner's library, 12 of 15 pairs at distance 0 were different pictures. Calibrated
+  (`examples/calibrate.rs`, 2,600 of the owner's photos plus synthetic copies): threshold 6
+  bits (all copies within 4), fingerprint limit 6 at the 99th percentile pixel (keeps 99.6% of
+  copies, rejects about 95% of burst pairs). Larger fingerprints (64 to 256 px) separated
+  worse. Since burst pairs still outnumber real copies in such libraries, `similar` is opt-in
+  (`--similar`) and documented as "expect burst shots". HEIC is decoded via
+  `ffmpeg` 7.1 or later when available (older versions may decode one tile of a phone's HEIC
+  grid); RAW is skipped with a note. `ffmpeg` applies the file's rotation itself, so for HEIC
+  and AVIF the pixel hash is of the upright image.
+- Hash versions: each image stores the version it was hashed with: the hash definitions, the
+  `image` and `image_hasher` crates and its format's decoder crate (major.minor, from
+  `Cargo.lock` via `build.rs`), plus `ffmpeg -version` for HEIC/AVIF. A scan rehashes images
+  whose version differs, since another decoder can produce slightly different pixels. Read
+  errors and timeouts are not recorded, so those images are tried again; only files the
+  decoder rejects are recorded as undecodable.
 
 ## Invariants
 
@@ -102,7 +126,8 @@ on the LFS files.
   trailing comment aligned with the others. New dependencies must have AGPL-3.0-compatible
   licenses.
 - Catalog schema changes bump `SCHEMA_VERSION` in `src/catalog.rs` and must migrate existing
-  catalogs; users' catalogs hold hours of hashing.
+  catalogs; users' catalogs hold hours of hashing. Until the first release that includes the
+  catalog, schema v1 is edited in place: nobody has a catalog to migrate yet.
 - Conventional Commits: `feat`, `fix`, `chore`, `chore(deps)`, `docs`, `ci`, `test`.
 - Add user-visible changes to `[Unreleased]` in `CHANGELOG.md` (Keep a Changelog format).
 - Keep the usage block in `README.md` identical to `pixrs --help` output.

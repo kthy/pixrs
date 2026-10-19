@@ -11,7 +11,7 @@ A command-line utility to present a bunch of media files in a reasonable manner.
 Usage: pixrs [OPTIONS] [COMMAND]
 
 Commands:
-  dupes  Report exact duplicates in the catalog
+  dupes  Report duplicate and similar files in the catalog
   scan   Scan a media library into the catalog
   serve  Browse the catalog in a local web viewer
   help   Print this message or the help of the given subcommand(s)
@@ -40,10 +40,15 @@ Options:
 The catalog keeps one row per media file: path, size, modification time and, where the file has
 them, date taken, camera and dimensions. Only files that share their size with another cataloged
 file can be exact duplicates, so only those are hashed (SHA-256); files with a unique size are
-never read in full. Rescanning only reads files that are new or whose size or modification time
-changed. The library itself is never modified.
+never read in full. Images are also decoded, in parallel, for a hash of their pixels and a
+perceptual hash, which find copies that are not byte-identical. JPEG, PNG, GIF, WebP, BMP and TIFF
+are decoded in-process; HEIC and AVIF need [FFmpeg][ffmpeg] 7.1 or later on `PATH`; RAW files are
+skipped.
+Rescanning only reads files that are new or whose size or modification time changed, and
+decodes images again only if an update changed the decoders. The library itself is never
+modified.
 
-### Report exact duplicates
+### Report duplicates
 
 ```text
 Usage: pixrs dupes [OPTIONS] [LIBRARIES]...
@@ -67,14 +72,39 @@ Options:
 
           [default: text]
 
+      --similar
+          Also find similar images (resized or recompressed copies). Expect
+          burst shots among them
+
+      --threshold <THRESHOLD>
+          How many of the 64 perceptual hash bits two images may differ in to
+          count as similar (at most 16)
+
+          [default: 6]
+
   -h, --help
           Print help (see a summary with '-h')
 ```
 
-Duplicates are files with the same size and SHA-256, in any scanned library. In each group the
-file with the earliest modification time is marked `keep`; ties go to the first path in sort
-order. Naming libraries shows only groups with a file in them, but with all copies: for example,
-`pixrs dupes /mnt/old-disk` lists what on the old disk also exists elsewhere.
+Duplicates are found in any scanned library, in three tiers:
+
+- `exact`: the same size and SHA-256.
+- `same-pixels`: images whose decoded pixels are identical, for example after a photo manager
+  rewrote their metadata.
+- `similar`, only with `--similar`: images with the same shape (aspect ratio) whose perceptual
+  hashes differ in at most `--threshold` of 64 bits and whose small grayscale fingerprints
+  match, for example resized or recompressed copies. Expect burst shots among them: photos
+  taken a moment apart can look alike even to the fingerprint check, so look at similar groups
+  before acting on them. Images with almost no detail, like black frames or blank scans, are
+  never similar.
+
+Files linked through other files form one group, which gets the weakest tier among them, and
+each file shows how it matches the kept one. In each group the file with the earliest
+modification time is marked `keep`; ties go to the first path in sort order. In `similar`
+groups the largest image is kept instead (most pixels, then most bytes), since similar copies
+are often scaled down. Naming libraries shows only groups with a file in them, but with all
+copies: for example, `pixrs dupes /mnt/old-disk` lists what on the old disk also exists
+elsewhere.
 
 The report comes from the catalog as of each library's last scan, so rescan libraries that have
 changed. It never touches the library.
@@ -89,20 +119,25 @@ Arguments:
                   libraries]
 
 Options:
-      --catalog <CATALOG>  The catalog file [default: catalog.sqlite in the OS
-                           data directory]
-      --cache <CACHE>      The thumbnail cache folder [default: thumbnails in
-                           the OS cache directory]
-      --port <PORT>        The port to listen on, on localhost only [default:
-                           2635]
-  -o, --open               Open the viewer in the default browser
-  -h, --help               Print help
+      --catalog <CATALOG>      The catalog file [default: catalog.sqlite in the
+                               OS data directory]
+      --cache <CACHE>          The thumbnail cache folder [default: thumbnails
+                               in the OS cache directory]
+      --similar                Also find similar images (resized or recompressed
+                               copies). Expect burst shots among them
+      --threshold <THRESHOLD>  How many of the 64 perceptual hash bits two
+                               images may differ in to count as similar (at most
+                               16) [default: 6]
+      --port <PORT>            The port to listen on, on localhost only
+                               [default: 2635]
+  -o, --open                   Open the viewer in the default browser
+  -h, --help                   Print help
 ```
 
 Starts a viewer at `http://127.0.0.1:2635/`: browse by folder or by date (date taken, or the
 modification time if that is unknown), view images, play audio and video, and compare duplicate
-groups side by side with the copy to keep marked. It only reads from the libraries and the
-catalog, so it can run while a scan is going on.
+groups side by side with their tier and the copy to keep marked. It only reads from the
+libraries and the catalog, so it can run while a scan is going on.
 
 Thumbnails are cached outside the libraries. JPEG, PNG, GIF, WebP, BMP and TIFF are decoded
 in-process. HEIC, AVIF and video thumbnails need [FFmpeg][ffmpeg] (HEIC tested with 7.1) on

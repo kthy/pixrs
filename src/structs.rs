@@ -5,6 +5,7 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
+use crate::dupes::DEFAULT_THRESHOLD;
 use crate::statics::{ABOUT, AFTER_HELP};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -30,7 +31,7 @@ pub struct Cli {
 /// Subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Report exact duplicates in the catalog
+    /// Report duplicate and similar files in the catalog
     Dupes(DupesOpt),
     /// Scan a media library into the catalog
     Scan(ScanOpt),
@@ -66,6 +67,15 @@ pub struct DupesOpt {
     /// Output format
     #[arg(long, value_enum, default_value_t = Format::Text)]
     pub format: Format,
+
+    /// Also find similar images (resized or recompressed copies). Expect burst shots among them
+    #[arg(long)]
+    pub similar: bool,
+
+    /// How many of the 64 perceptual hash bits two images may differ in to count as similar
+    /// (at most 16)
+    #[arg(long, requires = "similar", default_value_t = DEFAULT_THRESHOLD, value_parser = clap::value_parser!(u32).range(0..=16))]
+    pub threshold: u32,
 }
 
 /// Options for `pixrs serve`.
@@ -81,6 +91,15 @@ pub struct ServeOpt {
     /// The thumbnail cache folder [default: thumbnails in the OS cache directory]
     #[arg(long)]
     pub cache: Option<PathBuf>,
+
+    /// Also find similar images (resized or recompressed copies). Expect burst shots among them
+    #[arg(long)]
+    pub similar: bool,
+
+    /// How many of the 64 perceptual hash bits two images may differ in to count as similar
+    /// (at most 16)
+    #[arg(long, requires = "similar", default_value_t = DEFAULT_THRESHOLD, value_parser = clap::value_parser!(u32).range(0..=16))]
+    pub threshold: u32,
 
     /// The port to listen on, on localhost only
     #[arg(long, default_value_t = 2635)]
