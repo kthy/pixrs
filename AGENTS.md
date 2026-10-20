@@ -188,8 +188,9 @@ on the LFS files.
   licenses (listed in `about.toml`). After changing dependencies, run `just notices` to
   regenerate `THIRD_PARTY_NOTICES.txt`; CI fails if it is out of date.
 - Catalog schema changes bump `SCHEMA_VERSION` in `src/catalog.rs` and must migrate existing
-  catalogs; users' catalogs hold hours of hashing. Until the first release that includes the
-  catalog, schema v1 is edited in place: nobody has a catalog to migrate yet.
+  catalogs; users' catalogs hold hours of hashing. Schema v1 shipped in 0.2.0. Likewise, a
+  change to the plan or journal format bumps `PLAN_VERSION` in `src/plan.rs`, and `pixrs undo`
+  must still read journals written by released versions.
 - Conventional Commits: `feat`, `fix`, `chore`, `chore(deps)`, `docs`, `ci`, `test`.
 - Add user-visible changes to `[Unreleased]` in `CHANGELOG.md` (Keep a Changelog format).
 - Keep the usage block in `README.md` identical to `pixrs --help` output.

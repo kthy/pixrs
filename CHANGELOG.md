@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-20
+
 ### Added
 
 - `pixrs scan` catalogs a media library in SQLite: path, size, mtime and EXIF/track metadata
@@ -51,3 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The static HTML gallery generator. `pixrs serve` replaces it.
 - Unused `polars` dependency.
+
+[Unreleased]: https://github.com/kthy/pixrs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kthy/pixrs/releases/tag/v0.2.0
