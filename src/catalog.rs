@@ -5,6 +5,10 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
+use crate::avhash::{
+    frames_from_bytes, frames_to_bytes, values_from_bytes, values_to_bytes, AudioFingerprint,
+    Frame, VideoSignature,
+};
 use crate::error::Error;
 use crate::imagehash::ImageHashes;
 use crate::media::MediaType;
@@ -40,14 +44,19 @@ CREATE TABLE files (
     camera_model TEXT,
     width INTEGER,
     height INTEGER,
-    -- The hash and decoder versions the image hash pass decoded (or failed to decode) the file
-    -- with; NULL if it has not. A file decoded with other versions is decoded again.
-    image_hash_version TEXT,
+    -- The hash and decoder versions the hash pass decoded (or failed to decode) the file with;
+    -- NULL if it has not. A file decoded with other versions is decoded again.
+    hash_version TEXT,
     pixel_hash TEXT,
     -- Perceptual hash: 64 bits stored as a signed integer.
     phash INTEGER,
     -- 32 x 32 grayscale pixels, to confirm that images with close perceptual hashes are copies.
     fingerprint BLOB,
+    -- Video and audio: duration in milliseconds, the video's sampled frames
+    -- (`avhash::frames_to_bytes`), the audio's Chromaprint values (32-bit little-endian).
+    duration_ms INTEGER,
+    frames BLOB,
+    chromaprint BLOB,
     PRIMARY KEY (library_id, path)
 );
 CREATE INDEX files_size ON files (size);
@@ -247,7 +256,10 @@ impl Catalog {
                 camera_model = excluded.camera_model,
                 width = excluded.width,
                 height = excluded.height,
-                image_hash_version = NULL,
+                hash_version = NULL,
+                duration_ms = NULL,
+                frames = NULL,
+                chromaprint = NULL,
                 pixel_hash = NULL,
                 phash = NULL,
                 fingerprint = NULL",
@@ -362,38 +374,121 @@ impl Catalog {
         rows.collect()
     }
 
-    /// Every image in the library with the versions the image hash pass decoded it with, if it
-    /// has, ordered by path.
-    pub fn image_hash_versions(
+    /// Every media file in the library with its type and the versions the hash pass decoded
+    /// it with, if it has, ordered by path.
+    #[allow(clippy::type_complexity)]
+    pub fn hash_versions(
         &self,
         library_id: i64,
-    ) -> rusqlite::Result<Vec<(String, Option<String>)>> {
+    ) -> rusqlite::Result<Vec<(String, MediaType, Option<String>)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, image_hash_version FROM files
-             WHERE library_id = ?1 AND media_type = 'image'
+            "SELECT path, media_type, hash_version FROM files WHERE library_id = ?1
              ORDER BY path",
         )?;
-        let rows = stmt.query_map([library_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map([library_id], |row| {
+            let media_type: String = row.get(1)?;
+            let media_type = media_type.parse().map_err(|e: String| {
+                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, e.into())
+            })?;
+            Ok((row.get(0)?, media_type, row.get(2)?))
+        })?;
         rows.collect()
     }
 
-    /// Number of images in the given libraries (all if empty) the image hash pass has not
-    /// decoded: not scanned since they changed, or no decoder for them (RAW, or HEIC without
-    /// `ffmpeg`).
-    pub fn count_unhashed_images(&self, libraries: &[i64]) -> rusqlite::Result<usize> {
+    /// Number of media files in the given libraries (all if empty) the hash pass has not
+    /// decoded: not scanned since they changed, or no decoder for them (RAW, HEIC without
+    /// `ffmpeg`, video without `ffmpeg`, audio without `fpcalc`).
+    pub fn count_unhashed(&self, libraries: &[i64]) -> rusqlite::Result<usize> {
         let filter = Filter {
             libraries: libraries.to_vec(),
-            media_type: Some(MediaType::Image),
+            media_type: None,
         };
         let (cond, values) = filter.condition();
         self.conn.query_row(
             &format!(
-                "SELECT count(*) FROM files WHERE {} AND image_hash_version IS NULL",
+                "SELECT count(*) FROM files WHERE {} AND hash_version IS NULL",
                 cond
             ),
             params_from_iter(values),
             |row| row.get::<_, i64>(0).map(|n| n as usize),
         )
+    }
+
+    /// Record that a video was decoded with `version`, with its signature, or without if
+    /// decoding failed.
+    pub fn set_video_signature(
+        &self,
+        library_id: i64,
+        path: &str,
+        version: &str,
+        signature: Option<&VideoSignature>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET hash_version = ?3, duration_ms = ?4, frames = ?5
+             WHERE library_id = ?1 AND path = ?2",
+            params![
+                library_id,
+                path,
+                version,
+                signature.map(|s| s.duration_ms),
+                signature.map(|s| frames_to_bytes(&s.frames)),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record that audio was fingerprinted with `version`, with its fingerprint, or without if
+    /// that failed.
+    pub fn set_audio_fingerprint(
+        &self,
+        library_id: i64,
+        path: &str,
+        version: &str,
+        fingerprint: Option<&AudioFingerprint>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET hash_version = ?3, duration_ms = ?4, chromaprint = ?5
+             WHERE library_id = ?1 AND path = ?2",
+            params![
+                library_id,
+                path,
+                version,
+                fingerprint.map(|f| f.duration_ms),
+                fingerprint.map(|f| values_to_bytes(&f.values)),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every video with a signature and every audio file with a fingerprint, in any library.
+    pub fn hashed_av(&self) -> rusqlite::Result<Vec<HashedAv>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256, f.duration_ms,
+                    coalesce(f.width, 0), coalesce(f.height, 0), f.frames, f.chromaprint
+             FROM files f JOIN libraries l ON l.id = f.library_id
+             WHERE f.duration_ms IS NOT NULL
+               AND (f.frames IS NOT NULL OR f.chromaprint IS NOT NULL)",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let frames: Option<Vec<u8>> = row.get(9)?;
+            let chromaprint: Option<Vec<u8>> = row.get(10)?;
+            Ok(HashedAv {
+                file: HashedFile {
+                    library_id: row.get(0)?,
+                    root: row.get(1)?,
+                    path: row.get(2)?,
+                    size: row.get::<_, i64>(3)? as u64,
+                    mtime_ns: row.get(4)?,
+                    sha256: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                },
+                duration_ms: row.get(6)?,
+                width: row.get(7)?,
+                height: row.get(8)?,
+                frames: frames.as_deref().and_then(frames_from_bytes),
+                chromaprint: chromaprint.as_deref().map(values_from_bytes),
+            })
+        })?;
+        rows.collect()
     }
 
     /// Record that an image was decoded with `version`, with its hashes and decoded
@@ -406,7 +501,7 @@ impl Catalog {
         hashes: Option<&ImageHashes>,
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE files SET image_hash_version = ?3, pixel_hash = ?4, phash = ?5,
+            "UPDATE files SET hash_version = ?3, pixel_hash = ?4, phash = ?5,
                               fingerprint = ?6,
                               width = coalesce(?7, width), height = coalesce(?8, height)
              WHERE library_id = ?1 AND path = ?2",
@@ -516,7 +611,8 @@ impl Catalog {
             .conn
             .query_row(
                 &format!(
-                    "SELECT {}, image_hash_version, pixel_hash, phash, fingerprint
+                    "SELECT {}, hash_version, pixel_hash, phash, fingerprint, duration_ms, frames,
+                            chromaprint
                      FROM files WHERE library_id = ?1 AND path = ?2",
                     FILE_COLUMNS
                 ),
@@ -525,12 +621,13 @@ impl Catalog {
                     Ok(CatalogRow {
                         library_id,
                         file: file_record(row)?,
-                        image_hash_version: row.get(10)?,
+                        hash_version: row.get(10)?,
                         pixel_hash: row.get(11)?,
                         phash: row.get(12)?,
-                        fingerprint: row
-                            .get::<_, Option<Vec<u8>>>(13)?
-                            .map(|f| data_encoding::HEXLOWER.encode(&f)),
+                        fingerprint: hex(row.get(13)?),
+                        duration_ms: row.get(14)?,
+                        frames: hex(row.get(15)?),
+                        chromaprint: hex(row.get(16)?),
                     })
                 },
             )
@@ -545,21 +642,20 @@ impl Catalog {
     pub fn put_row(&self, row: &CatalogRow) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         self.upsert(row.library_id, &row.file)?;
-        let fingerprint = row
-            .fingerprint
-            .as_deref()
-            .and_then(|hex| data_encoding::HEXLOWER.decode(hex.as_bytes()).ok());
         self.conn.execute(
-            "UPDATE files SET image_hash_version = ?3, pixel_hash = ?4, phash = ?5,
-                              fingerprint = ?6
+            "UPDATE files SET hash_version = ?3, pixel_hash = ?4, phash = ?5,
+                              fingerprint = ?6, duration_ms = ?7, frames = ?8, chromaprint = ?9
              WHERE library_id = ?1 AND path = ?2",
             params![
                 row.library_id,
                 row.file.path,
-                row.image_hash_version,
+                row.hash_version,
                 row.pixel_hash,
                 row.phash,
-                fingerprint,
+                unhex(&row.fingerprint),
+                row.duration_ms,
+                unhex(&row.frames),
+                unhex(&row.chromaprint),
             ],
         )?;
         tx.commit()
@@ -806,11 +902,39 @@ pub struct HashedImage {
 pub struct CatalogRow {
     pub library_id: i64,
     pub file: FileRecord,
-    pub image_hash_version: Option<String>,
+    pub hash_version: Option<String>,
     pub pixel_hash: Option<String>,
     pub phash: Option<i64>,
-    /// As lowercase hex.
+    /// BLOBs as lowercase hex.
     pub fingerprint: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub frames: Option<String>,
+    pub chromaprint: Option<String>,
+}
+
+/// A BLOB as lowercase hex, for `CatalogRow`.
+fn hex(blob: Option<Vec<u8>>) -> Option<String> {
+    blob.map(|b| data_encoding::HEXLOWER.encode(&b))
+}
+
+/// Lowercase hex from `hex` as a BLOB.
+fn unhex(text: &Option<String>) -> Option<Vec<u8>> {
+    text.as_deref()
+        .and_then(|t| data_encoding::HEXLOWER.decode(t.as_bytes()).ok())
+}
+
+/// A video or audio file with its signature or fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashedAv {
+    pub file: HashedFile,
+    pub duration_ms: i64,
+    /// Size of the video; 0 if unknown or audio.
+    pub width: u32,
+    pub height: u32,
+    /// For videos.
+    pub frames: Option<Vec<Frame>>,
+    /// For audio.
+    pub chromaprint: Option<Vec<u32>>,
 }
 
 /// A library ID and a path in that library.
@@ -1234,10 +1358,10 @@ mod tests {
         catalog.upsert(id, &record("b.jpg", 1)).unwrap();
         let versions = |catalog: &Catalog| {
             catalog
-                .image_hash_versions(id)
+                .hash_versions(id)
                 .unwrap()
                 .into_iter()
-                .map(|(path, v)| format!("{} {}", path, v.unwrap_or_default()))
+                .map(|(path, _, v)| format!("{} {}", path, v.unwrap_or_default()))
                 .collect::<Vec<_>>()
         };
         assert_eq!(versions(&catalog), ["a.jpg ", "b.jpg "]);
@@ -1265,12 +1389,12 @@ mod tests {
             ),
             ("ppp", Some(u64::MAX), 30, 20)
         );
-        assert_eq!(catalog.count_unhashed_images(&[]).unwrap(), 0);
+        assert_eq!(catalog.count_unhashed(&[]).unwrap(), 0);
 
         catalog.upsert(id, &record("a.jpg", 2)).unwrap();
         assert_eq!(versions(&catalog), ["a.jpg ", "b.jpg v1"]);
         assert!(catalog.hashed_images(true).unwrap().is_empty());
-        assert_eq!(catalog.count_unhashed_images(&[id]).unwrap(), 1);
+        assert_eq!(catalog.count_unhashed(&[id]).unwrap(), 1);
     }
 
     #[test]

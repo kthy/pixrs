@@ -23,7 +23,9 @@ use clap::{CommandFactory, Parser};
 use indicatif::HumanDuration;
 use log::{debug, error};
 use pixrs::catalog::Catalog;
-use pixrs::dupes::{find_dupes, plural, write_csv, write_json, write_text, DupeReport, Tier};
+use pixrs::dupes::{
+    find_dupes, plural, write_csv, write_json, write_text, DupeReport, Similarity, Tier,
+};
 use pixrs::error::Error;
 use pixrs::plan::{
     outside_libraries, plan_organize, plan_quarantine, read_plan, write_plan, write_summary,
@@ -122,8 +124,11 @@ fn dupes(opt: DupesOpt) {
     let catalog =
         Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail("Dupes failed", e));
     let libraries = library_ids(&catalog, &opt.libraries, "Dupes failed");
-    let similar = opt.similar.then_some(opt.threshold);
-    let report = match find_dupes(&catalog, &libraries, similar) {
+    let similarity = Similarity {
+        threshold: opt.threshold,
+        images: opt.similar,
+    };
+    let report = match find_dupes(&catalog, &libraries, similarity) {
         Ok(report) => report,
         Err(e) => fail("Dupes failed", e.into()),
     };
@@ -153,8 +158,8 @@ fn dupes(opt: DupesOpt) {
     }
 }
 
-/// Plan moving all but the kept copy of each exact and same-pixels group to `dir`; with
-/// library arguments, only copies in those libraries.
+/// Plan moving every exact and same-pixel copy of a kept file to `dir`; with library
+/// arguments, only copies in those libraries.
 fn quarantine(
     catalog: &Catalog,
     catalog_path: &Path,
@@ -172,12 +177,14 @@ fn quarantine(
     let similar = report
         .groups
         .iter()
-        .filter(|g| g.tier == Tier::Similar)
+        .flat_map(|g| &g.files)
+        .filter(|f| f.matches == Some(Tier::Similar))
         .count();
     if similar > 0 {
         println!(
-            "{} similar groups are left alone: similar images are never quarantined.",
-            similar
+            "{} {} only similar to the kept file and left alone.",
+            similar,
+            plural(similar, "file is", "files are")
         );
     }
     write_summary(&plan, &notes, &path, &mut io::stdout().lock())
@@ -273,7 +280,7 @@ fn scan(opt: ScanOpt, now: Instant) {
         Ok(s) => {
             println!(
                 "Scanned {} in {}: {} added, {} updated, {} removed, {} unchanged, {} hashed, \
-                 {} images decoded, {} skipped",
+                 {} decoded, {} skipped",
                 opt.library.display(),
                 HumanDuration(now.elapsed()),
                 s.added,
@@ -281,21 +288,22 @@ fn scan(opt: ScanOpt, now: Instant) {
                 s.removed,
                 s.unchanged,
                 s.hashed,
-                s.images_hashed,
+                s.media_hashed,
                 s.skipped
             );
-            if s.images_undecodable > 0 {
+            if s.media_undecodable > 0 {
                 println!(
-                    "{} images could not be decoded; they are left out of similarity matching \
+                    "{} files could not be decoded; they are left out of similarity matching \
                      until they or the decoders change.",
-                    s.images_undecodable
+                    s.media_undecodable
                 );
             }
-            if s.images_without_decoder > 0 {
+            if s.media_without_decoder > 0 {
                 println!(
-                    "{} images have no decoder (RAW, or HEIC/AVIF without ffmpeg 7.1 or later on \
-                     PATH); they are left out of same-pixel and similarity matching.",
-                    s.images_without_decoder
+                    "{} files have no decoder (RAW; HEIC/AVIF without ffmpeg 7.1 or later; video \
+                     without ffmpeg and ffprobe; audio without fpcalc on PATH); they are left \
+                     out of same-pixel and similarity matching.",
+                    s.media_without_decoder
                 );
             }
             println!("Catalog: {}", catalog.display());
@@ -319,7 +327,10 @@ fn serve(opt: ServeOpt) {
         libraries,
         cache_dir,
         port: opt.port,
-        similar: opt.similar.then_some(opt.threshold),
+        similarity: Similarity {
+            threshold: opt.threshold,
+            images: opt.similar,
+        },
     };
     let ready = |url: &str| {
         println!("Serving the catalog at {}", url);

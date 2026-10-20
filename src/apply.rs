@@ -1051,7 +1051,8 @@ mod tests {
         }
         let root = root.canonicalize().unwrap();
         let catalog_path = dir.path().join("catalog.sqlite");
-        crate::scan::scan(&root, &catalog_path, true).unwrap();
+        crate::scan::scan_with(&root, &catalog_path, true, &crate::decode::Tools::default())
+            .unwrap();
         Fixture {
             dir,
             root,
@@ -1223,7 +1224,8 @@ mod tests {
             ("b/copy of photo.xmp", b"sidecar"),
         ]);
         let catalog = Catalog::open(&f.catalog_path).unwrap();
-        let report = crate::dupes::find_dupes(&catalog, &[], None).unwrap();
+        let report =
+            crate::dupes::find_dupes(&catalog, &[], crate::dupes::Similarity::default()).unwrap();
         assert_eq!(report.groups.len(), 1);
         let quarantine = f.dir.path().join("quarantine");
         let now = datetime!(2026-10-20 12:00 UTC);
@@ -1351,7 +1353,8 @@ mod tests {
             ("a/IMG_1.xmp", b"edits of the kept copy"),
         ]);
         let catalog = Catalog::open(&f.catalog_path).unwrap();
-        let report = crate::dupes::find_dupes(&catalog, &[], None).unwrap();
+        let report =
+            crate::dupes::find_dupes(&catalog, &[], crate::dupes::Similarity::default()).unwrap();
         let quarantine = f.dir.path().join("quarantine");
         let now = datetime!(2026-10-20 12:00 UTC);
         let (plan, notes) =

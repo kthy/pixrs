@@ -51,11 +51,12 @@ Decided details:
   count as missing (broken metadata, e.g. QuickTime's 1904 epoch); `--trust-dates` turns that
   check off, for scans of old photos named with their real date.
 - Duplicates: report only by default. A flag enables quarantine, which keeps the oldest file and
-  moves the others to a quarantine folder. "Oldest" means earliest mtime, with path order as
-  the tie-breaker. Exception: in groups of similar images the largest image is kept (most
-  pixels, then most bytes, then oldest), since similar copies are often scaled down.
-  Quarantine only acts on `exact` and `same-pixels` groups, never on `similar` ones (mostly
-  burst shots, see "Image hashes").
+  moves the others to a quarantine folder. "Oldest" means earliest mtime, with path order as the
+  tie-breaker. Exception: in `similar` groups the largest file is kept (most pixels, then most
+  bytes, then oldest), since similar copies are often scaled down; then the oldest of its exact and
+  same-pixel copies replaces it (a copy with rewritten metadata can be larger). Quarantine only
+  moves files that match their keeper `exact` or `same-pixels`, never `similar` ones (similar
+  images are mostly burst shots, see "Image hashes"); exact copies in a `similar` group still move.
 - Organize commands: `pixrs organize` and `pixrs dupes --quarantine <DIR>` only write a plan
   file (and print a summary); `pixrs apply <PLAN>` carries out either kind of plan and
   `pixrs undo <JOURNAL>` reverses it. An interrupted `apply` is not resumed: undo it and plan
@@ -84,7 +85,7 @@ Decided details:
   its target is free and then renames, and OS renames replace, so a file another program creates at
   exactly that name in the microseconds between would be overwritten. Closing it needs OS-specific
   no-replace renames; the owner decided not to (#44).
-- Media probing: call the `ffmpeg`/`ffprobe` binaries if they are on `PATH`, and degrade
+- Media probing: call the `ffmpeg`/`ffprobe`/`fpcalc` binaries if they are on `PATH`, and degrade
   gracefully if not. Do not link against libav: it complicates the build on Windows and its GPL
   licensing does not sit well with linking into this AGPL program.
 - Metadata: `nom-exif` (covers JPEG, HEIC and MP4/MOV).
@@ -116,12 +117,37 @@ Decided details:
   `ffmpeg` 7.1 or later when available (older versions may decode one tile of a phone's HEIC
   grid); RAW is skipped with a note. `ffmpeg` applies the file's rotation itself, so for HEIC
   and AVIF the pixel hash is of the upright image.
-- Hash versions: each image stores the version it was hashed with: the hash definitions, the
-  `image` and `image_hasher` crates and its format's decoder crate (major.minor, from
-  `Cargo.lock` via `build.rs`), plus `ffmpeg -version` for HEIC/AVIF. A scan rehashes images
-  whose version differs, since another decoder can produce slightly different pixels. Read
-  errors and timeouts are not recorded, so those images are tried again; only files the
-  decoder rejects are recorded as undecodable.
+- Video and audio similarity: a video's signature is 9 frames at 5%, 15%, ... 85% of its duration
+  (`ffmpeg -ss`, duration from `ffprobe`), each with the image perceptual hash; frames shift with
+  re-encoding when keyframes are used, fixed fractions do not. The fractions are of the video
+  stream's own duration and start, not the container's (phones record a little more audio than
+  video, and a copy without audio would otherwise be sampled at other moments). Matroska keeps the
+  stream duration only in a `DURATION` tag. `-ss` counts from the container's start, so the
+  stream's start is taken relative to it (MTS files start far from 0). Videos are similar when
+  durations are within 1 s or 1%, aspect ratios within 3%, and at least 7 of 9 frame pairs have
+  hashes within `--threshold` (frames without detail do not count; at least 5 must have a hash).
+  Frames are compared by hash alone, not also by fingerprint: re-encoders convert variable frame
+  rates to constant ones, which moves frames by milliseconds. Calibrated on 38 of the owner's
+  videos (each re-encoded three ways): 35 to 36 of 38 copies matched, and none of the 703 pairs of
+  different videos. Audio uses Chromaprint via the `fpcalc` binary (never linked), first 120 s:
+  similar when durations are within 2 s and the bit error rate at the best offset within 2 s is at
+  most 0.15 (re-encodes to MP3, AAC, Opus and MP2 measured 0.002 to 0.042; unrelated audio is
+  around 0.5). Clips under about 5 s give too short a fingerprint and never match (under about 3 s
+  `fpcalc` gives none; it is stored empty, not as undecodable). Fingerprints with fewer than 10%
+  distinct values (silence, hum, steady tones all look alike) are never compared. Both reuse the
+  `similar` tier (the media type tells them apart) and are always on, since calibration showed no
+  false matches; similar images stay behind `--similar` (burst shots), and so do videos under 4 s
+  (Live Photo clips shot moments apart were not in the calibration sample). `--threshold` applies
+  to images and video frames. Both are skipped with a note when `ffmpeg`/`ffprobe` or `fpcalc` are
+  not on `PATH`.
+- Hash versions: each file stores the version it was hashed with. Images: the hash
+  definitions, the `image` and `image_hasher` crates and its format's decoder crate (major.minor,
+  from `Cargo.lock` via `build.rs`), plus `ffmpeg -version` for HEIC/AVIF. Videos: the signature
+  and image hash definitions, the crates that hash frames and `ffmpeg`'s version. Audio: the
+  signature definitions and `fpcalc`'s version. A scan rehashes files whose version differs,
+  since another decoder can produce slightly different pixels. Read errors and timeouts are not
+  recorded, so those files are tried again; only files the decoder rejects are recorded as
+  undecodable. A video frame `ffmpeg` cannot decode counts as one without detail.
 
 ## Invariants
 
@@ -133,7 +159,7 @@ Decided details:
 - **Every move is journaled before it happens**, so `pixrs apply` can be undone.
 - **Cross-platform**: Windows, Linux and macOS. Use `Path`/`PathBuf` operations, not string
   slicing on `/`. Unicode file names must work; non-UTF-8 names must not crash the scan.
-- No runtime dependencies beyond the binary itself, except optional `ffmpeg`/`ffprobe`.
+- No runtime dependencies beyond the binary itself, except optional `ffmpeg`/`ffprobe`/`fpcalc`.
 
 ## Workflow
 

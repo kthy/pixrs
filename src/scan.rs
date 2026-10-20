@@ -5,10 +5,12 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::catalog::{library_path, Catalog, FileRecord, MediaMeta, Stamp};
-use crate::decode::{
-    ffmpeg_handles_heic, ffmpeg_version, find_tool, image_decoder, DecodeError, Decoder,
+use crate::avhash::{
+    audio_fingerprint, audio_version, video_signature, video_version, AudioFingerprint,
+    VideoSignature,
 };
+use crate::catalog::{library_path, Catalog, FileRecord, MediaMeta, Stamp};
+use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, Tools};
 use crate::error::Error;
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
@@ -49,14 +51,16 @@ pub struct ScanSummary {
     pub hashed: usize,
     /// Files or folders that could not be read, or whose names are not valid UTF-8.
     pub skipped: usize,
-    /// Images decoded for their pixel and perceptual hashes: new, changed, or hashed with other
-    /// decoder versions.
-    pub images_hashed: usize,
-    /// Images that failed to decode. They are not tried again until they or the decoders change.
-    pub images_undecodable: usize,
-    /// Images with no decoder and no hashes: RAW formats, or HEIC and AVIF without `ffmpeg` 7.1
-    /// or later on `PATH`. They are tried again on every scan.
-    pub images_without_decoder: usize,
+    /// Media files decoded for their hashes, signatures or fingerprints: new, changed, or made
+    /// with other decoder versions.
+    pub media_hashed: usize,
+    /// Media files that failed to decode. They are not tried again until they or the decoders
+    /// change.
+    pub media_undecodable: usize,
+    /// Media files with no decoder and no hashes: RAW formats, HEIC and AVIF without `ffmpeg`
+    /// 7.1 or later, video without `ffmpeg` and `ffprobe`, audio without `fpcalc`. They are tried
+    /// again on every scan.
+    pub media_without_decoder: usize,
 }
 
 /// A media file that is new or changed since the last scan.
@@ -74,12 +78,24 @@ struct Pending {
 /// reading only files that are new or changed since the last scan, and removes files that
 /// disappeared. The second hashes the files that could be exact duplicates: those whose size
 /// matches another cataloged file, in any library. Files with a unique size are never read in
-/// full by it. The third decodes images, in parallel, for their pixel and perceptual hashes and
-/// fingerprints: images that are new or changed, or were hashed with other decoder versions.
-/// Images the decoder rejected are not tried again until they or the decoders change.
+/// full by it. The third decodes media files, in parallel: images for their pixel and perceptual
+/// hashes and fingerprints, videos for their frame signatures (with `ffmpeg`), audio for its
+/// fingerprint (with `fpcalc`). Only files that are new or changed, or were hashed with other
+/// decoder versions, are decoded; files a decoder rejected are not tried again until they or
+/// the decoders change.
 ///
 /// The library itself is only read.
 pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSummary, Error> {
+    scan_with(library, catalog_path, quiet, &Tools::find())
+}
+
+/// `scan`, with the external tools given instead of looked up on `PATH`.
+pub fn scan_with(
+    library: &Path,
+    catalog_path: &Path,
+    quiet: bool,
+    tools: &Tools,
+) -> Result<ScanSummary, Error> {
     let root = library
         .canonicalize()
         .ok()
@@ -238,53 +254,57 @@ pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSumm
     pb.finish_and_clear();
     tx.commit()?;
 
-    // Pass 3: pixel and perceptual hashes of images that have none yet, or were hashed with
-    // other decoder versions.
-    let images = catalog.image_hash_versions(library_id)?;
-    let ffmpeg = if images
-        .iter()
-        .any(|(rel, _)| image_decoder(rel) == Some(Decoder::Ffmpeg))
-    {
-        find_tool("ffmpeg")
-    } else {
-        None
-    };
-    // An old `ffmpeg` may decode only part of a HEIC photo; better no hashes than wrong ones.
-    let ffmpeg = ffmpeg.and_then(|ffmpeg| {
-        let version = ffmpeg_version(&ffmpeg);
-        if ffmpeg_handles_heic(&version) {
-            Some((ffmpeg, version))
-        } else {
-            eprintln!(
-                "ffmpeg {} is older than 7.1 and may decode HEIC photos only in part, so HEIC \
-                 and AVIF images are not hashed.",
-                version
-            );
-            None
-        }
-    });
-    let mut to_decode: Vec<(String, String)> = vec![];
-    for (rel, stored) in images {
-        let current = match (image_decoder(&rel), &ffmpeg) {
-            (Some(Decoder::InProcess), _) => hash_version(&rel, ""),
-            (Some(Decoder::Ffmpeg), Some((_, version))) => hash_version(&rel, version),
-            _ => None,
+    // Pass 3: image hashes, video signatures and audio fingerprints of files that have none
+    // yet, or were made with other decoder versions.
+    let ffmpeg_version = tools.ffmpeg.as_ref().map(|(_, v)| v.as_str());
+    let heic_ok = ffmpeg_version.is_some_and(ffmpeg_handles_heic);
+    let mut warned_heic = false;
+    let mut to_decode: Vec<(String, MediaType, String)> = vec![];
+    for (rel, media_type, stored) in catalog.hash_versions(library_id)? {
+        let current = match media_type {
+            MediaType::Image => match (image_decoder(&rel), ffmpeg_version) {
+                (Some(Decoder::InProcess), _) => hash_version(&rel, ""),
+                (Some(Decoder::Ffmpeg), Some(version)) if heic_ok => hash_version(&rel, version),
+                (Some(Decoder::Ffmpeg), Some(version)) => {
+                    // An old `ffmpeg` may decode only part of a HEIC photo; better no hashes
+                    // than wrong ones.
+                    if !warned_heic {
+                        eprintln!(
+                            "ffmpeg {} is older than 7.1 and may decode HEIC photos only in \
+                             part, so HEIC and AVIF images are not hashed.",
+                            version
+                        );
+                        warned_heic = true;
+                    }
+                    None
+                }
+                _ => None,
+            },
+            MediaType::Video => match (ffmpeg_version, &tools.ffprobe) {
+                (Some(version), Some(_)) => Some(video_version(version)),
+                _ => None,
+            },
+            MediaType::Audio => tools.fpcalc.as_ref().map(|(_, v)| audio_version(v)),
         };
         match current {
-            Some(current) if stored.as_ref() != Some(&current) => to_decode.push((rel, current)),
+            Some(current) if stored.as_ref() != Some(&current) => {
+                to_decode.push((rel, media_type, current))
+            }
             Some(_) => {}
             // Hashes made earlier, e.g. with an `ffmpeg` that is gone now, are kept.
-            None if stored.is_none() => summary.images_without_decoder += 1,
+            None if stored.is_none() => summary.media_without_decoder += 1,
             None => {}
         }
     }
     let pb = progress_bar(to_decode.len() as u64, "Decoding", false, quiet);
     let mut tx = Some(catalog.transaction()?);
     let mut done = 0;
-    let paths: Vec<&str> = to_decode.iter().map(|(rel, _)| rel.as_str()).collect();
-    let ffmpeg = ffmpeg.as_ref().map(|(ffmpeg, _)| ffmpeg.as_path());
-    hash_images(&root, &paths, ffmpeg, |i, result| {
-        let (rel, version) = (paths[i], to_decode[i].1.as_str());
+    let files: Vec<(&str, MediaType)> = to_decode
+        .iter()
+        .map(|(rel, media_type, _)| (rel.as_str(), *media_type))
+        .collect();
+    hash_files(&root, &files, tools, |i, result| {
+        let ((rel, media_type), version) = (files[i], to_decode[i].2.as_str());
         if done > 0 && done % COMMIT_EVERY == 0 {
             tx.take().expect("a transaction is open").commit()?;
             tx = Some(catalog.transaction()?);
@@ -293,11 +313,18 @@ pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSumm
         pb.set_message(String::from(rel));
         pb.inc(1);
         match result {
-            Ok(Some(hashes)) => {
-                catalog.set_image_hashes(library_id, rel, version, Some(&hashes))?;
-                summary.images_hashed += 1;
+            Ok(Some(hashed)) => {
+                record_hashes(
+                    &catalog,
+                    library_id,
+                    rel,
+                    version,
+                    Some(&hashed),
+                    media_type,
+                )?;
+                summary.media_hashed += 1;
             }
-            Ok(None) => summary.images_without_decoder += 1,
+            Ok(None) => summary.media_without_decoder += 1,
             Err(e) => {
                 let path = library_path(&root, rel);
                 pb.suspend(|| eprintln!("Cannot decode {}: {}", path.display(), e));
@@ -314,8 +341,8 @@ pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSumm
                 if e.is_transient() || !path.is_file() {
                     summary.skipped += 1;
                 } else {
-                    catalog.set_image_hashes(library_id, rel, version, None)?;
-                    summary.images_undecodable += 1;
+                    record_hashes(&catalog, library_id, rel, version, None, media_type)?;
+                    summary.media_undecodable += 1;
                 }
             }
         }
@@ -328,19 +355,72 @@ pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSumm
     Ok(summary)
 }
 
-/// Hash the images at the relative paths `paths` below `root` on several threads, and pass each
-/// result with its index in `paths` to `record` on this thread, in the order they finish. Stops
-/// at the first error from `record`.
-fn hash_images(
+/// What the hash pass made of a file.
+enum Hashed {
+    Image(ImageHashes),
+    Video(VideoSignature),
+    Audio(AudioFingerprint),
+}
+
+/// Store a file's hashes, or that decoding it failed (`None`), with `version`.
+fn record_hashes(
+    catalog: &Catalog,
+    library_id: i64,
+    rel: &str,
+    version: &str,
+    hashed: Option<&Hashed>,
+    media_type: MediaType,
+) -> rusqlite::Result<()> {
+    match (hashed, media_type) {
+        (Some(Hashed::Image(h)), _) => catalog.set_image_hashes(library_id, rel, version, Some(h)),
+        (Some(Hashed::Video(s)), _) => {
+            catalog.set_video_signature(library_id, rel, version, Some(s))
+        }
+        (Some(Hashed::Audio(f)), _) => {
+            catalog.set_audio_fingerprint(library_id, rel, version, Some(f))
+        }
+        (None, MediaType::Image) => catalog.set_image_hashes(library_id, rel, version, None),
+        (None, MediaType::Video) => catalog.set_video_signature(library_id, rel, version, None),
+        (None, MediaType::Audio) => catalog.set_audio_fingerprint(library_id, rel, version, None),
+    }
+}
+
+/// Hash one file by its media type. `Ok(None)` if there is no tool for it.
+fn hash_media(
+    path: &Path,
+    rel: &str,
+    media_type: MediaType,
+    tools: &Tools,
+) -> Result<Option<Hashed>, DecodeError> {
+    let ffmpeg = tools.ffmpeg.as_ref().map(|(f, _)| f.as_path());
+    match media_type {
+        MediaType::Image => Ok(hash_image(path, rel, ffmpeg)?.map(Hashed::Image)),
+        MediaType::Video => match (ffmpeg, &tools.ffprobe) {
+            (Some(ffmpeg), Some(ffprobe)) => {
+                Ok(Some(Hashed::Video(video_signature(ffmpeg, ffprobe, path)?)))
+            }
+            _ => Ok(None),
+        },
+        MediaType::Audio => match &tools.fpcalc {
+            Some((fpcalc, _)) => Ok(Some(Hashed::Audio(audio_fingerprint(fpcalc, path)?))),
+            None => Ok(None),
+        },
+    }
+}
+
+/// Hash the files at the relative paths in `files` below `root` on several threads, and pass
+/// each result with its index in `files` to `record` on this thread, in the order they finish.
+/// Stops at the first error from `record`.
+fn hash_files(
     root: &Path,
-    paths: &[&str],
-    ffmpeg: Option<&Path>,
-    mut record: impl FnMut(usize, Result<Option<ImageHashes>, DecodeError>) -> Result<(), Error>,
+    files: &[(&str, MediaType)],
+    tools: &Tools,
+    mut record: impl FnMut(usize, Result<Option<Hashed>, DecodeError>) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let workers = available_parallelism()
         .map_or(1, |n| n.get())
         .min(MAX_DECODERS)
-        .min(paths.len().max(1));
+        .min(files.len().max(1));
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::sync_channel(workers * 2);
     thread::scope(|scope| {
@@ -349,15 +429,17 @@ fn hash_images(
             let next = &next;
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(rel) = paths.get(i) else {
+                let Some(&(rel, media_type)) = files.get(i) else {
                     break;
                 };
                 let path = library_path(root, rel);
                 // A decoder bug on one broken file should not end the scan.
-                let result = catch_unwind(AssertUnwindSafe(|| hash_image(&path, rel, ffmpeg)))
-                    .unwrap_or_else(|_| {
-                        Err(DecodeError::Invalid(String::from("the decoder crashed")))
-                    });
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    hash_media(&path, rel, media_type, tools)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(DecodeError::Invalid(String::from("the decoder crashed")))
+                });
                 if tx.send((i, result)).is_err() {
                     break;
                 }
@@ -572,7 +654,7 @@ mod tests {
         }
 
         fn scan(&self) -> ScanSummary {
-            scan(&self.lib(), &self.catalog(), true).unwrap()
+            scan_with(&self.lib(), &self.catalog(), true, &Tools::default()).unwrap()
         }
 
         fn files(&self) -> Vec<FileRecord> {
@@ -660,7 +742,9 @@ mod tests {
             ScanSummary {
                 added: 3,
                 hashed: 3,
-                images_undecodable: 1,
+                media_undecodable: 1,
+                // The video and the audio file, without ffmpeg and fpcalc.
+                media_without_decoder: 2,
                 ..Default::default()
             }
         );
@@ -689,7 +773,8 @@ mod tests {
         fx.write("clip.mp4", b"not an image");
 
         let first = fx.scan();
-        assert_eq!((first.images_hashed, first.images_without_decoder), (2, 1));
+        // The RAW file, and the video without ffmpeg.
+        assert_eq!((first.media_hashed, first.media_without_decoder), (2, 2));
         let lib = fx.lib().canonicalize().unwrap();
         let catalog = Catalog::open(&fx.catalog()).unwrap();
         let id = catalog.library_id(lib.to_str().unwrap()).unwrap();
@@ -701,26 +786,24 @@ mod tests {
 
         // Unchanged images are not decoded again; the RAW file is tried again.
         let second = fx.scan();
-        assert_eq!(
-            (second.images_hashed, second.images_without_decoder),
-            (0, 1)
-        );
+        assert_eq!((second.media_hashed, second.media_without_decoder), (0, 2));
         let catalog = Catalog::open(&fx.catalog()).unwrap();
         let unhashed: Vec<String> = catalog
-            .image_hash_versions(id)
+            .hash_versions(id)
             .unwrap()
             .into_iter()
-            .filter(|(_, version)| version.is_none())
-            .map(|(path, _)| path)
+            .filter(|(_, _, version)| version.is_none())
+            .map(|(path, _, _)| path)
             .collect();
-        assert_eq!(unhashed, ["raw.nef"]);
+        // Without tools, the video has no decoder either.
+        assert_eq!(unhashed, ["clip.mp4", "raw.nef"]);
 
         // An image hashed with other decoder versions is decoded again.
         catalog
             .set_image_hashes(id, "photo.jpg", "an older version", None)
             .unwrap();
         drop(catalog);
-        assert_eq!(fx.scan().images_hashed, 1);
+        assert_eq!(fx.scan().media_hashed, 1);
         let catalog = Catalog::open(&fx.catalog()).unwrap();
         assert_eq!(catalog.hashed_images(true).unwrap().len(), 2);
     }
@@ -748,7 +831,7 @@ mod tests {
                 added: 1,
                 unchanged: 1,
                 hashed: 2,
-                images_undecodable: 1,
+                media_undecodable: 1,
                 ..Default::default()
             }
         );
@@ -793,9 +876,9 @@ mod tests {
                 hashed: 0,
                 skipped: 0,
                 // The test files are not real JPEGs. Only the new and changed ones are tried.
-                images_hashed: 0,
-                images_undecodable: 2,
-                images_without_decoder: 0,
+                media_hashed: 0,
+                media_undecodable: 2,
+                media_without_decoder: 0,
             }
         );
         let after = fx.files();

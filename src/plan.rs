@@ -472,10 +472,11 @@ pub fn plan_organize(
     Ok((plan, notes))
 }
 
-/// Plan moving every copy but the keeper of each `exact` and `same-pixels` group to `dir`, as
+/// Plan moving every copy that has the same bytes or pixels as its group's keeper to `dir`, as
 /// `dir/<library name>/<path in the library>`. With `only` libraries, only copies in them move.
-/// Similar groups are left alone: they are mostly burst shots, not copies. Each move requires
-/// its group's kept copy to still be there, unchanged, when the plan is applied.
+/// Similar files are left alone: similar images are mostly burst shots, not copies, and a
+/// re-encoded video may be the better copy. Exact copies in a similar group still move. Each
+/// move requires its group's kept copy to still be there, unchanged, when the plan is applied.
 pub fn plan_quarantine(
     catalog: &Catalog,
     catalog_path: &Path,
@@ -510,7 +511,11 @@ pub fn plan_quarantine(
     let mut moves = vec![];
     let mut involved: Vec<i64> = vec![];
     for group in &report.groups {
-        if group.tier == Tier::Similar {
+        if group
+            .files
+            .iter()
+            .all(|f| f.matches == Some(Tier::Similar) || f.keep)
+        {
             continue;
         }
         let keeper = &group.files[0];
@@ -525,7 +530,11 @@ pub fn plan_quarantine(
             size: keeper.size,
             mtime_ns: keeper.mtime_ns,
         };
-        for file in group.files.iter().filter(|f| !f.keep) {
+        let copies = group
+            .files
+            .iter()
+            .filter(|f| matches!(f.matches, Some(Tier::Exact | Tier::SamePixels)));
+        for file in copies {
             if !only.is_empty() && !only.contains(&file.library_id) {
                 continue;
             }

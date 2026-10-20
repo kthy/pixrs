@@ -44,12 +44,14 @@ The catalog keeps one row per media file: path, size, modification time and, whe
 them, date taken, camera and dimensions. Only files that share their size with another cataloged
 file can be exact duplicates, so only those are hashed (SHA-256); files with a unique size are
 never read in full. Images are also decoded, in parallel, for a hash of their pixels and a
-perceptual hash, which find copies that are not byte-identical. JPEG, PNG, GIF, WebP, BMP and TIFF
-are decoded in-process; HEIC and AVIF need [FFmpeg][ffmpeg] 7.1 or later on `PATH`; RAW files are
-skipped.
-Rescanning only reads files that are new or whose size or modification time changed, and
-decodes images again only if an update changed the decoders. The library itself is never
-modified.
+perceptual hash, which find copies that are not byte-identical. JPEG, PNG, GIF, WebP, BMP and
+TIFF are decoded in-process; HEIC and AVIF need [FFmpeg][ffmpeg] 7.1 or later on `PATH`; RAW
+files are skipped. Videos get a signature of 9 frames, which needs `ffmpeg` and `ffprobe` on
+`PATH`, and audio a fingerprint from `fpcalc`, part of [Chromaprint][chromaprint] (on Debian
+and Ubuntu, `apt install libchromaprint-tools`), for finding re-encoded copies. Without these
+tools, those files are cataloged but not compared. Rescanning only reads files that are new or
+whose size or modification time changed, and decodes media again only if an update changed the
+decoders. The library itself is never modified.
 
 ### Report duplicates
 
@@ -76,19 +78,20 @@ Options:
           [default: text]
 
       --similar
-          Also find similar images (resized or recompressed copies). Expect
-          burst shots among them
+          Also find similar images (resized or recompressed copies) and videos
+          under 4 seconds. Expect burst shots among them. Longer similar videos
+          and similar audio are always found
 
       --threshold <THRESHOLD>
-          How many of the 64 perceptual hash bits two images may differ in to
-          count as similar (at most 16)
+          How many of the 64 perceptual hash bits two images or video frames may
+          differ in to count as similar (at most 16)
 
           [default: 6]
 
       --quarantine <DIR>
-          Plan moving all but the kept copy of each exact and same-pixels group
-          to this folder (similar groups are never quarantined). Nothing moves
-          until `pixrs apply`
+          Plan moving every exact and same-pixel copy of a kept file to this
+          folder (similar files are never quarantined). Nothing moves until
+          `pixrs apply`
 
   -h, --help
           Print help (see a summary with '-h')
@@ -99,20 +102,23 @@ Duplicates are found in any scanned library, in three tiers:
 - `exact`: the same size and SHA-256.
 - `same-pixels`: images whose decoded pixels are identical, for example after a photo manager
   rewrote their metadata.
-- `similar`, only with `--similar`: images with the same shape (aspect ratio) whose perceptual
-  hashes differ in at most `--threshold` of 64 bits and whose small grayscale fingerprints
-  match, for example resized or recompressed copies. Expect burst shots among them: photos
-  taken a moment apart can look alike even to the fingerprint check, so look at similar groups
-  before acting on them. Images with almost no detail, like black frames or blank scans, are
-  never similar.
+- `similar`: videos of the same length and shape whose frames at 9 points have perceptual hashes at
+  most `--threshold` of 64 bits apart, and audio of the same length whose Chromaprint fingerprints
+  match, for example re-encoded or resized copies. Audio shorter than about 5 seconds, silence and
+  steady tones are never similar. With `--similar`, also videos under 4 seconds (such as Live Photo
+  clips), and images with the same shape (aspect ratio) whose perceptual hashes are within
+  `--threshold` and whose small grayscale fingerprints match, for example resized or recompressed
+  copies. Expect burst shots among them: photos taken a moment apart can look alike even to the
+  fingerprint check, so look at similar groups before acting on them. Images with almost no detail,
+  like black frames or blank scans, are never similar.
 
-Files linked through other files form one group, which gets the weakest tier among them, and
-each file shows how it matches the kept one. In each group the file with the earliest
-modification time is marked `keep`; ties go to the first path in sort order. In `similar`
-groups the largest image is kept instead (most pixels, then most bytes), since similar copies
-are often scaled down. Naming libraries shows only groups with a file in them, but with all
-copies: for example, `pixrs dupes /mnt/old-disk` lists what on the old disk also exists
-elsewhere.
+Files linked through other files form one group, which gets the weakest tier among them, and each
+file shows how it matches the kept one. In each group the file with the earliest modification time
+is marked `keep`; ties go to the first path in sort order. In `similar` groups the largest file is
+kept instead (most pixels, then most bytes), since similar copies are often scaled down; if it has
+exact or same-pixel copies, the oldest of them is kept. Naming libraries shows only groups with a
+file in them, but with all copies: for example, `pixrs dupes /mnt/old-disk` lists what on the old
+disk also exists elsewhere.
 
 The report comes from the catalog as of each library's last scan, so rescan libraries that have
 changed. It never touches the library.
@@ -132,10 +138,12 @@ Options:
       --cache <CACHE>          The thumbnail cache folder [default: thumbnails
                                in the OS cache directory]
       --similar                Also find similar images (resized or recompressed
-                               copies). Expect burst shots among them
+                               copies) and videos under 4 seconds. Expect burst
+                               shots among them. Longer similar videos and
+                               similar audio are always found
       --threshold <THRESHOLD>  How many of the 64 perceptual hash bits two
-                               images may differ in to count as similar (at most
-                               16) [default: 6]
+                               images or video frames may differ in to count as
+                               similar (at most 16) [default: 6]
       --port <PORT>            The port to listen on, on localhost only
                                [default: 2635]
   -o, --open                   Open the viewer in the default browser
@@ -211,10 +219,10 @@ catalog; `pixrs apply` carries it out.
 
 ### Quarantine duplicates
 
-`pixrs dupes --quarantine <DIR>` plans moving every copy but the kept one of each `exact` and
-`same-pixels` group to `<DIR>/<library name>/<path in the library>`, keeping the folder
-structure. Similar groups are never quarantined. The folder must be outside every scanned
-library. Like `organize`, it only writes a plan.
+`pixrs dupes --quarantine <DIR>` plans moving every copy with the same bytes or pixels as its
+group's kept file to `<DIR>/<library name>/<path in the library>`, keeping the folder
+structure. Similar files are never quarantined, but exact copies in a `similar` group are. The
+folder must be outside every scanned library. Like `organize`, it only writes a plan.
 
 ### Apply and undo a plan
 
@@ -267,6 +275,7 @@ and run `git lfs pull` to fetch the real files.
 [badge-audit-svg]: https://github.com/kthy/pixrs/actions/workflows/audit.yml/badge.svg
 [badge-ci-href]: https://github.com/kthy/pixrs/actions/workflows/ci.yml
 [badge-ci-svg]: https://github.com/kthy/pixrs/actions/workflows/ci.yml/badge.svg
+[chromaprint]: https://acoustid.org/chromaprint
 [ffmpeg]: https://ffmpeg.org/
 [git-lfs]: https://git-lfs.com/
 [rustup]: https://rustup.rs/
