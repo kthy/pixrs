@@ -55,7 +55,7 @@ CREATE INDEX files_sha256 ON files (sha256);
 ";
 
 /// What a scan compares to decide whether a file changed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Stamp {
     pub size: u64,
     /// Modification time in nanoseconds since the Unix epoch.
@@ -63,7 +63,7 @@ pub struct Stamp {
 }
 
 /// Metadata read from inside a media file. Every field is optional.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MediaMeta {
     /// When the photo or video was taken: RFC 3339 if the file records a timezone,
     /// otherwise `YYYY-MM-DDTHH:MM:SS` in the camera's local time.
@@ -74,8 +74,20 @@ pub struct MediaMeta {
     pub height: Option<u32>,
 }
 
+impl MediaMeta {
+    /// Camera make and model, without the make twice when the model starts with it.
+    pub fn camera(&self) -> Option<String> {
+        match (&self.camera_make, &self.camera_model) {
+            (Some(make), Some(model)) if model.starts_with(make.as_str()) => Some(model.clone()),
+            (Some(make), Some(model)) => Some(format!("{} {}", make, model)),
+            (Some(one), None) | (None, Some(one)) => Some(one.clone()),
+            (None, None) => None,
+        }
+    }
+}
+
 /// One media file in the catalog.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileRecord {
     /// Path relative to the library root, with `/` as separator on every platform.
     pub path: String,
@@ -454,6 +466,105 @@ impl Catalog {
             .pragma_query_value(None, "data_version", |row| row.get(0))
     }
 
+    /// Whether the catalog has a row for the file.
+    pub fn has_row(&self, library_id: i64, path: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM files WHERE library_id = ?1 AND path = ?2",
+                params![library_id, path],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+    }
+
+    /// Move a file's row to a new path, possibly in another library, if there is a row at the
+    /// old path. A row at the new path is dropped first with `replace` (when the file there is
+    /// known to be gone); without it, the row stays where it is. Returns whether it moved.
+    pub fn rename_row(
+        &self,
+        library_id: i64,
+        path: &str,
+        new_library_id: i64,
+        new_path: &str,
+        replace: bool,
+    ) -> rusqlite::Result<bool> {
+        if (library_id, path) == (new_library_id, new_path) {
+            return Ok(false);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        if !self.has_row(library_id, path)? {
+            return Ok(false);
+        }
+        if self.has_row(new_library_id, new_path)? {
+            if !replace {
+                return Ok(false);
+            }
+            self.remove(new_library_id, new_path)?;
+        }
+        self.conn.execute(
+            "UPDATE files SET library_id = ?3, path = ?4 WHERE library_id = ?1 AND path = ?2",
+            params![library_id, path, new_library_id, new_path],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Remove a file's row and return everything in it, so `put_row` can restore it.
+    pub fn take_row(&self, library_id: i64, path: &str) -> rusqlite::Result<Option<CatalogRow>> {
+        let row = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {}, image_hash_version, pixel_hash, phash, fingerprint
+                     FROM files WHERE library_id = ?1 AND path = ?2",
+                    FILE_COLUMNS
+                ),
+                params![library_id, path],
+                |row| {
+                    Ok(CatalogRow {
+                        library_id,
+                        file: file_record(row)?,
+                        image_hash_version: row.get(10)?,
+                        pixel_hash: row.get(11)?,
+                        phash: row.get(12)?,
+                        fingerprint: row
+                            .get::<_, Option<Vec<u8>>>(13)?
+                            .map(|f| data_encoding::HEXLOWER.encode(&f)),
+                    })
+                },
+            )
+            .optional()?;
+        if row.is_some() {
+            self.remove(library_id, path)?;
+        }
+        Ok(row)
+    }
+
+    /// Put back a row from `take_row`, replacing any row at its path.
+    pub fn put_row(&self, row: &CatalogRow) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.upsert(row.library_id, &row.file)?;
+        let fingerprint = row
+            .fingerprint
+            .as_deref()
+            .and_then(|hex| data_encoding::HEXLOWER.decode(hex.as_bytes()).ok());
+        self.conn.execute(
+            "UPDATE files SET image_hash_version = ?3, pixel_hash = ?4, phash = ?5,
+                              fingerprint = ?6
+             WHERE library_id = ?1 AND path = ?2",
+            params![
+                row.library_id,
+                row.file.path,
+                row.image_hash_version,
+                row.pixel_hash,
+                row.phash,
+                fingerprint,
+            ],
+        )?;
+        tx.commit()
+    }
+
     /// Every library with its file count, ordered by root.
     pub fn libraries(&self) -> rusqlite::Result<Vec<Library>> {
         let mut stmt = self.conn.prepare(
@@ -688,6 +799,18 @@ pub struct HashedImage {
     pub height: u32,
     /// `None` when `phash` is.
     pub fingerprint: Option<Vec<u8>>,
+}
+
+/// Everything in a file's catalog row, kept in a journal while the file is outside its library.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CatalogRow {
+    pub library_id: i64,
+    pub file: FileRecord,
+    pub image_hash_version: Option<String>,
+    pub pixel_hash: Option<String>,
+    pub phash: Option<i64>,
+    /// As lowercase hex.
+    pub fingerprint: Option<String>,
 }
 
 /// A library ID and a path in that library.

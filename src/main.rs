@@ -23,14 +23,23 @@ use clap::{CommandFactory, Parser};
 use indicatif::HumanDuration;
 use log::{debug, error};
 use pixrs::catalog::Catalog;
-use pixrs::dupes::{find_dupes, write_csv, write_json, write_text};
+use pixrs::dupes::{find_dupes, plural, write_csv, write_json, write_text, DupeReport, Tier};
+use pixrs::error::Error;
+use pixrs::plan::{
+    outside_libraries, plan_organize, plan_quarantine, read_plan, write_plan, write_summary,
+    OrganizeOptions,
+};
 use pixrs::serve::{default_cache_dir, Config};
 use pixrs::statics::LICENSE;
-use pixrs::structs::{Cli, Command, DupesOpt, Format, ScanOpt, ServeOpt};
+use pixrs::structs::{
+    ApplyOpt, Cli, Command, DupesOpt, Format, OrganizeOpt, ScanOpt, ServeOpt, UndoOpt,
+};
+use pixrs::template::Template;
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::Instant;
+use time::OffsetDateTime;
 
 /// This is where the magic happens.
 fn main() {
@@ -52,7 +61,10 @@ fn main() {
     }
 
     match cli.command {
+        Some(Command::Apply(opt)) => apply(opt),
         Some(Command::Dupes(opt)) => dupes(opt),
+        Some(Command::Organize(opt)) => organize(opt),
+        Some(Command::Undo(opt)) => undo(opt),
         Some(Command::Scan(opt)) => scan(opt, now),
         Some(Command::Serve(opt)) => serve(opt),
         None => {
@@ -115,6 +127,10 @@ fn dupes(opt: DupesOpt) {
         Ok(report) => report,
         Err(e) => fail("Dupes failed", e.into()),
     };
+    if let Some(dir) = &opt.quarantine {
+        quarantine(&catalog, &catalog_path, &report, &libraries, dir);
+        return;
+    }
 
     let mut out = BufWriter::new(io::stdout().lock());
     let written = match opt.format {
@@ -135,6 +151,119 @@ fn dupes(opt: DupesOpt) {
             unhashed
         );
     }
+}
+
+/// Plan moving all but the kept copy of each exact and same-pixels group to `dir`; with
+/// library arguments, only copies in those libraries.
+fn quarantine(
+    catalog: &Catalog,
+    catalog_path: &Path,
+    report: &DupeReport,
+    libraries: &[i64],
+    dir: &Path,
+) {
+    let context = "Quarantine failed";
+    let dir = outside_libraries(catalog, dir, "The quarantine folder")
+        .unwrap_or_else(|e| fail(context, e));
+    let now = OffsetDateTime::now_utc();
+    let (plan, notes) = plan_quarantine(catalog, catalog_path, report, libraries, &dir, now)
+        .unwrap_or_else(|e| fail(context, e));
+    let path = write_plan(&plan, now).unwrap_or_else(|e| fail(context, e));
+    let similar = report
+        .groups
+        .iter()
+        .filter(|g| g.tier == Tier::Similar)
+        .count();
+    if similar > 0 {
+        println!(
+            "{} similar groups are left alone: similar images are never quarantined.",
+            similar
+        );
+    }
+    write_summary(&plan, &notes, &path, &mut io::stdout().lock())
+        .unwrap_or_else(|e| fail(context, e.into()));
+}
+
+/// Plan how to organize a library and print the plan.
+fn organize(opt: OrganizeOpt) {
+    let context = "Organize failed";
+    let catalog_path = catalog_path(opt.catalog);
+    let catalog = Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail(context, e));
+    let library_id = library_ids(&catalog, std::slice::from_ref(&opt.library), context)[0];
+    let root = opt
+        .library
+        .canonicalize()
+        .unwrap_or_else(|e| fail(context, e.into()));
+    let template = match (&opt.template, &opt.layout) {
+        (Some(template), _) => Template::parse(template),
+        (None, Some(layout)) => Template::from_layout(layout),
+        (None, None) => unreachable!("clap requires --template or --layout"),
+    }
+    .unwrap_or_else(|e| fail(context, Error::Usage(e)));
+    let to = opt
+        .to
+        .as_deref()
+        .map(|to| pixrs::scan::resolve(to).unwrap_or_else(|e| fail(context, e.into())));
+    let now = OffsetDateTime::now_utc();
+    let opts = OrganizeOptions {
+        template: &template,
+        undated: &opt.undated,
+        suffix: &opt.suffix,
+        trust_dates: opt.trust_dates,
+        to,
+        prune_empty: opt.prune_empty,
+        now,
+    };
+    let (plan, notes) = plan_organize(&catalog, &catalog_path, library_id, &root, &opts)
+        .unwrap_or_else(|e| fail(context, e));
+    let path = write_plan(&plan, now).unwrap_or_else(|e| fail(context, e));
+    write_summary(&plan, &notes, &path, &mut io::stdout().lock())
+        .unwrap_or_else(|e| fail(context, e.into()));
+}
+
+/// Carry out a plan file.
+fn apply(opt: ApplyOpt) {
+    let context = "Apply failed";
+    let plan = read_plan(&opt.plan).unwrap_or_else(|e| fail(context, e));
+    let summary = pixrs::apply::apply(&opt.plan, &plan).unwrap_or_else(|e| {
+        if let Some(journal) = &e.journal {
+            eprintln!(
+                "Stopped before the plan was done. To reverse what was done, run:\n  pixrs \
+                 undo \"{}\"",
+                journal.display()
+            );
+        }
+        fail(context, e.error)
+    });
+    for (file, reason) in &summary.skipped {
+        println!("Skipped {}: {}", file, reason);
+    }
+    println!(
+        "Moved {} {}, skipped {}, removed {} empty {}.",
+        summary.moved,
+        plural(summary.moved, "file", "files"),
+        summary.skipped.len(),
+        summary.folders_removed,
+        plural(summary.folders_removed, "folder", "folders")
+    );
+    println!(
+        "Journal: {}\nTo reverse it, run:\n  pixrs undo \"{}\"",
+        summary.journal.display(),
+        summary.journal.display()
+    );
+}
+
+/// Reverse an applied plan from its journal.
+fn undo(opt: UndoOpt) {
+    let summary = pixrs::apply::undo(&opt.journal).unwrap_or_else(|e| fail("Undo failed", e));
+    for warning in &summary.warnings {
+        println!("Warning: {}", warning);
+    }
+    println!(
+        "Moved {} {} back.",
+        summary.moved_back,
+        plural(summary.moved_back, "file", "files")
+    );
 }
 
 /// Scan a media library into the catalog and print a summary.

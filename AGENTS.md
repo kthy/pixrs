@@ -45,11 +45,45 @@ Decided details:
   (default `_{n}`).
 - Date source: EXIF date taken. Fallback: a date parsed from the file name. If there is none,
   keep the original file name (e.g. `DSC0047.jpg`) and put it in a configurable `undated`
-  folder in place of the date folders, e.g. `video/undated/DSC0047.mp4`.
+  folder in place of the date folders, e.g. `video/undated/DSC0047.mp4`. A date without a time
+  (e.g. WhatsApp `IMG-20190501-WA0001`) fills the date folders, and the file keeps its original
+  name when the template needs a time. Dates before 1980 or more than a day in the future
+  count as missing (broken metadata, e.g. QuickTime's 1904 epoch); `--trust-dates` turns that
+  check off, for scans of old photos named with their real date.
 - Duplicates: report only by default. A flag enables quarantine, which keeps the oldest file and
   moves the others to a quarantine folder. "Oldest" means earliest mtime, with path order as
   the tie-breaker. Exception: in groups of similar images the largest image is kept (most
   pixels, then most bytes, then oldest), since similar copies are often scaled down.
+  Quarantine only acts on `exact` and `same-pixels` groups, never on `similar` ones (mostly
+  burst shots, see "Image hashes").
+- Organize commands: `pixrs organize` and `pixrs dupes --quarantine <DIR>` only write a plan
+  file (and print a summary); `pixrs apply <PLAN>` carries out either kind of plan and
+  `pixrs undo <JOURNAL>` reverses it. An interrupted `apply` is not resumed: undo it and plan
+  again. Plans and journals live next to the catalog (`plans/`, `journals/`).
+- Organize details: moves never overwrite (collisions get the suffix; compared case-insensitively
+  on every OS, so plans are the same everywhere; a rename that only changes letter case is refused
+  if another file has exactly the new name). Target folders that differ from an existing folder
+  only in letter case are that folder, so folder case is never changed. Token values are sanitized
+  to names valid on Windows. Sidecar files (`.xmp`, `.aae`, `.thm`, `.srt`, Google Takeout `.json`)
+  with the same base name in the same folder move and are renamed with their media file, unless
+  another media file with that base name stays in the folder. Folders left empty stay unless
+  `--prune-empty` is given. Each move checks that the file still matches the plan (size, mtime) and
+  that the target is free, else skips it; a move that fails before anything changed is skipped too,
+  and a folder that cannot be read counts as taken, and only a half-done move stops `apply`. `undo`
+  ignores skipped moves, only removes a file at a target if it is a copy pixrs journaled and
+  verified, and only moves catalog rows that still point at the target. Temporary files are
+  journaled with their kind: a stop on the way of a case-only rename is the file itself and is only
+  ever put back (next to its old place if that is taken); a copy is only removed while its source
+  still holds every byte of it, otherwise it is kept as `name.pixrs-recovered.ext`. A source must
+  still match the plan right before it is removed after a cross-filesystem copy. Cross-filesystem
+  moves copy to a temporary name, verify the SHA-256, keep the mtime, rename, then remove the
+  source. The catalog is updated as files move. The quarantine folder must be outside every
+  cataloged library and contain none; files go to `<DIR>/<library name>/<path in library>`. With
+  library arguments, only copies in those libraries are quarantined, and each move requires the
+  group's kept copy to still be there unchanged at `apply`. Accepted risk: each move checks that
+  its target is free and then renames, and OS renames replace, so a file another program creates at
+  exactly that name in the microseconds between would be overwritten. Closing it needs OS-specific
+  no-replace renames; the owner decided not to (#44).
 - Media probing: call the `ffmpeg`/`ffprobe` binaries if they are on `PATH`, and degrade
   gracefully if not. Do not link against libav: it complicates the build on Windows and its GPL
   licensing does not sit well with linking into this AGPL program.
@@ -91,11 +125,12 @@ Decided details:
 
 ## Invariants
 
-- **The library is read-only** except during `organize --apply`. Nothing else may write,
-  rename, delete or touch timestamps in the library. (Access times updated by the OS when files
-  are read are unavoidable and accepted.) The catalog, thumbnails and reports live outside it.
+- **The library is read-only** except during `pixrs apply` and `pixrs undo`. Nothing else may
+  write, rename, delete or touch timestamps in the library. (Access times updated by the OS
+  when files are read are unavoidable and accepted.) The catalog, thumbnails, plans, journals
+  and reports live outside it.
 - **Never delete user files.** Quarantine moves files; it does not delete them.
-- **Every move is journaled before it happens**, so `--apply` can be undone.
+- **Every move is journaled before it happens**, so `pixrs apply` can be undone.
 - **Cross-platform**: Windows, Linux and macOS. Use `Path`/`PathBuf` operations, not string
   slicing on `/`. Unicode file names must work; non-UTF-8 names must not crash the scan.
 - No runtime dependencies beyond the binary itself, except optional `ffmpeg`/`ffprobe`.

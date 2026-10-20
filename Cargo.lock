@@ -1201,6 +1201,7 @@ dependencies = [
  "pretty_assertions",
  "ring",
  "rusqlite",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",

@@ -624,16 +624,6 @@ pub async fn dupes(
     }))
 }
 
-/// Camera make and model, without the make twice when the model starts with it.
-fn camera(file: &FileRecord) -> Option<String> {
-    match (&file.meta.camera_make, &file.meta.camera_model) {
-        (Some(make), Some(model)) if model.starts_with(make.as_str()) => Some(model.clone()),
-        (Some(make), Some(model)) => Some(format!("{} {}", make, model)),
-        (Some(one), None) | (None, Some(one)) => Some(one.clone()),
-        (None, None) => None,
-    }
-}
-
 /// `/view/{lib}/{*path}`: one file, full size, with its details and prev/next links.
 pub async fn view(
     State(state): State<Arc<AppState>>,
@@ -722,7 +712,7 @@ pub async fn view(
                 dt { @if file.meta.taken_at.is_some() { "Taken" } @else { "Modified" } }
                 dd { (date.replacen('T', " ", 1)) }
             }
-            @if let Some(camera) = camera(&file) { dt { "Camera" } dd { (camera) } }
+            @if let Some(camera) = file.meta.camera() { dt { "Camera" } dd { (camera) } }
             @if let (Some(w), Some(h)) = (file.meta.width, file.meta.height) {
                 dt { "Dimensions" } dd { (w) " x " (h) }
             }

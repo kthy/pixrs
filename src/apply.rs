@@ -1,0 +1,1454 @@
+//! Carrying out plans, with a journal of every step, and undoing them from the journal.
+
+/*************************************************************************************************
+ * Copyright © 2022-2026 Kristian Thy (<thy@42.dk>)                                              *
+ * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
+ *************************************************************************************************/
+
+use crate::catalog::{Catalog, CatalogRow};
+use crate::error::Error;
+use crate::plan::{state_dir, Keeper, Move, Plan};
+use ring::digest::{Context, SHA256};
+use same_file::is_same_file;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// One line of a journal. Every step is written, and flushed to disk, before it is taken.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+enum Record {
+    Start {
+        plan: String,
+        catalog: String,
+    },
+    /// A folder about to be created for a target.
+    Mkdir {
+        path: String,
+    },
+    /// A file about to be moved.
+    Intent {
+        index: usize,
+        from: String,
+        to: String,
+        size: u64,
+        mtime_ns: i64,
+        cataloged: Option<(i64, String)>,
+        cataloged_to: Option<(i64, String)>,
+    },
+    /// A temporary file pixrs created for a move, by `apply` or `undo`.
+    Via {
+        index: usize,
+        path: String,
+        kind: ViaKind,
+        /// For a copy, the file it is copied from.
+        source: Option<String>,
+    },
+    /// The catalog row of a file that left its library, so undo can put it back.
+    Row {
+        index: usize,
+        row: CatalogRow,
+    },
+    Done {
+        index: usize,
+    },
+    /// A file left where it was. Undo ignores its intent.
+    Skipped {
+        index: usize,
+        reason: String,
+    },
+    /// A folder about to be removed because the moves left it empty.
+    Rmdir {
+        path: String,
+    },
+    Finished,
+}
+
+/// What a temporary file is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ViaKind {
+    /// The file itself, stopped on its way during a rename that only changes letter case. It may
+    /// be the only copy: never removed.
+    Stop,
+    /// A copy being made across file systems. Redundant while its source exists.
+    Copy,
+}
+
+/// An open journal file.
+struct Journal {
+    file: File,
+}
+
+impl Journal {
+    fn write(&mut self, record: &Record) -> io::Result<()> {
+        let mut line = serde_json::to_vec(record)?;
+        line.push(b'\n');
+        self.file.write_all(&line)?;
+        self.file.sync_data()
+    }
+}
+
+/// The lock that keeps two `apply` or `undo` runs on one catalog apart. Removed when dropped.
+struct Lock(PathBuf);
+
+impl Lock {
+    fn take(catalog: &Path) -> Result<Lock, Error> {
+        let path = state_dir(catalog, "pixrs.lock");
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                Ok(Lock(path))
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Usage(format!(
+                "{} exists: another `pixrs apply` or `pixrs undo` is running on this catalog. \
+                 If none is (it crashed), delete the file and try again.",
+                path.display()
+            ))),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Test hooks for `apply`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ApplyOptions {
+    /// Stop as if interrupted after this many files were moved.
+    pub stop_after: Option<usize>,
+    /// Stop as if interrupted after the first move, before the catalog follows it.
+    pub stop_before_catalog: bool,
+    /// Copy instead of renaming, as across file systems.
+    pub force_copy: bool,
+    /// Stop as if interrupted halfway through the first copy.
+    pub stop_in_copy: bool,
+    /// Stop as if interrupted halfway through the first rename that only changes letter case.
+    pub stop_in_rename: bool,
+}
+
+/// What `apply` did.
+#[derive(Debug, Default)]
+pub struct ApplySummary {
+    pub moved: usize,
+    /// Files left where they were, and why.
+    pub skipped: Vec<(String, String)>,
+    pub folders_removed: usize,
+    pub journal: PathBuf,
+}
+
+/// What `undo` did.
+#[derive(Debug, Default)]
+pub struct UndoSummary {
+    pub moved_back: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Why a move did not happen.
+enum MoveError {
+    /// Something is at the target; nothing is ever overwritten.
+    Taken,
+    /// It failed before anything changed.
+    Failed(io::Error),
+    /// It failed halfway: the file may be at a temporary name, or in two places. Only undo
+    /// should touch it now.
+    Partial(io::Error),
+}
+
+/// Number for temporary file names, unique within the process.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A new, empty temporary file in `dir`, so the name is pixrs's alone.
+fn reserve_temp(dir: &Path) -> io::Result<PathBuf> {
+    loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!(
+            ".pixrs-{}-{}-{}.tmp",
+            std::process::id(),
+            nanos,
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+/// Whether `a` and `b` differ only in letter case, so they are the same file on Windows and
+/// macOS.
+fn case_only(a: &Path, b: &Path) -> bool {
+    a != b && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+}
+
+/// Whether `a` and `b` are the same file (one name in another letter case, or a hard link).
+fn same_file(a: &Path, b: &Path) -> bool {
+    is_same_file(a, b).unwrap_or(false)
+}
+
+/// Whether a file named exactly `path` (letter case included) is in its folder. An error
+/// reading the folder is passed on: callers must not take it as "not there".
+fn exactly_there(path: &Path) -> io::Result<bool> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(false);
+    };
+    for entry in fs::read_dir(dir)? {
+        if entry?.file_name() == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// How far a copy's mtime may be from the original's: file systems store mtimes with different
+/// precision, FAT and exFAT to 2 seconds.
+const MTIME_SLACK_NS: i64 = 2_000_000_000;
+
+/// Whether a file has `size` and (within `MTIME_SLACK_NS`) `mtime_ns`.
+fn matches(meta: &fs::Metadata, size: u64, mtime_ns: i64) -> bool {
+    meta.is_file()
+        && crate::scan::stamp(meta)
+            .is_ok_and(|s| s.size == size && (s.mtime_ns - mtime_ns).abs() <= MTIME_SLACK_NS)
+}
+
+/// Whether the file `part` is the start of (or all of) the file `whole`: a copy, stopped or
+/// finished, of `whole`.
+fn is_prefix_of(part: &Path, whole: &Path) -> io::Result<bool> {
+    let (mut a, mut b) = (File::open(part)?, File::open(whole)?);
+    if a.metadata()?.len() > b.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut x, mut y) = (vec![0; 64 * 1024], vec![0; 64 * 1024]);
+    loop {
+        let n = a.read(&mut x)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut y[..n])?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+/// A free name next to `path` to keep a file under that undo cannot put back:
+/// `name.pixrs-recovered.ext`, then `name.pixrs-recovered-2.ext` and so on.
+fn recovered_name(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{}", ext)),
+        _ => (name.to_string(), String::new()),
+    };
+    let mut n = 1;
+    loop {
+        let number = if n == 1 {
+            String::new()
+        } else {
+            format!("-{}", n)
+        };
+        let candidate = path.with_file_name(format!("{}.pixrs-recovered{}{}", stem, number, ext));
+        if !exists(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Remove a source file whose verified copy is in place. On Windows a read-only file cannot be
+/// removed, so that flag goes first.
+fn remove_source(path: &Path) -> io::Result<()> {
+    if cfg!(windows) {
+        let mut permissions = fs::metadata(path)?.permissions();
+        if permissions.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    fs::remove_file(path)
+}
+
+/// An mtime in nanoseconds since the epoch as a `SystemTime`.
+fn system_time(mtime_ns: i64) -> SystemTime {
+    let magnitude = Duration::from_nanos(mtime_ns.unsigned_abs());
+    if mtime_ns >= 0 {
+        UNIX_EPOCH + magnitude
+    } else {
+        UNIX_EPOCH - magnitude
+    }
+}
+
+/// SHA-256 of a file.
+fn sha256_of(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let mut context = Context::new(&SHA256);
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => context.update(&buffer[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(context.finish().as_ref().to_vec())
+}
+
+/// Flush a folder's entries to disk, so a rename in it survives a power cut. Windows has no
+/// such call for folders; its file systems journal metadata. Some network and FUSE file systems
+/// cannot do it either and say so; that is not an error.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    if !cfg!(unix) {
+        return Ok(());
+    }
+    match File::open(dir).and_then(|d| d.sync_all()) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Copy `from` into the reserved temporary file `via`, flushed to disk, with `from`'s mtime,
+/// check that the copy reads back the same, and return its SHA-256. Permissions are copied
+/// later, onto the file in its final place: a read-only temporary file could not be removed on
+/// Windows.
+fn copy_verified(from: &Path, via: &Path, mtime: i64, stop_in_copy: bool) -> io::Result<Vec<u8>> {
+    let mut source = File::open(from)?;
+    let mut copy = OpenOptions::new().write(true).truncate(true).open(via)?;
+    let mut context = Context::new(&SHA256);
+    let mut buffer = vec![0; 256 * 1024];
+    loop {
+        let n = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        context.update(&buffer[..n]);
+        copy.write_all(&buffer[..n])?;
+        if stop_in_copy {
+            return Err(io::Error::other("stopped in the middle of a copy"));
+        }
+    }
+    copy.sync_all()?;
+    copy.set_modified(system_time(mtime))?;
+    drop(copy);
+    let hash = context.finish().as_ref().to_vec();
+    if sha256_of(via)? != hash {
+        return Err(io::Error::other(format!(
+            "the copy {} does not match {}",
+            via.display(),
+            from.display()
+        )));
+    }
+    Ok(hash)
+}
+
+/// Move `from` (which has `size` and `mtime`) to `to`, never overwriting.
+///
+/// A rename that only changes letter case goes through a temporary name: refused if another
+/// file has exactly the new name, and undone if anything turns up at `to` once `from` is out of
+/// the way. Otherwise `to` must not exist in any letter case. Renames if it can; across file
+/// systems it copies to a temporary file in the target folder, checks the copy, renames it into
+/// place, flushes the folder, checks that `from` did not change meanwhile, and only then
+/// removes `from`. `note_via` is called with each temporary file before it is used.
+fn move_file(
+    from: &Path,
+    to: &Path,
+    size: u64,
+    mtime: i64,
+    opts: &ApplyOptions,
+    mut note_via: impl FnMut(&Path, ViaKind, Option<&Path>) -> io::Result<()>,
+) -> Result<(), MoveError> {
+    let dir = to.parent().unwrap_or(Path::new("."));
+    if case_only(from, to) {
+        if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
+            return Err(MoveError::Taken);
+        }
+        let via = reserve_temp(dir).map_err(MoveError::Failed)?;
+        if let Err(e) = note_via(&via, ViaKind::Stop, None).and_then(|()| fs::rename(from, &via)) {
+            let _ = fs::remove_file(&via);
+            return Err(MoveError::Failed(e));
+        }
+        if opts.stop_in_rename {
+            return Err(MoveError::Partial(io::Error::other("stopped in a rename")));
+        }
+        // `from` is out of the way now, so anything at `to` is another file. Go back if the old
+        // name is free; on Windows and macOS it is the same name as `to`, so the file waits at
+        // `via` for undo instead of replacing the newcomer.
+        if exists(to) {
+            if exists(from) {
+                return Err(MoveError::Partial(io::Error::other(format!(
+                    "{} turned up during the rename; the file waits at {}",
+                    to.display(),
+                    via.display()
+                ))));
+            }
+            return match fs::rename(&via, from) {
+                Ok(()) => Err(MoveError::Taken),
+                Err(e) => Err(MoveError::Partial(e)),
+            };
+        }
+        return fs::rename(&via, to).map_err(MoveError::Partial);
+    }
+    if exists(to) {
+        return Err(MoveError::Taken);
+    }
+    if !opts.force_copy {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {}
+            Err(e) => return Err(MoveError::Failed(e)),
+        }
+    }
+    let via = reserve_temp(dir).map_err(MoveError::Failed)?;
+    let copied = note_via(&via, ViaKind::Copy, Some(from))
+        .and_then(|()| copy_verified(from, &via, mtime, opts.stop_in_copy));
+    let hash = match copied {
+        Ok(hash) => hash,
+        Err(e) if opts.stop_in_copy => {
+            // As if the process died here: the partial copy stays for undo to clean up.
+            return Err(MoveError::Partial(e));
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&via);
+            return Err(MoveError::Failed(e));
+        }
+    };
+    if exists(to) {
+        let _ = fs::remove_file(&via);
+        return Err(MoveError::Taken);
+    }
+    if let Err(e) = fs::rename(&via, to) {
+        let _ = fs::remove_file(&via);
+        return Err(MoveError::Failed(e));
+    }
+    if let Ok(meta) = fs::metadata(from) {
+        let _ = fs::set_permissions(to, meta.permissions());
+    }
+    sync_dir(dir).map_err(MoveError::Partial)?;
+    // An edit to `from` while it was copied would be lost with it.
+    let unchanged = fs::symlink_metadata(from).is_ok_and(|m| matches(&m, size, mtime))
+        && sha256_of(from).is_ok_and(|h| h == hash);
+    if !unchanged {
+        return Err(MoveError::Partial(io::Error::other(format!(
+            "{} changed while it was copied; both are kept",
+            from.display()
+        ))));
+    }
+    remove_source(from).map_err(MoveError::Partial)
+}
+
+/// Why the file at `path` should not be moved, if it should not: gone, or not as expected.
+fn changed(path: &Path, size: u64, mtime_ns: i64) -> Option<String> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Some(String::from("it is no longer there"));
+    };
+    if !meta.is_file() {
+        return Some(String::from("it is not a file"));
+    }
+    let same = crate::scan::stamp(&meta).is_ok_and(|s| s.size == size && s.mtime_ns == mtime_ns);
+    (!same).then(|| String::from("it changed since the plan was made"))
+}
+
+/// Why a move should not happen now, if it should not.
+fn problem(m: &Move, done: &[bool]) -> Option<String> {
+    if let Some(media) = m.sidecar_of {
+        if !done[media] {
+            return Some(String::from("its media file was not moved"));
+        }
+    }
+    if let Some(Keeper {
+        path,
+        size,
+        mtime_ns,
+    }) = &m.keeper
+    {
+        if changed(Path::new(path), *size, *mtime_ns).is_some() {
+            return Some(format!("the kept copy {} is gone or changed", path));
+        }
+    }
+    changed(Path::new(&m.from), m.size, m.mtime_ns)
+}
+
+/// A new journal for a plan, next to the catalog.
+fn new_journal(plan_path: &Path, catalog: &Path) -> Result<(Journal, PathBuf), Error> {
+    let dir = state_dir(catalog, "journals");
+    fs::create_dir_all(&dir)?;
+    let stem = plan_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("plan"));
+    let mut path = dir.join(format!("{}.jsonl", stem));
+    let mut n = 2;
+    while exists(&path) {
+        path = dir.join(format!("{}-{}.jsonl", stem, n));
+        n += 1;
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    sync_dir(&dir)?;
+    Ok((Journal { file }, path))
+}
+
+/// Why `apply` stopped, and the journal to undo what it did, if it got that far.
+#[derive(Debug)]
+pub struct ApplyError {
+    pub error: Error,
+    pub journal: Option<PathBuf>,
+}
+
+/// Carry out the plan in `plan_path`.
+pub fn apply(plan_path: &Path, plan: &Plan) -> Result<ApplySummary, ApplyError> {
+    apply_with(plan_path, plan, &ApplyOptions::default())
+}
+
+/// `apply`, with test hooks.
+pub fn apply_with(
+    plan_path: &Path,
+    plan: &Plan,
+    opts: &ApplyOptions,
+) -> Result<ApplySummary, ApplyError> {
+    let mut journal = None;
+    apply_journaled(plan_path, plan, opts, &mut journal)
+        .map_err(|error| ApplyError { error, journal })
+}
+
+fn apply_journaled(
+    plan_path: &Path,
+    plan: &Plan,
+    opts: &ApplyOptions,
+    journal_out: &mut Option<PathBuf>,
+) -> Result<ApplySummary, Error> {
+    let catalog_path = Path::new(&plan.catalog);
+    let catalog = Catalog::open(catalog_path)?;
+    let _lock = Lock::take(catalog_path)?;
+    let (mut journal, journal_path) = new_journal(plan_path, catalog_path)?;
+    *journal_out = Some(journal_path.clone());
+    let mut summary = ApplySummary {
+        journal: journal_path,
+        ..ApplySummary::default()
+    };
+    journal.write(&Record::Start {
+        plan: plan_path.to_string_lossy().into_owned(),
+        catalog: plan.catalog.clone(),
+    })?;
+
+    let mut done = vec![false; plan.moves.len()];
+    for (index, m) in plan.moves.iter().enumerate() {
+        let (from, to) = (Path::new(&m.from), Path::new(&m.to));
+        let mut skip = |journal: &mut Journal, reason: String| -> Result<(), Error> {
+            journal.write(&Record::Skipped {
+                index,
+                reason: reason.clone(),
+            })?;
+            summary.skipped.push((m.from.clone(), reason));
+            Ok(())
+        };
+        if let Some(reason) = problem(m, &done) {
+            skip(&mut journal, reason)?;
+            continue;
+        }
+        if let Err(e) = create_folders(to.parent(), &mut journal) {
+            skip(&mut journal, format!("cannot create its folder: {}", e))?;
+            continue;
+        }
+        journal.write(&Record::Intent {
+            index,
+            from: m.from.clone(),
+            to: m.to.clone(),
+            size: m.size,
+            mtime_ns: m.mtime_ns,
+            cataloged: m.cataloged.clone(),
+            cataloged_to: m.cataloged_to.clone(),
+        })?;
+        let moved = move_file(from, to, m.size, m.mtime_ns, opts, |via, kind, source| {
+            journal.write(&Record::Via {
+                index,
+                path: via.to_string_lossy().into_owned(),
+                kind,
+                source: source.map(|s| s.to_string_lossy().into_owned()),
+            })
+        });
+        match moved {
+            Ok(()) => {}
+            Err(MoveError::Taken) => {
+                skip(&mut journal, format!("{} is taken", m.to))?;
+                continue;
+            }
+            Err(MoveError::Failed(e)) => {
+                skip(&mut journal, e.to_string())?;
+                continue;
+            }
+            Err(MoveError::Partial(e)) => return Err(e.into()),
+        }
+        journal.write(&Record::Done { index })?;
+        done[index] = true;
+        summary.moved += 1;
+        if opts.stop_before_catalog {
+            return Err(Error::Usage(String::from("stopped as asked")));
+        }
+        update_catalog(&catalog, &mut journal, index, m)?;
+        if opts.stop_after == Some(summary.moved) {
+            return Err(Error::Usage(String::from("stopped as asked")));
+        }
+    }
+
+    if plan.prune_empty {
+        let roots: Vec<PathBuf> = plan
+            .libraries
+            .iter()
+            .map(|l| PathBuf::from(&l.root))
+            .collect();
+        let emptied: BTreeSet<PathBuf> = plan
+            .moves
+            .iter()
+            .zip(&done)
+            .filter(|(_, &d)| d)
+            .filter_map(|(m, _)| Path::new(&m.from).parent().map(Path::to_path_buf))
+            .collect();
+        // Deepest first, so a folder's subfolders go before it.
+        for dir in emptied.iter().rev() {
+            let mut dir = dir.clone();
+            while roots.iter().any(|r| dir.starts_with(r) && dir != *r) && is_empty_dir(&dir) {
+                journal.write(&Record::Rmdir {
+                    path: dir.to_string_lossy().into_owned(),
+                })?;
+                fs::remove_dir(&dir)?;
+                summary.folders_removed += 1;
+                if !dir.pop() {
+                    break;
+                }
+            }
+        }
+    }
+    journal.write(&Record::Finished)?;
+    Ok(summary)
+}
+
+fn is_empty_dir(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+/// Create the missing folders of `dir`, outermost first, each journaled first.
+fn create_folders(dir: Option<&Path>, journal: &mut Journal) -> io::Result<()> {
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !exists(d)).collect();
+    for folder in missing.into_iter().rev() {
+        journal.write(&Record::Mkdir {
+            path: folder.to_string_lossy().into_owned(),
+        })?;
+        match fs::create_dir(folder) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        if let Some(parent) = folder.parent() {
+            sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// Bring the catalog in line with a move: the row follows the file, or is kept in the journal
+/// if the file left its library.
+fn update_catalog(
+    catalog: &Catalog,
+    journal: &mut Journal,
+    index: usize,
+    m: &Move,
+) -> Result<(), Error> {
+    let Some((library_id, path)) = &m.cataloged else {
+        return Ok(());
+    };
+    match &m.cataloged_to {
+        // A row at the target is stale: the file there was gone, or the move would not have
+        // happened.
+        Some((new_library_id, new_path)) => {
+            catalog.rename_row(*library_id, path, *new_library_id, new_path, true)?;
+        }
+        None => {
+            // The row is only gone once the journal has it.
+            let tx = catalog.transaction()?;
+            if let Some(row) = catalog.take_row(*library_id, path)? {
+                journal.write(&Record::Row { index, row })?;
+            }
+            tx.commit()?;
+        }
+    }
+    Ok(())
+}
+
+/// The records of a journal. A last line cut short by a crash is ignored.
+fn read_journal(path: &Path) -> Result<Vec<Record>, Error> {
+    let file = File::open(path)?;
+    let lines: Vec<String> = BufReader::new(file).lines().collect::<Result<_, _>>()?;
+    let mut records = vec![];
+    for (n, line) in lines.iter().enumerate() {
+        match serde_json::from_str(line) {
+            Ok(record) => records.push(record),
+            Err(_) if n + 1 == lines.len() => {}
+            Err(e) => {
+                return Err(Error::Usage(format!(
+                    "{} line {} is not a journal record: {}",
+                    path.display(),
+                    n + 1,
+                    e
+                )))
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Where a moved file is now.
+enum Found {
+    /// Only at its target: it can go back.
+    AtTarget,
+    /// Back at its old place (or never moved).
+    AtSource,
+    /// At both, as two files with the same contents: a verified copy that got into place
+    /// before the source was removed.
+    Copied,
+    /// Something else; leave it alone and say why.
+    Unclear(String),
+}
+
+/// Where the file of a journaled move is. Only a copy pixrs made itself (a temporary copy is
+/// journaled for the move, and the two names are different files with the same contents)
+/// counts as a copy that may be removed.
+fn locate(from: &Path, to: &Path, size: u64, mtime_ns: i64, had_copy: bool) -> io::Result<Found> {
+    let neither = || {
+        Found::Unclear(format!(
+            "{} is neither at {} nor back at its old place",
+            from.display(),
+            to.display()
+        ))
+    };
+    if case_only(from, to) {
+        // One file under two spellings on Windows and macOS: look at the exact names.
+        return Ok(match (exactly_there(to)?, exactly_there(from)?) {
+            (true, false) if fs::metadata(to).is_ok_and(|m| matches(&m, size, mtime_ns)) => {
+                Found::AtTarget
+            }
+            (true, false) => Found::Unclear(format!(
+                "{} is not the file that was moved there; left there",
+                to.display()
+            )),
+            // Two names for one file (Windows, macOS), or two different files (Linux).
+            (true, true) if same_file(from, to) => Found::AtSource,
+            (true, true) => Found::Unclear(format!(
+                "{} and {} both exist; left as they are",
+                from.display(),
+                to.display()
+            )),
+            (false, true) => Found::AtSource,
+            (false, false) => neither(),
+        });
+    }
+    let at_target = fs::symlink_metadata(to).ok();
+    let at_source = exists(from);
+    Ok(match (at_target, at_source) {
+        (None, true) => Found::AtSource,
+        (None, false) => neither(),
+        (Some(_), true) if same_file(from, to) => Found::AtSource,
+        (Some(meta), true) => {
+            if had_copy && meta.len() == size && sha256_of(to)? == sha256_of(from)? {
+                Found::Copied
+            } else {
+                Found::Unclear(format!(
+                    "{} and {} both exist; left as they are",
+                    from.display(),
+                    to.display()
+                ))
+            }
+        }
+        // Moves keep the mtime, so a file there with another one is not the moved file.
+        (Some(meta), false) if matches(&meta, size, mtime_ns) => Found::AtTarget,
+        (Some(_), false) => Found::Unclear(format!(
+            "{} is not the file that was moved there (it changed, or is another file); left \
+             there",
+            to.display()
+        )),
+    })
+}
+
+/// Deal with a temporary file left by an interrupted move of a file of `size` and `mtime`,
+/// without ever losing data.
+///
+/// An empty file is a reservation that was never used (unless the moved file is empty too) and
+/// goes. A stopped rename is the file itself: it goes back to `from` if it is the moved file
+/// and `from` is free. A copy is removed only if its source still has every byte of it.
+/// Anything else is kept next to the temporary file, as `name.pixrs-recovered.ext`.
+fn clean_up_via(via: &ViaFile, from: &Path, size: u64, mtime: i64, warnings: &mut Vec<String>) {
+    let Ok(meta) = fs::symlink_metadata(&via.path) else {
+        return;
+    };
+    let unused = meta.len() == 0 && size != 0;
+    let redundant = via.kind == ViaKind::Copy
+        && via
+            .source
+            .as_deref()
+            .is_some_and(|source| is_prefix_of(&via.path, source).unwrap_or(false));
+    let result = if unused || redundant {
+        fs::remove_file(&via.path)
+    } else if via.kind == ViaKind::Stop && matches(&meta, size, mtime) && !exists(from) {
+        fs::rename(&via.path, from)
+    } else {
+        // Next to the temporary file, so on its file system.
+        let keep = recovered_name(
+            &via.path
+                .with_file_name(from.file_name().unwrap_or_default()),
+        );
+        fs::rename(&via.path, &keep).map(|()| {
+            warnings.push(format!(
+                "Kept {} as {}: check it by hand",
+                via.path.display(),
+                keep.display()
+            ));
+        })
+    };
+    if let Err(e) = result {
+        warnings.push(format!("Cannot clean up {}: {}", via.path.display(), e));
+    }
+}
+
+/// Open a journal to add records after its last complete line. A line a crash cut short is cut
+/// off: its record was never complete, and nothing happens before its record is. A last record
+/// that is complete but lacks its newline (edited by hand) gets one instead.
+fn append_to(path: &Path) -> io::Result<Journal> {
+    let contents = fs::read(path)?;
+    let complete = contents
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    // Not opened for appending: Windows does not allow cutting a file opened that way.
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    if complete < contents.len() {
+        if serde_json::from_slice::<Record>(&contents[complete..]).is_ok() {
+            file.seek(io::SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+        } else {
+            file.set_len(complete as u64)?;
+        }
+        file.sync_data()?;
+    }
+    file.seek(io::SeekFrom::End(0))?;
+    Ok(Journal { file })
+}
+
+/// A temporary file and what it is, from a `Via` record.
+struct ViaFile {
+    path: PathBuf,
+    kind: ViaKind,
+    source: Option<PathBuf>,
+}
+
+/// Reverse everything the journal at `path` records, as far as it got. Safe to run again, also
+/// after a crash: it looks at where each file actually is, and journals its own steps.
+pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
+    let records = read_journal(path)?;
+    let Some(Record::Start { catalog, .. }) = records.first() else {
+        return Err(Error::Usage(format!(
+            "{} does not start like a pixrs journal",
+            path.display()
+        )));
+    };
+    let catalog_path = PathBuf::from(catalog);
+    let catalog = Catalog::open(&catalog_path)?;
+    let _lock = Lock::take(&catalog_path)?;
+    let mut journal = append_to(path)?;
+    let mut summary = UndoSummary::default();
+
+    let mut intents: Vec<&Record> = vec![];
+    let mut vias: HashMap<usize, Vec<ViaFile>> = HashMap::new();
+    let mut rows: HashMap<usize, &CatalogRow> = HashMap::new();
+    let mut skipped: HashSet<usize> = HashSet::new();
+    let mut created: Vec<PathBuf> = vec![];
+    let mut removed: Vec<PathBuf> = vec![];
+    for record in &records {
+        match record {
+            Record::Intent { .. } => intents.push(record),
+            Record::Via {
+                index,
+                path,
+                kind,
+                source,
+            } => {
+                vias.entry(*index).or_default().push(ViaFile {
+                    path: PathBuf::from(path),
+                    kind: *kind,
+                    source: source.as_deref().map(PathBuf::from),
+                });
+            }
+            Record::Row { index, row } => {
+                rows.insert(*index, row);
+            }
+            Record::Skipped { index, .. } => {
+                skipped.insert(*index);
+            }
+            Record::Mkdir { path } => created.push(PathBuf::from(path)),
+            Record::Rmdir { path } => removed.push(PathBuf::from(path)),
+            _ => {}
+        }
+    }
+
+    // Folders the moves emptied come back first, so files can go back into them.
+    for dir in removed.iter().rev() {
+        if let Err(e) = fs::create_dir_all(dir) {
+            summary
+                .warnings
+                .push(format!("Cannot recreate {}: {}", dir.display(), e));
+        }
+    }
+    let opts = ApplyOptions::default();
+    for record in intents.iter().rev() {
+        let Record::Intent {
+            index,
+            from,
+            to,
+            size,
+            mtime_ns,
+            cataloged,
+            cataloged_to,
+        } = record
+        else {
+            continue;
+        };
+        let (from, to) = (Path::new(from), Path::new(to));
+        let index_vias = vias.remove(index).unwrap_or_default();
+        for via in &index_vias {
+            clean_up_via(via, from, *size, *mtime_ns, &mut summary.warnings);
+        }
+        if skipped.contains(index) {
+            continue;
+        }
+        let had_copy = index_vias.iter().any(|v| v.kind == ViaKind::Copy);
+        let found = match locate(from, to, *size, *mtime_ns, had_copy) {
+            Ok(found) => found,
+            Err(e) => Found::Unclear(format!("Cannot check {}: {}", to.display(), e)),
+        };
+        let back = match found {
+            Found::AtTarget => {
+                let moved = move_file(to, from, *size, *mtime_ns, &opts, |via, kind, source| {
+                    journal.write(&Record::Via {
+                        index: *index,
+                        path: via.to_string_lossy().into_owned(),
+                        kind,
+                        source: source.map(|s| s.to_string_lossy().into_owned()),
+                    })
+                });
+                match moved {
+                    Ok(()) => {
+                        summary.moved_back += 1;
+                        true
+                    }
+                    Err(MoveError::Taken) => {
+                        summary.warnings.push(format!(
+                            "{} stays: {} is taken",
+                            to.display(),
+                            from.display()
+                        ));
+                        false
+                    }
+                    Err(MoveError::Failed(e) | MoveError::Partial(e)) => {
+                        summary
+                            .warnings
+                            .push(format!("Cannot move {} back: {}", to.display(), e));
+                        false
+                    }
+                }
+            }
+            Found::Copied => match remove_source(to) {
+                Ok(()) => true,
+                Err(e) => {
+                    summary.warnings.push(format!(
+                        "Cannot remove the copy {}: {}",
+                        to.display(),
+                        e
+                    ));
+                    false
+                }
+            },
+            Found::AtSource => true,
+            Found::Unclear(warning) => {
+                summary.warnings.push(warning);
+                false
+            }
+        };
+        // The catalog follows only a file that is back, and only where a row still points at
+        // the target, so running undo again changes nothing.
+        if let (true, Some((library_id, path))) = (back, cataloged) {
+            match (cataloged_to, rows.get(index)) {
+                (Some((new_library_id, new_path)), _) => {
+                    catalog.rename_row(*new_library_id, new_path, *library_id, path, false)?;
+                }
+                (None, Some(row)) if !catalog.has_row(*library_id, path)? => {
+                    catalog.put_row(row)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    for dir in created.iter().rev() {
+        if is_empty_dir(dir) {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::catalog::{library_path, FileRecord};
+    use crate::plan::{plan_organize, plan_quarantine, write_plan, OrganizeOptions};
+    use crate::template::Template;
+    use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
+    use tempfile::{tempdir, TempDir};
+    use time::macros::datetime;
+
+    struct Fixture {
+        dir: TempDir,
+        root: PathBuf,
+        catalog_path: PathBuf,
+    }
+
+    /// A library of real files, scanned into a catalog next to it.
+    fn fixture(files: &[(&str, &[u8])]) -> Fixture {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("lib");
+        for (path, contents) in files {
+            let full = library_path(&root, path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, contents).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let catalog_path = dir.path().join("catalog.sqlite");
+        crate::scan::scan(&root, &catalog_path, true).unwrap();
+        Fixture {
+            dir,
+            root,
+            catalog_path,
+        }
+    }
+
+    /// Every file and folder below `dir`, with file contents.
+    fn tree(dir: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        walkdir::WalkDir::new(dir)
+            .min_depth(1)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .map(|e| {
+                // `/` on every OS, so the keys read the same on Windows.
+                let rel = e
+                    .path()
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let contents = e.file_type().is_file().then(|| fs::read(e.path()).unwrap());
+                (rel, contents)
+            })
+            .collect()
+    }
+
+    fn rows(f: &Fixture) -> Vec<FileRecord> {
+        let catalog = Catalog::open(&f.catalog_path).unwrap();
+        let id = catalog.library_id(f.root.to_str().unwrap()).unwrap();
+        catalog.files(id).unwrap()
+    }
+
+    fn organize_plan(f: &Fixture, template: &str, prune_empty: bool) -> (PathBuf, Plan) {
+        let catalog = Catalog::open(&f.catalog_path).unwrap();
+        let id = catalog.library_id(f.root.to_str().unwrap()).unwrap();
+        let template = Template::parse(template).unwrap();
+        let now = datetime!(2026-10-20 12:00 UTC);
+        let opts = OrganizeOptions {
+            template: &template,
+            undated: "undated",
+            suffix: "_{n}",
+            trust_dates: false,
+            to: None,
+            prune_empty,
+            now,
+        };
+        let (plan, _) = plan_organize(&catalog, &f.catalog_path, id, &f.root, &opts).unwrap();
+        let path = write_plan(&plan, now).unwrap();
+        (path, plan)
+    }
+
+    const FILES: &[(&str, &[u8])] = &[
+        ("2017/2017-10-08 18.15.36.jpg", b"one"),
+        ("2017/sub/IMG_20190501_143201.jpg", b"two"),
+        ("2017/sub/IMG_20190501_143201.xmp", b"edits"),
+        ("misc/DSC0047.mp4", b"three"),
+        ("Ærø/Sommer på Ærø 2019-07-01.JPG", b"four"),
+    ];
+
+    #[test]
+    fn test_round_trip() {
+        for force_copy in [false, true] {
+            let f = fixture(FILES);
+            let (before, catalog_before) = (tree(&f.root), rows(&f));
+            let (plan_path, plan) = organize_plan(&f, "{type}/{year}/{date}_{time}.{ext}", true);
+            let opts = ApplyOptions {
+                force_copy,
+                ..ApplyOptions::default()
+            };
+            let summary = apply_with(&plan_path, &plan, &opts).unwrap();
+            assert_eq!((summary.moved, summary.skipped.len()), (5, 0));
+            let after = tree(&f.root);
+            assert!(after.contains_key("image/2019/2019-05-01_143201.jpg"));
+            assert!(after.contains_key("image/2019/2019-05-01_143201.xmp"));
+            assert!(after.contains_key("video/undated/DSC0047.mp4"));
+            assert!(after.contains_key("image/2019/Sommer på Ærø 2019-07-01.jpg"));
+            // The emptied folders are pruned; the catalog follows the files.
+            assert!(!after.contains_key("2017") && !after.contains_key("misc"));
+            assert!(rows(&f)
+                .iter()
+                .any(|r| r.path == "video/undated/DSC0047.mp4"));
+
+            let undone = undo(&summary.journal).unwrap();
+            assert_eq!(undone.warnings, Vec::<String>::new());
+            assert_eq!(tree(&f.root), before, "force_copy {}", force_copy);
+            assert_eq!(rows(&f), catalog_before);
+            // Running it again changes nothing.
+            undo(&summary.journal).unwrap();
+            assert_eq!(tree(&f.root), before);
+        }
+    }
+
+    #[test]
+    fn test_interrupted_apply_is_undone() {
+        let f = fixture(FILES);
+        let before = tree(&f.root);
+        let (plan_path, plan) = organize_plan(&f, "{year}/{date}_{time}.{ext}", false);
+        let journal = state_dir(&f.catalog_path, "journals").join(format!(
+            "{}.jsonl",
+            plan_path.file_stem().unwrap().to_string_lossy()
+        ));
+        let opts = ApplyOptions {
+            stop_after: Some(2),
+            ..ApplyOptions::default()
+        };
+        assert!(apply_with(&plan_path, &plan, &opts).is_err());
+        assert_ne!(tree(&f.root), before);
+        undo(&journal).unwrap();
+        assert_eq!(tree(&f.root), before);
+
+        // Stopped halfway through a copy across file systems.
+        let opts = ApplyOptions {
+            force_copy: true,
+            stop_in_copy: true,
+            ..ApplyOptions::default()
+        };
+        assert!(apply_with(&plan_path, &plan, &opts).is_err());
+        let journal = state_dir(&f.catalog_path, "journals").join(format!(
+            "{}-2.jsonl",
+            plan_path.file_stem().unwrap().to_string_lossy()
+        ));
+        undo(&journal).unwrap();
+        assert_eq!(tree(&f.root), before);
+    }
+
+    #[test]
+    fn test_changed_and_taken_files_are_skipped() {
+        let f = fixture(FILES);
+        let (plan_path, plan) = organize_plan(&f, "{type}/{name}.{ext}", false);
+        // One file changes after planning; another's target gets taken.
+        fs::write(f.root.join("misc/DSC0047.mp4"), b"changed!").unwrap();
+        fs::create_dir_all(f.root.join("image")).unwrap();
+        fs::write(f.root.join("image/2017-10-08 18.15.36.jpg"), b"intruder").unwrap();
+        let summary = apply(&plan_path, &plan).unwrap();
+        let skipped: Vec<&str> = summary.skipped.iter().map(|(_, r)| r.as_str()).collect();
+        assert_eq!(skipped.len(), 2, "{:?}", skipped);
+        assert!(skipped.contains(&"it changed since the plan was made"));
+        assert!(skipped.iter().any(|r| r.ends_with("is taken")));
+        assert_eq!(
+            fs::read(f.root.join("image/2017-10-08 18.15.36.jpg")).unwrap(),
+            b"intruder"
+        );
+        assert_eq!(
+            fs::read(f.root.join("misc/DSC0047.mp4")).unwrap(),
+            b"changed!"
+        );
+    }
+
+    #[test]
+    fn test_case_only_rename_round_trip() {
+        let f = fixture(&[("Upper.JPG", b"x")]);
+        let before = tree(&f.root);
+        let (plan_path, plan) = organize_plan(&f, "{name}.{ext}", false);
+        assert_eq!(plan.moves.len(), 1);
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert!(exactly_there(&f.root.join("Upper.jpg")).unwrap());
+        undo(&summary.journal).unwrap();
+        assert_eq!(tree(&f.root), before);
+    }
+
+    #[test]
+    fn test_quarantine_round_trip_restores_catalog_rows() {
+        let f = fixture(&[
+            ("a/photo.jpg", b"same bytes"),
+            ("b/copy of photo.jpg", b"same bytes"),
+            ("b/copy of photo.xmp", b"sidecar"),
+        ]);
+        let catalog = Catalog::open(&f.catalog_path).unwrap();
+        let report = crate::dupes::find_dupes(&catalog, &[], None).unwrap();
+        assert_eq!(report.groups.len(), 1);
+        let quarantine = f.dir.path().join("quarantine");
+        let now = datetime!(2026-10-20 12:00 UTC);
+        let (plan, _) =
+            plan_quarantine(&catalog, &f.catalog_path, &report, &[], &quarantine, now).unwrap();
+        drop(catalog);
+        let plan_path = write_plan(&plan, now).unwrap();
+        let (before, catalog_before) = (tree(&f.root), rows(&f));
+
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert_eq!(summary.moved, 2);
+        // The keeper (oldest, then path order) stays; the copy and its sidecar move, below a
+        // folder named after the library.
+        let moved = tree(&quarantine);
+        let moved_from = if tree(&f.root).contains_key("a/photo.jpg") {
+            "b"
+        } else {
+            "a"
+        };
+        assert_eq!(
+            moved
+                .keys()
+                .filter(|k| k.starts_with(&format!("lib/{}/", moved_from)))
+                .count(),
+            if moved_from == "b" { 2 } else { 1 }
+        );
+        assert_eq!(rows(&f).len(), 1);
+
+        undo(&summary.journal).unwrap();
+        assert_eq!(tree(&f.root), before);
+        assert_eq!(rows(&f), catalog_before);
+    }
+
+    #[test]
+    fn test_lock() {
+        let dir = tempdir().unwrap();
+        let catalog = dir.path().join("catalog.sqlite");
+        let lock = Lock::take(&catalog).unwrap();
+        assert!(matches!(Lock::take(&catalog), Err(Error::Usage(_))));
+        drop(lock);
+        assert!(Lock::take(&catalog).is_ok());
+    }
+
+    #[test]
+    fn test_truncated_journal_line_is_ignored() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        let start = serde_json::to_string(&Record::Start {
+            plan: String::from("p"),
+            catalog: String::from("c"),
+        })
+        .unwrap();
+        fs::write(&path, format!("{}\n{{\"event\":\"int", start)).unwrap();
+        assert_eq!(read_journal(&path).unwrap().len(), 1);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_names_differing_in_case_are_not_overwritten() {
+        let f = fixture(&[("Photo.JPG", b"upper"), ("Photo.jpg", b"lower")]);
+        let before = tree(&f.root);
+        let (plan_path, plan) = organize_plan(&f, "{name}.{ext}", false);
+        let summary = apply(&plan_path, &plan).unwrap();
+        let after = tree(&f.root);
+        let mut contents: Vec<&[u8]> = after.values().flatten().map(Vec::as_slice).collect();
+        contents.sort();
+        assert_eq!(contents, [b"lower".as_slice(), b"upper".as_slice()]);
+        undo(&summary.journal).unwrap();
+        assert_eq!(tree(&f.root), before);
+    }
+
+    #[test]
+    fn test_folder_case_is_kept() {
+        // The template says `image`; the folder on disk is `Image`. That is not a move.
+        let f = fixture(&[("Image/x.jpg", b"x")]);
+        let (_, plan) = organize_plan(&f, "{type}/{name}.{ext}", false);
+        assert_eq!(plan.moves, vec![]);
+    }
+
+    #[test]
+    fn test_undo_leaves_skipped_moves_and_rows_alone() {
+        let f = fixture(FILES);
+        let catalog_before = rows(&f);
+        let (plan_path, plan) = organize_plan(&f, "{type}/{name}.{ext}", false);
+        // An identical copy appears at one target after planning.
+        fs::create_dir_all(f.root.join("video")).unwrap();
+        fs::write(f.root.join("video/DSC0047.mp4"), b"three").unwrap();
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert_eq!(summary.skipped.len(), 1);
+        for _ in 0..2 {
+            let undone = undo(&summary.journal).unwrap();
+            assert_eq!(undone.warnings, Vec::<String>::new());
+            assert_eq!(
+                fs::read(f.root.join("video/DSC0047.mp4")).unwrap(),
+                b"three"
+            );
+            assert_eq!(fs::read(f.root.join("misc/DSC0047.mp4")).unwrap(), b"three");
+            assert_eq!(rows(&f), catalog_before);
+        }
+    }
+
+    #[test]
+    fn test_crash_before_the_catalog_follows() {
+        let f = fixture(FILES);
+        let (before, catalog_before) = (tree(&f.root), rows(&f));
+        let (plan_path, plan) = organize_plan(&f, "{type}/{name}.{ext}", false);
+        let opts = ApplyOptions {
+            stop_before_catalog: true,
+            ..ApplyOptions::default()
+        };
+        assert!(apply_with(&plan_path, &plan, &opts).is_err());
+        let journal = state_dir(&f.catalog_path, "journals").join(format!(
+            "{}.jsonl",
+            plan_path.file_stem().unwrap().to_string_lossy()
+        ));
+        undo(&journal).unwrap();
+        assert_eq!(tree(&f.root), before);
+        assert_eq!(rows(&f), catalog_before);
+    }
+
+    #[test]
+    fn test_quarantine_needs_the_kept_copy_and_leaves_shared_sidecars() {
+        let f = fixture(&[
+            ("a/IMG_1.jpg", b"same bytes"),
+            ("a/IMG_1.jpeg", b"same bytes"),
+            ("a/IMG_1.xmp", b"edits of the kept copy"),
+        ]);
+        let catalog = Catalog::open(&f.catalog_path).unwrap();
+        let report = crate::dupes::find_dupes(&catalog, &[], None).unwrap();
+        let quarantine = f.dir.path().join("quarantine");
+        let now = datetime!(2026-10-20 12:00 UTC);
+        let (plan, notes) =
+            plan_quarantine(&catalog, &f.catalog_path, &report, &[], &quarantine, now).unwrap();
+        drop(catalog);
+        // Only the copy moves; the sidecar stays with the kept file.
+        assert_eq!(plan.moves.len(), 1);
+        assert_eq!(notes.warnings.len(), 1);
+        let keeper = plan.moves[0].keeper.clone().unwrap();
+        let plan_path = write_plan(&plan, now).unwrap();
+        // The kept copy is gone before the plan is applied: nothing moves.
+        fs::rename(&keeper.path, f.dir.path().join("elsewhere.jpg")).unwrap();
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert_eq!(summary.moved, 0);
+        assert!(summary.skipped[0].1.contains("kept copy"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_crash_in_a_case_only_rename_keeps_the_file() {
+        let f = fixture(&[("Upper.JPG", b"original")]);
+        let (plan_path, plan) = organize_plan(&f, "{name}.{ext}", false);
+        let opts = ApplyOptions {
+            stop_in_rename: true,
+            ..ApplyOptions::default()
+        };
+        let error = apply_with(&plan_path, &plan, &opts).unwrap_err();
+        // Meanwhile another file turns up at the new name.
+        fs::write(f.root.join("Upper.jpg"), b"newcomer").unwrap();
+        let undone = undo(&error.journal.unwrap()).unwrap();
+        assert_eq!(fs::read(f.root.join("Upper.JPG")).unwrap(), b"original");
+        assert_eq!(fs::read(f.root.join("Upper.jpg")).unwrap(), b"newcomer");
+        assert_eq!(undone.moved_back, 0);
+    }
+
+    #[test]
+    fn test_undo_after_a_cut_journal_line() {
+        let f = fixture(&[("Upper.JPG", b"x"), ("other.jpg", b"y")]);
+        let before = tree(&f.root);
+        let (plan_path, plan) = organize_plan(&f, "{name}.{ext}", false);
+        let opts = ApplyOptions {
+            stop_after: Some(1),
+            ..ApplyOptions::default()
+        };
+        let journal = apply_with(&plan_path, &plan, &opts)
+            .unwrap_err()
+            .journal
+            .unwrap();
+        // A crash cut the last record short.
+        let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+        file.write_all(b"{\"event\":\"int").unwrap();
+        drop(file);
+        undo(&journal).unwrap();
+        assert_eq!(tree(&f.root), before);
+        // Undo's own records start on a line of their own, so the journal still reads.
+        read_journal(&journal).unwrap();
+        undo(&journal).unwrap();
+        assert_eq!(tree(&f.root), before);
+    }
+
+    #[test]
+    fn test_a_partial_copy_without_its_source_is_kept_aside() {
+        let dir = tempdir().unwrap();
+        let (via, source, from) = (
+            dir.path().join(".pixrs-1.tmp"),
+            dir.path().join("gone.jpg"),
+            dir.path().join("photo.jpg"),
+        );
+        fs::write(&via, b"half a pho").unwrap();
+        let copy = ViaFile {
+            path: via.clone(),
+            kind: ViaKind::Copy,
+            source: Some(source.clone()),
+        };
+        let mut warnings = vec![];
+        clean_up_via(&copy, &from, 20, 0, &mut warnings);
+        assert!(!from.exists());
+        assert_eq!(
+            fs::read(dir.path().join("photo.pixrs-recovered.jpg")).unwrap(),
+            b"half a pho"
+        );
+        assert_eq!(warnings.len(), 1);
+
+        // With its source still there, a partial copy is redundant.
+        fs::write(&via, b"half").unwrap();
+        fs::write(&source, b"half and the rest").unwrap();
+        clean_up_via(&copy, &from, 20, 0, &mut warnings);
+        assert!(!via.exists());
+
+        // An unused, empty reservation for a stopped rename goes; it is not the file.
+        fs::write(&via, b"").unwrap();
+        let stop = ViaFile {
+            path: via.clone(),
+            kind: ViaKind::Stop,
+            source: None,
+        };
+        clean_up_via(&stop, &from, 20, 0, &mut warnings);
+        assert!(!via.exists() && !from.exists());
+    }
+}
