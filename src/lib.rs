@@ -19,13 +19,17 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.                         *
  *************************************************************************************************/
 
+pub mod apply;
 pub mod catalog;
+pub mod dates;
 pub mod decode;
 pub mod dupes;
 pub mod error;
 pub mod imagehash;
 pub mod media;
+pub mod plan;
 pub mod scan;
 pub mod serve;
 pub mod statics;
 pub mod structs;
+pub mod template;

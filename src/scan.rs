@@ -424,7 +424,7 @@ fn relative_path(root: &Path, path: &Path) -> Option<String> {
 }
 
 /// Size and modification time of a file.
-fn stamp(meta: &FsMetadata) -> io::Result<Stamp> {
+pub(crate) fn stamp(meta: &FsMetadata) -> io::Result<Stamp> {
     let mtime_ns = match meta.modified()?.duration_since(UNIX_EPOCH) {
         Ok(after) => after.as_nanos() as i64,
         Err(before) => -(before.duration().as_nanos() as i64),

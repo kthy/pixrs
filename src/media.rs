@@ -26,7 +26,8 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 ];
 
 /// The kind of media a file holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MediaType {
     Image,
     Video,

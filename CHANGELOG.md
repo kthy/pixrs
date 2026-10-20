@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   small fingerprint. `pixrs dupes` and the viewer use them to report images with the same
   pixels (e.g. rewritten metadata) and, with `--similar`, similar images (e.g. resized or
   recompressed), each group labeled with its tier. `--threshold` sets how similar is similar.
+- `pixrs organize` plans renaming and moving a library's files by a template or layout presets,
+  with dates from metadata or file names, an `undated` folder, collision suffixes and sidecar
+  files. `pixrs dupes --quarantine <DIR>` plans moving duplicate copies out of the library.
+  `pixrs apply` carries out a plan with a journal of every step, and `pixrs undo` reverses it.
 - `pixrs serve` starts a local web viewer on the catalog: browse by folder or date, view images,
   play audio and video, and compare duplicate groups. Thumbnails are cached outside the
   libraries; HEIC, AVIF and video thumbnails use `ffmpeg` if it is on `PATH`. Works offline.
