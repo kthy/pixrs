@@ -185,7 +185,8 @@ on the LFS files.
   `src/structs.rs`. `src/lib.rs` and `src/main.rs` carry the full AGPL notice.
 - `Cargo.toml` dependencies: major-version spec where possible, with the crate's license as a
   trailing comment aligned with the others. New dependencies must have AGPL-3.0-compatible
-  licenses.
+  licenses (listed in `about.toml`). After changing dependencies, run `just notices` to
+  regenerate `THIRD_PARTY_NOTICES.txt`; CI fails if it is out of date.
 - Catalog schema changes bump `SCHEMA_VERSION` in `src/catalog.rs` and must migrate existing
   catalogs; users' catalogs hold hours of hashing. Until the first release that includes the
   catalog, schema v1 is edited in place: nobody has a catalog to migrate yet.

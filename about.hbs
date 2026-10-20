@@ -1,0 +1,28 @@
+THIRD-PARTY SOFTWARE NOTICES
+
+PixRS includes the following third-party software, each under its own license. Their notices
+follow. Generated with cargo-about from `about.toml` and `about.hbs`; run `just notices` after
+changing dependencies.
+
+PixRS also includes:
+
+- htmx 4.0.0 (https://htmx.org/), under the BSD Zero Clause License, which needs no notice.
+- SQLite (https://sqlite.org/), via rusqlite's bundled build, which is in the public domain.
+
+PixRS can call these programs if they are installed, but does not include them: FFmpeg's
+ffmpeg and ffprobe (https://ffmpeg.org/), and Chromaprint's fpcalc
+(https://acoustid.org/chromaprint).
+
+Licenses:
+{{#each overview}}
+- {{{name}}}: {{count}}
+{{/each}}
+{{#each licenses}}
+
+================================================================================
+{{{name}}}
+
+Used by: {{#each used_by}}{{{crate.name}}}{{#unless @last}}, {{/unless}}{{/each}}
+
+{{{text}}}
+{{/each}}

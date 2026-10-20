@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   play audio and video, and compare duplicate groups. Thumbnails are cached outside the
   libraries; HEIC, AVIF and video thumbnails use `ffmpeg` if it is on `PATH`. Works offline.
 
+- `--third-party-notices` prints the licenses of the third-party software included in PixRS,
+  generated with `cargo-about` into `THIRD_PARTY_NOTICES.txt`.
+
 ### Changed
 
 - Replace the `rouille` web server with `axum`.

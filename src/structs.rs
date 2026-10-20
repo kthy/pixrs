@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub license: bool,
 
+    /// Display the licenses of third-party software included in PixRS
+    #[arg(long)]
+    pub third_party_notices: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

@@ -20,9 +20,11 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-  -l, --license  Display full license notice
-  -h, --help     Print help
-  -V, --version  Print version
+  -l, --license              Display full license notice
+      --third-party-notices  Display the licenses of third-party software
+                             included in PixRS
+  -h, --help                 Print help
+  -V, --version              Print version
 ```
 
 ### Scan a library into the catalog
@@ -270,6 +272,14 @@ cargo run -- serve --catalog target/catalog.sqlite --open
 The test media files are stored with [Git LFS][git-lfs]. Without it they are checked out as small
 pointer files; the tests still pass, but the viewer shows placeholders for them. Install Git LFS
 and run `git lfs pull` to fetch the real files.
+
+## License
+
+PixRS is released under the GNU Affero General Public License, version 3 or later; see
+[`LICENSE.md`](LICENSE.md). The licenses of the third-party software it includes are in
+[`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt), which `pixrs --third-party-notices` also
+prints. After changing dependencies, regenerate it with `just notices` (needs
+`cargo install --locked cargo-about --features cli`); CI checks that it is current.
 
 [badge-audit-href]: https://github.com/kthy/pixrs/actions/workflows/audit.yml
 [badge-audit-svg]: https://github.com/kthy/pixrs/actions/workflows/audit.yml/badge.svg

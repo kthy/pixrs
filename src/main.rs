@@ -32,7 +32,7 @@ use pixrs::plan::{
     OrganizeOptions,
 };
 use pixrs::serve::{default_cache_dir, Config};
-use pixrs::statics::LICENSE;
+use pixrs::statics::{LICENSE, THIRD_PARTY_NOTICES};
 use pixrs::structs::{
     ApplyOpt, Cli, Command, DupesOpt, Format, OrganizeOpt, ScanOpt, ServeOpt, UndoOpt,
 };
@@ -56,9 +56,14 @@ fn main() {
     // Load command line arguments
     let cli = Cli::parse();
 
-    // Short circuit to license display
+    // Short circuit to license display. Long texts are often piped to a pager; quitting it
+    // early is not an error.
     if cli.license {
-        println!("{}", LICENSE);
+        let _ = writeln!(io::stdout(), "{}", LICENSE);
+        exit(exitcode::OK);
+    }
+    if cli.third_party_notices {
+        let _ = io::stdout().write_all(THIRD_PARTY_NOTICES.as_bytes());
         exit(exitcode::OK);
     }
 
