@@ -1066,12 +1066,15 @@ mod tests {
             .into_iter()
             .map(|e| e.unwrap())
             .map(|e| {
+                // `/` on every OS, so the keys read the same on Windows.
                 let rel = e
                     .path()
                     .strip_prefix(dir)
                     .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 let contents = e.file_type().is_file().then(|| fs::read(e.path()).unwrap());
                 (rel, contents)
             })
