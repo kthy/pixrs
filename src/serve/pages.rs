@@ -541,7 +541,7 @@ fn dupe_group(group: &DupeGroup) -> Markup {
                         (HumanBytes(group.files[0].size)) " x " (group.files.len()) " exact copies, "
                     }
                     Tier::SamePixels => { (group.files.len()) " images with the same pixels, " }
-                    Tier::Similar => { (group.files.len()) " similar images, " }
+                    Tier::Similar => { (group.files.len()) " similar files, " }
                 }
                 (HumanBytes(group.reclaimable_bytes())) " reclaimable "
                 span.badge.tier { (group.tier.as_str()) }
@@ -605,14 +605,15 @@ pub async fn dupes(
                      to hash them."
                 }
             }
-            @if summary.unhashed_images > 0 {
+            @if summary.unhashed_media > 0 {
                 p.note {
-                    (summary.unhashed_images) " images have no pixel or perceptual hash yet (not \
-                     scanned since they changed, RAW, or HEIC/AVIF without ffmpeg), so there may \
-                     be more same-pixel or similar images."
+                    (summary.unhashed_media) " files have no image hash, video signature or audio \
+                     fingerprint yet (not scanned since they changed, or no decoder: RAW, \
+                     HEIC/AVIF without ffmpeg 7.1, video without ffmpeg, audio without fpcalc), so \
+                     there may be more same-pixel or similar files."
                 }
             }
-            @if state.similar.is_none() {
+            @if !state.similarity.images {
                 p.note {
                     "Similar images (resized or recompressed copies) are not shown. Start the \
                      viewer with --similar to include them; expect burst shots among them."

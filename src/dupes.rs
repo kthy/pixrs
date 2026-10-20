@@ -5,7 +5,10 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::catalog::{display_root, library_path, Catalog, HashedFile, HashedImage};
+use crate::avhash::{
+    audio_durations_match, audio_match, frames_match, has_detail, video_durations_match, Frame,
+};
+use crate::catalog::{display_root, library_path, Catalog, HashedAv, HashedFile, HashedImage};
 use crate::imagehash::{distance, fingerprints_match};
 use indicatif::HumanBytes;
 use serde::Serialize;
@@ -96,11 +99,11 @@ pub struct Summary {
     /// Files that share their size with another file but are not hashed yet, so they may be
     /// duplicates this report does not show.
     pub unhashed_candidates: usize,
-    /// Images the image hash pass has not decoded (new or changed since the last scan, or no
-    /// decoder for them), so they may have same-pixel or similar copies this report does not
-    /// show. Images the decoder rejected, and images with too little detail for a perceptual
-    /// hash, are not counted.
-    pub unhashed_images: usize,
+    /// Images, videos and audio the hash pass has not decoded (new or changed since the last
+    /// scan, or no tool for them), so they may have same-pixel or similar copies this report
+    /// does not show. Files the decoder rejected, and images with too little detail for a
+    /// perceptual hash, are not counted.
+    pub unhashed_media: usize,
 }
 
 /// All duplicate groups: exact ones first, then same pixels, then similar, each largest
@@ -115,13 +118,19 @@ pub struct DupeReport {
 /// fraction. Resized copies keep their aspect ratio; crops and unrelated pictures often do not.
 const MAX_ASPECT_DIFFERENCE: f64 = 0.03;
 
+/// Videos shorter than this (in milliseconds) are only compared with `--similar`, like images:
+/// Live Photo clips and other short clips shot moments apart look much like burst shots.
+const SHORT_VIDEO_MS: i64 = 4000;
+
 /// What `find_dupes` reads from the catalog. Loading it is quick; grouping it compares every
 /// pair of images and can take a while, so the viewer does that without holding the catalog.
 pub struct DupeInput {
     exact: Vec<HashedFile>,
     images: Vec<HashedImage>,
+    /// Videos and audio with signatures.
+    av: Vec<HashedAv>,
     unhashed_candidates: usize,
-    unhashed_images: usize,
+    unhashed_media: usize,
 }
 
 /// A file with whatever hashes it has.
@@ -208,29 +217,21 @@ pub fn aspects_match(a: f64, b: f64) -> bool {
 /// A perceptual hash, aspect ratio and fingerprint.
 type Visual<'a> = (u64, f64, &'a [u8]);
 
-/// Pairs of indices into `images` that are similar: perceptual hashes at most `threshold` bits
-/// apart, matching aspect ratios, and matching fingerprints. Compares every pair, on all cores.
-fn similar_pairs(images: &[Visual], threshold: u32) -> Vec<(usize, usize)> {
+/// The pairs `row(i)` returns for every `i` below `rows`, on all cores. Rows are dealt out
+/// round-robin, which balances the work when row `i` compares `i` with the rows after it.
+fn pairs_by_row(
+    rows: usize,
+    row: impl Fn(usize, &mut Vec<(usize, usize)>) + Sync,
+) -> Vec<(usize, usize)> {
     let workers = available_parallelism().map_or(1, |n| n.get());
+    let row = &row;
     thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
                 scope.spawn(move || {
                     let mut pairs = vec![];
-                    // Rows round-robin: row i has n - i - 1 comparisons, so this balances.
-                    for i in (w..images.len()).step_by(workers) {
-                        let (hash, aspect, fingerprint) = images[i];
-                        for (j, &(other, other_aspect, other_fingerprint)) in
-                            images.iter().enumerate().skip(i + 1)
-                        {
-                            // Cheapest test first: most pairs fail on the hash.
-                            if distance(hash, other) <= threshold
-                                && aspects_match(aspect, other_aspect)
-                                && fingerprints_match(fingerprint, other_fingerprint)
-                            {
-                                pairs.push((i, j));
-                            }
-                        }
+                    for i in (w..rows).step_by(workers) {
+                        row(i, &mut pairs);
                     }
                     pairs
                 })
@@ -243,29 +244,124 @@ fn similar_pairs(images: &[Visual], threshold: u32) -> Vec<(usize, usize)> {
     })
 }
 
-/// Read what `group_dupes` needs from the catalog. Perceptual hashes and fingerprints are only
-/// read when `similar` is set.
+/// Pairs of indices into `images` that are similar: perceptual hashes at most `threshold` bits
+/// apart, matching aspect ratios, and matching fingerprints. Compares every pair, on all cores.
+fn similar_pairs(images: &[Visual], threshold: u32) -> Vec<(usize, usize)> {
+    pairs_by_row(images.len(), |i, pairs| {
+        let (hash, aspect, fingerprint) = images[i];
+        for (j, &(other, other_aspect, other_fingerprint)) in images.iter().enumerate().skip(i + 1)
+        {
+            // Cheapest test first: most pairs fail on the hash.
+            if distance(hash, other) <= threshold
+                && aspects_match(aspect, other_aspect)
+                && fingerprints_match(fingerprint, other_fingerprint)
+            {
+                pairs.push((i, j));
+            }
+        }
+    })
+}
+
+/// The node for `file`, added if it is new.
+fn add_node(
+    nodes: &mut Vec<Node>,
+    index: &mut HashMap<(i64, String), usize>,
+    file: HashedFile,
+) -> usize {
+    *index
+        .entry((file.library_id, file.path.clone()))
+        .or_insert_with(|| {
+            nodes.push(Node {
+                sha256: (!file.sha256.is_empty()).then(|| file.sha256.clone()),
+                pixel_hash: None,
+                phash: None,
+                fingerprint: None,
+                pixels: 0,
+                aspect: 0.0,
+                file,
+            });
+            nodes.len() - 1
+        })
+}
+
+/// Pairs of node indices of similar videos (durations, aspect ratios and frames match) and
+/// similar audio (durations and fingerprints match). Files are sorted by duration and only
+/// compared within the duration tolerance, on all cores. Videos shorter than `SHORT_VIDEO_MS`
+/// are left out unless `short_videos` is set, and so is audio without detail (silence, hum).
+///
+/// Audio is the costly part: an audio pair takes tens of microseconds, and music libraries have
+/// many tracks of similar length.
+fn similar_av(
+    items: &[(usize, HashedAv)],
+    threshold: u32,
+    short_videos: bool,
+) -> Vec<(usize, usize)> {
+    let mut videos: Vec<(usize, i64, f64, &[Frame])> = items
+        .iter()
+        .filter(|(_, a)| short_videos || a.duration_ms >= SHORT_VIDEO_MS)
+        .filter_map(|(i, a)| {
+            let frames = a.frames.as_deref()?;
+            Some((*i, a.duration_ms, aspect(a.width, a.height), frames))
+        })
+        .collect();
+    let mut audio: Vec<(usize, i64, &[u32])> = items
+        .iter()
+        .filter_map(|(i, a)| Some((*i, a.duration_ms, a.chromaprint.as_deref()?)))
+        .filter(|(_, _, values)| has_detail(values))
+        .collect();
+    videos.sort_by_key(|v| v.1);
+    audio.sort_by_key(|a| a.1);
+    let mut pairs = pairs_by_row(videos.len(), |n, pairs| {
+        let (i, duration, aspect, frames) = videos[n];
+        for &(j, other_duration, other_aspect, other_frames) in &videos[n + 1..] {
+            if !video_durations_match(duration, other_duration) {
+                break;
+            }
+            if aspects_match(aspect, other_aspect) && frames_match(frames, other_frames, threshold)
+            {
+                pairs.push((i, j));
+            }
+        }
+    });
+    pairs.extend(pairs_by_row(audio.len(), |n, pairs| {
+        let (i, duration, values) = audio[n];
+        for &(j, other_duration, other_values) in &audio[n + 1..] {
+            if !audio_durations_match(duration, other_duration) {
+                break;
+            }
+            if audio_match(values, other_values) {
+                pairs.push((i, j));
+            }
+        }
+    }));
+    pairs
+}
+
+/// Read what `group_dupes` needs from the catalog. Image perceptual hashes and fingerprints
+/// are only read when `similar_images` is set.
 pub fn load_dupes(
     catalog: &Catalog,
     libraries: &[i64],
-    similar: bool,
+    similar_images: bool,
 ) -> rusqlite::Result<DupeInput> {
     Ok(DupeInput {
         exact: catalog.duplicate_candidates()?,
-        images: catalog.hashed_images(similar)?,
+        images: catalog.hashed_images(similar_images)?,
+        av: catalog.hashed_av()?,
         unhashed_candidates: catalog.count_unhashed_with_shared_size(libraries)?,
-        unhashed_images: catalog.count_unhashed_images(libraries)?,
+        unhashed_media: catalog.count_unhashed(libraries)?,
     })
 }
 
 /// Find duplicates. Files are linked when they have the same size and SHA-256 (exact), or the
-/// same pixel hash (same pixels). With `similar` set, images are also linked when their
-/// perceptual hashes are at most that many bits apart, their aspect ratios match and their
-/// fingerprints match (similar). A group is every file linked to another, directly or through
+/// same pixel hash (same pixels), and as similar: videos whose durations, shapes and frames
+/// match, audio whose durations and fingerprints match, and with `similarity.images`, images
+/// whose perceptual hashes are at most `similarity.threshold` bits apart, whose aspect ratios
+/// match and whose fingerprints match. A group is every file linked to another, directly or through
 /// others, and has the weakest tier among its files: a group with an exact pair and a similar
 /// third file is similar.
 ///
-/// Similar matching is opt-in because on libraries with burst shots most similar pairs are
+/// Similar images are opt-in because on libraries with burst shots most similar pairs are
 /// shots taken moments apart, not copies: on the owner's library, which has few resized copies,
 /// the fingerprint check rejected about 95% of burst pairs, and those left still outnumbered
 /// real copies.
@@ -275,40 +371,55 @@ pub fn load_dupes(
 /// what on the old disk also exists elsewhere.
 ///
 /// In each group the kept file is the one with the earliest mtime. Ties are broken by path order:
-/// library root first, then the path inside the library. In similar groups the largest image
-/// (pixels, then bytes) is kept instead, since similar copies are often scaled down; the oldest
+/// library root first, then the path inside the library. In similar groups the largest file
+/// (pixels, then bytes), or the oldest file with its bytes or pixels, is kept instead, since similar copies are often scaled down; the oldest
 /// wins ties. The keeper is chosen from all files, so it does not depend on `libraries`.
 ///
 /// The report reflects the catalog as of each library's last scan; files are not checked.
 pub fn find_dupes(
     catalog: &Catalog,
     libraries: &[i64],
-    similar: Option<u32>,
+    similarity: Similarity,
 ) -> rusqlite::Result<DupeReport> {
-    let input = load_dupes(catalog, libraries, similar.is_some())?;
-    Ok(group_dupes(input, libraries, similar))
+    let input = load_dupes(catalog, libraries, similarity.images)?;
+    Ok(group_dupes(input, libraries, similarity))
+}
+
+/// How `find_dupes` looks for similar files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Similarity {
+    /// Hamming distance between perceptual hashes (of images and video frames) up to which
+    /// they count as similar.
+    pub threshold: u32,
+    /// Also look for similar images and short videos. Similar video and audio are otherwise
+    /// always looked for: they have no burst-shot problem.
+    pub images: bool,
+}
+
+impl Default for Similarity {
+    fn default() -> Self {
+        Similarity {
+            threshold: DEFAULT_THRESHOLD,
+            images: false,
+        }
+    }
+}
+
+impl Similarity {
+    /// With similar images too.
+    pub fn with_images(threshold: u32) -> Self {
+        Similarity {
+            threshold,
+            images: true,
+        }
+    }
 }
 
 /// The grouping half of `find_dupes`, for input from `load_dupes`.
-pub fn group_dupes(input: DupeInput, libraries: &[i64], similar: Option<u32>) -> DupeReport {
+pub fn group_dupes(input: DupeInput, libraries: &[i64], similarity: Similarity) -> DupeReport {
     let mut nodes: Vec<Node> = vec![];
     let mut index: HashMap<(i64, String), usize> = HashMap::new();
-    let mut add = |file: HashedFile| -> usize {
-        *index
-            .entry((file.library_id, file.path.clone()))
-            .or_insert_with(|| {
-                nodes.push(Node {
-                    sha256: (!file.sha256.is_empty()).then(|| file.sha256.clone()),
-                    pixel_hash: None,
-                    phash: None,
-                    fingerprint: None,
-                    pixels: 0,
-                    aspect: 0.0,
-                    file,
-                });
-                nodes.len() - 1
-            })
-    };
+    let mut add = |file: HashedFile| add_node(&mut nodes, &mut index, file);
     let exact: Vec<usize> = input.exact.into_iter().map(&mut add).collect();
     let mut images: Vec<(usize, HashedImage)> = vec![];
     for mut image in input.images {
@@ -324,6 +435,18 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similar: Option<u32>) ->
         node.aspect = aspect(image.width, image.height);
     }
 
+    // Videos and audio, for the keeper rule (largest first) and similarity.
+    let av: Vec<(usize, HashedAv)> = input
+        .av
+        .into_iter()
+        .map(|item| {
+            let i = add_node(&mut nodes, &mut index, item.file.clone());
+            nodes[i].pixels = u64::from(item.width) * u64::from(item.height);
+            nodes[i].aspect = aspect(item.width, item.height);
+            (i, item)
+        })
+        .collect();
+
     let mut sets = Sets((0..nodes.len()).collect());
     let mut exact_sets: HashMap<(u64, String), Vec<usize>> = HashMap::new();
     for &i in &exact {
@@ -332,18 +455,18 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similar: Option<u32>) ->
     }
     for members in exact_sets.values() {
         // Byte-identical files have the same pixels and size, even if only one was decoded.
+        // Videos and audio have no pixel hash, but may have a size.
         let decoded = members
             .iter()
             .copied()
-            .find(|&i| nodes[i].pixel_hash.is_some());
-        let (pixel_hash, pixels, aspect) = match decoded {
-            Some(i) => (
-                nodes[i].pixel_hash.clone(),
-                nodes[i].pixels,
-                nodes[i].aspect,
-            ),
-            None => (None, 0, 0.0),
-        };
+            .find(|&i| nodes[i].pixel_hash.is_some())
+            .or_else(|| members.iter().copied().max_by_key(|&i| nodes[i].pixels))
+            .expect("exact sets are not empty");
+        let (pixel_hash, pixels, aspect) = (
+            nodes[decoded].pixel_hash.clone(),
+            nodes[decoded].pixels,
+            nodes[decoded].aspect,
+        );
         for &i in members {
             sets.union(members[0], i);
             if nodes[i].pixel_hash.is_none() {
@@ -368,13 +491,17 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similar: Option<u32>) ->
             visuals.push((hash, node.aspect, fingerprint));
         }
     }
-    let pairs = match similar {
-        Some(threshold) => similar_pairs(&visuals, threshold),
-        None => vec![],
+    let pairs = if similarity.images {
+        similar_pairs(&visuals, similarity.threshold)
+    } else {
+        vec![]
     };
     drop(visuals);
     for (a, b) in pairs {
         sets.union(hashed[a], hashed[b]);
+    }
+    for (a, b) in similar_av(&av, similarity.threshold, similarity.images) {
+        sets.union(a, b);
     }
 
     let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -392,24 +519,39 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similar: Option<u32>) ->
         })
         .map(|mut group| {
             let tier = group_tier(&nodes, &group);
+            let oldest = |a: &Node, b: &Node| {
+                (a.file.mtime_ns, &a.file.root, &a.file.path).cmp(&(
+                    b.file.mtime_ns,
+                    &b.file.root,
+                    &b.file.path,
+                ))
+            };
             group.sort_by(|&a, &b| {
                 let (a, b) = (&nodes[a], &nodes[b]);
-                let oldest = || {
-                    (a.file.mtime_ns, &a.file.root, &a.file.path).cmp(&(
-                        b.file.mtime_ns,
-                        &b.file.root,
-                        &b.file.path,
-                    ))
-                };
                 if tier == Tier::Similar {
                     // Similar copies are often smaller: keep the largest.
                     (b.pixels, b.file.size)
                         .cmp(&(a.pixels, a.file.size))
-                        .then_with(oldest)
+                        .then_with(|| oldest(a, b))
                 } else {
-                    oldest()
+                    oldest(a, b)
                 }
             });
+            if tier == Tier::Similar {
+                // Of the largest file's exact and same-pixel copies, keep the oldest: a copy
+                // with rewritten metadata can have more bytes than the original.
+                let largest = &nodes[group[0]];
+                let first = (1..group.len())
+                    .filter(|&p| match_tier(largest, &nodes[group[p]]) != Tier::Similar)
+                    .fold(0, |best, p| {
+                        if oldest(&nodes[group[p]], &nodes[group[best]]).is_lt() {
+                            p
+                        } else {
+                            best
+                        }
+                    });
+                group[..=first].rotate_right(1);
+            }
             let keeper = &nodes[group[0]];
             let files: Vec<DupeFile> = group
                 .iter()
@@ -451,7 +593,7 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similar: Option<u32>) ->
         redundant_files: groups.iter().map(|g| g.files.len() - 1).sum(),
         reclaimable_bytes: groups.iter().map(DupeGroup::reclaimable_bytes).sum(),
         unhashed_candidates: input.unhashed_candidates,
-        unhashed_images: input.unhashed_images,
+        unhashed_media: input.unhashed_media,
     };
     DupeReport { groups, summary }
 }
@@ -490,7 +632,7 @@ pub fn write_text(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
                 sha256.get(..12).unwrap_or(sha256)
             )?,
             (Tier::SamePixels, _) => writeln!(out, "{} images with the same pixels:", n)?,
-            _ => writeln!(out, "{} similar images:", n)?,
+            _ => writeln!(out, "{} similar files:", n)?,
         }
         for file in &group.files {
             write!(
@@ -619,7 +761,12 @@ mod tests {
         }
 
         fn report(&self) -> DupeReport {
-            find_dupes(&self.catalog, &[], Some(DEFAULT_THRESHOLD)).unwrap()
+            find_dupes(
+                &self.catalog,
+                &[],
+                Similarity::with_images(DEFAULT_THRESHOLD),
+            )
+            .unwrap()
         }
     }
 
@@ -652,7 +799,7 @@ mod tests {
                 reclaimable_bytes: 100,
                 unhashed_candidates: 0,
                 // The fixture's files are images that were never decoded.
-                unhashed_images: 3,
+                unhashed_media: 3,
             }
         );
     }
@@ -700,7 +847,12 @@ mod tests {
         // Filtering on the old disk shows its groups with all copies, including the one on the
         // NAS, which stays the keeper. Groups only on the NAS are left out.
         let old_disk = fx.catalog.find_library("/old-disk").unwrap().unwrap();
-        let report = find_dupes(&fx.catalog, &[old_disk], Some(DEFAULT_THRESHOLD)).unwrap();
+        let report = find_dupes(
+            &fx.catalog,
+            &[old_disk],
+            Similarity::with_images(DEFAULT_THRESHOLD),
+        )
+        .unwrap();
         let shas: Vec<&str> = report
             .groups
             .iter()
@@ -737,7 +889,12 @@ mod tests {
         fx.add("/other", "d.jpg", 100, 10, None);
         assert_eq!(fx.report().summary.unhashed_candidates, 3);
         let lib = fx.catalog.find_library("/lib").unwrap().unwrap();
-        let report = find_dupes(&fx.catalog, &[lib], Some(DEFAULT_THRESHOLD)).unwrap();
+        let report = find_dupes(
+            &fx.catalog,
+            &[lib],
+            Similarity::with_images(DEFAULT_THRESHOLD),
+        )
+        .unwrap();
         assert_eq!(report.summary.unhashed_candidates, 2);
     }
 
@@ -797,7 +954,7 @@ mod tests {
                     "redundant_files": 1,
                     "reclaimable_bytes": 100,
                     "unhashed_candidates": 0,
-                    "unhashed_images": 2,
+                    "unhashed_media": 2,
                 },
             })
         );
@@ -850,10 +1007,12 @@ mod tests {
         write("white.jpg", &jpeg(&blank(255, 255, 255), 85));
         write("navy.jpg", &jpeg(&blank(20, 20, 90), 80));
         let catalog_path = dir.path().join("catalog.sqlite");
-        crate::scan::scan(&lib, &catalog_path, true).unwrap();
+        crate::scan::scan_with(&lib, &catalog_path, true, &crate::decode::Tools::default())
+            .unwrap();
 
         let catalog = Catalog::open_existing(&catalog_path).unwrap();
-        let report = find_dupes(&catalog, &[], Some(DEFAULT_THRESHOLD)).unwrap();
+        let report =
+            find_dupes(&catalog, &[], Similarity::with_images(DEFAULT_THRESHOLD)).unwrap();
         let groups: Vec<(Tier, Vec<&str>)> = report
             .groups
             .iter()
@@ -873,10 +1032,10 @@ mod tests {
                 (Tier::Similar, vec!["big.jpg", "small.jpg"]),
             ]
         );
-        assert_eq!(report.summary.unhashed_images, 0);
+        assert_eq!(report.summary.unhashed_media, 0);
 
         // Similar images are only looked for when asked.
-        let report = find_dupes(&catalog, &[], None).unwrap();
+        let report = find_dupes(&catalog, &[], Similarity::default()).unwrap();
         assert!(report.groups.iter().all(|g| g.tier != Tier::Similar));
         assert_eq!(report.groups.len(), 1);
     }
@@ -904,7 +1063,7 @@ mod tests {
         set("b.jpg", "p1", 0, 10);
         set("c.jpg", "p2", 0b111, 10);
 
-        let report = find_dupes(&fx.catalog, &[], Some(3)).unwrap();
+        let report = find_dupes(&fx.catalog, &[], Similarity::with_images(3)).unwrap();
         assert_eq!(report.groups.len(), 1);
         let group = &report.groups[0];
         assert_eq!((group.tier, group.sha256.as_deref()), (Tier::Similar, None));
@@ -927,14 +1086,72 @@ mod tests {
 
         // More pixels beat more bytes.
         set("c.jpg", "p2", 0b111, 40);
-        let report = find_dupes(&fx.catalog, &[], Some(3)).unwrap();
+        let report = find_dupes(&fx.catalog, &[], Similarity::with_images(3)).unwrap();
         assert_eq!(kept_and_others(&report.groups[0])[0], (true, "c.jpg"));
 
         // Without the similar link the group is exact, and the oldest copy is kept.
-        let report = find_dupes(&fx.catalog, &[], Some(2)).unwrap();
+        let report = find_dupes(&fx.catalog, &[], Similarity::with_images(2)).unwrap();
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].tier, Tier::Exact);
         assert_eq!(kept_and_others(&report.groups[0])[0], (true, "a.jpg"));
+    }
+
+    #[test]
+    fn test_similar_group_keeps_the_original_over_a_larger_same_pixel_copy() {
+        // A photo manager rewrote the metadata of a copy, which made it larger; a burst shot
+        // links them into a similar group. The original is still kept.
+        let fx = Fixture::new();
+        fx.add("/lib", "original.jpg", 100, 1, None);
+        fx.add("/lib", "edited.jpg", 120, 5, None);
+        fx.add("/lib", "burst.jpg", 90, 3, None);
+        let id = fx.catalog.find_library("/lib").unwrap().unwrap();
+        let set = |path: &str, pixels: &str, perceptual: u64| {
+            let hashes = crate::imagehash::ImageHashes {
+                pixels: String::from(pixels),
+                perceptual: Some(perceptual),
+                fingerprint: Some(vec![100; 16]),
+                width: 10,
+                height: 10,
+            };
+            fx.catalog
+                .set_image_hashes(id, path, "v", Some(&hashes))
+                .unwrap();
+        };
+        set("original.jpg", "p1", 0);
+        set("edited.jpg", "p1", 0);
+        set("burst.jpg", "p2", 1);
+        let report = find_dupes(&fx.catalog, &[], Similarity::with_images(3)).unwrap();
+        let matches: Vec<(&str, Option<Tier>)> = report.groups[0]
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.matches))
+            .collect();
+        assert_eq!(
+            matches,
+            [
+                ("original.jpg", None),
+                ("edited.jpg", Some(Tier::SamePixels)),
+                ("burst.jpg", Some(Tier::Similar))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_audio_without_detail_is_never_similar() {
+        let audio = |values: Vec<u32>| HashedAv {
+            file: HashedFile::default(),
+            duration_ms: 30_000,
+            width: 0,
+            height: 0,
+            frames: None,
+            chromaprint: Some(values),
+        };
+        let tone = || vec![558_758_263; 221];
+        let music = || (0..221u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let silent = [(0, audio(tone())), (1, audio(tone()))];
+        assert_eq!(similar_av(&silent, DEFAULT_THRESHOLD, true), vec![]);
+        let copies = [(0, audio(music())), (1, audio(music()))];
+        assert_eq!(similar_av(&copies, DEFAULT_THRESHOLD, true), vec![(0, 1)]);
     }
 
     #[test]
@@ -965,7 +1182,8 @@ mod tests {
         set("flat.jpg", None, 400, 300);
         set("flat too.jpg", None, 400, 300);
 
-        let report = find_dupes(&fx.catalog, &[], Some(DEFAULT_THRESHOLD)).unwrap();
+        let report =
+            find_dupes(&fx.catalog, &[], Similarity::with_images(DEFAULT_THRESHOLD)).unwrap();
         assert_eq!(report.groups.len(), 1);
         let mut paths: Vec<&str> = report.groups[0]
             .files
@@ -997,7 +1215,8 @@ mod tests {
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
         }
-        let report = find_dupes(&fx.catalog, &[], Some(DEFAULT_THRESHOLD)).unwrap();
+        let report =
+            find_dupes(&fx.catalog, &[], Similarity::with_images(DEFAULT_THRESHOLD)).unwrap();
         assert_eq!(report.groups, vec![]);
     }
 
@@ -1022,9 +1241,98 @@ mod tests {
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
         }
-        let report = find_dupes(&fx.catalog, &[], Some(0)).unwrap();
+        let report = find_dupes(&fx.catalog, &[], Similarity::with_images(0)).unwrap();
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].tier, Tier::SamePixels);
+    }
+
+    #[test]
+    fn test_short_videos_are_only_compared_with_similar() {
+        let video = |duration_ms: i64| HashedAv {
+            file: HashedFile::default(),
+            duration_ms,
+            width: 640,
+            height: 360,
+            frames: Some((0..9).map(Some).collect()),
+            chromaprint: None,
+        };
+        let short = [(0, video(3000)), (1, video(3000))];
+        assert_eq!(similar_av(&short, DEFAULT_THRESHOLD, false), vec![]);
+        assert_eq!(similar_av(&short, DEFAULT_THRESHOLD, true), vec![(0, 1)]);
+        let long = [(0, video(SHORT_VIDEO_MS)), (1, video(SHORT_VIDEO_MS))];
+        assert_eq!(similar_av(&long, DEFAULT_THRESHOLD, false), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn test_re_encoded_video_is_similar() {
+        let dir = tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let Some((a, _, _)) = crate::avhash::tests::videos(&lib) else {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        };
+        let tools = crate::decode::Tools::find();
+        if tools.ffprobe.is_none() {
+            eprintln!("ffprobe not available, skipping");
+            return;
+        }
+        // A newer exact copy of the original.
+        std::fs::create_dir(lib.join("backup")).unwrap();
+        let copy = lib.join("backup/a.mp4");
+        std::fs::copy(&a, &copy).unwrap();
+        let later = std::fs::metadata(&a).unwrap().modified().unwrap()
+            + std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&copy)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let catalog_path = dir.path().join("catalog.sqlite");
+        crate::scan::scan_with(&lib, &catalog_path, true, &tools).unwrap();
+        let catalog = Catalog::open_existing(&catalog_path).unwrap();
+        let report =
+            find_dupes(&catalog, &[], Similarity::with_images(DEFAULT_THRESHOLD)).unwrap();
+        // The re-encoded copy matches; the larger original is kept, not the smaller copy; the
+        // unrelated video is not in any group.
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].tier, Tier::Similar);
+        let files: Vec<(&str, Option<Tier>)> = report.groups[0]
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.matches))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("a.mp4", None),
+                ("backup/a.mp4", Some(Tier::Exact)),
+                ("b.mp4", Some(Tier::Similar)),
+            ]
+        );
+        // Similar video is found without asking for similar images.
+        assert_eq!(
+            find_dupes(&catalog, &[], Similarity::default())
+                .unwrap()
+                .groups
+                .len(),
+            1
+        );
+        // The exact copy is quarantined even though the group is similar; the re-encode is not.
+        let quarantine = dir.path().join("quarantine");
+        let (plan, _) = crate::plan::plan_quarantine(
+            &catalog,
+            &catalog_path,
+            &report,
+            &[],
+            &quarantine,
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        let moved: Vec<&str> = plan.moves.iter().map(|m| m.from.as_str()).collect();
+        let copy = crate::scan::resolve(&copy).unwrap();
+        assert_eq!(moved, vec![copy.to_str().unwrap()]);
     }
 
     #[test]
@@ -1036,10 +1344,12 @@ mod tests {
         std::fs::write(lib.join("backup/a.jpg"), b"same").unwrap();
         std::fs::write(lib.join("other.jpg"), b"diff").unwrap();
         let catalog_path = dir.path().join("catalog.sqlite");
-        crate::scan::scan(&lib, &catalog_path, true).unwrap();
+        crate::scan::scan_with(&lib, &catalog_path, true, &crate::decode::Tools::default())
+            .unwrap();
 
         let catalog = Catalog::open_existing(&catalog_path).unwrap();
-        let report = find_dupes(&catalog, &[], Some(DEFAULT_THRESHOLD)).unwrap();
+        let report =
+            find_dupes(&catalog, &[], Similarity::with_images(DEFAULT_THRESHOLD)).unwrap();
         assert_eq!(report.groups.len(), 1);
         let mut paths: Vec<&str> = report.groups[0]
             .files

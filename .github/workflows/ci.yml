@@ -37,13 +37,22 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
+      # So the tests that need ffmpeg and fpcalc run on at least one OS.
+      - name: Install ffmpeg and fpcalc
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg libchromaprint-tools
       # Tests that need ffmpeg skip themselves without it; this shows which case applies.
-      - name: Show ffmpeg version
+      - name: Show ffmpeg and fpcalc versions
         shell: bash
         run: |
           if command -v ffmpeg > /dev/null; then
             ffmpeg -version | sed -n 1p
           else
             echo "ffmpeg is not on PATH: the tests that need it skip"
+          fi
+          if command -v fpcalc > /dev/null; then
+            fpcalc -version
+          else
+            echo "fpcalc is not on PATH: the tests that need it skip"
           fi
       - run: cargo test

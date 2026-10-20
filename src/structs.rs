@@ -74,17 +74,18 @@ pub struct DupesOpt {
     #[arg(long, value_enum, default_value_t = Format::Text)]
     pub format: Format,
 
-    /// Also find similar images (resized or recompressed copies). Expect burst shots among them
+    /// Also find similar images (resized or recompressed copies) and videos under 4 seconds.
+    /// Expect burst shots among them. Longer similar videos and similar audio are always found
     #[arg(long)]
     pub similar: bool,
 
-    /// How many of the 64 perceptual hash bits two images may differ in to count as similar
-    /// (at most 16)
-    #[arg(long, requires = "similar", default_value_t = DEFAULT_THRESHOLD, value_parser = clap::value_parser!(u32).range(0..=16))]
+    /// How many of the 64 perceptual hash bits two images or video frames may differ in to
+    /// count as similar (at most 16)
+    #[arg(long, default_value_t = DEFAULT_THRESHOLD, value_parser = clap::value_parser!(u32).range(0..=16))]
     pub threshold: u32,
 
-    /// Plan moving all but the kept copy of each exact and same-pixels group to this folder
-    /// (similar groups are never quarantined). Nothing moves until `pixrs apply`
+    /// Plan moving every exact and same-pixel copy of a kept file to this folder (similar files
+    /// are never quarantined). Nothing moves until `pixrs apply`
     #[arg(long, value_name = "DIR")]
     pub quarantine: Option<PathBuf>,
 }
@@ -161,13 +162,14 @@ pub struct ServeOpt {
     #[arg(long)]
     pub cache: Option<PathBuf>,
 
-    /// Also find similar images (resized or recompressed copies). Expect burst shots among them
+    /// Also find similar images (resized or recompressed copies) and videos under 4 seconds.
+    /// Expect burst shots among them. Longer similar videos and similar audio are always found
     #[arg(long)]
     pub similar: bool,
 
-    /// How many of the 64 perceptual hash bits two images may differ in to count as similar
-    /// (at most 16)
-    #[arg(long, requires = "similar", default_value_t = DEFAULT_THRESHOLD, value_parser = clap::value_parser!(u32).range(0..=16))]
+    /// How many of the 64 perceptual hash bits two images or video frames may differ in to
+    /// count as similar (at most 16)
+    #[arg(long, default_value_t = DEFAULT_THRESHOLD, value_parser = clap::value_parser!(u32).range(0..=16))]
     pub threshold: u32,
 
     /// The port to listen on, on localhost only

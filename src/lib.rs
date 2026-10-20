@@ -20,6 +20,7 @@
  *************************************************************************************************/
 
 pub mod apply;
+pub mod avhash;
 pub mod catalog;
 pub mod dates;
 pub mod decode;

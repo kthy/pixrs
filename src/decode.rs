@@ -156,6 +156,31 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
     found.then(|| PathBuf::from(name))
 }
 
+/// The external tools the hash pass can use, found on `PATH`, with their versions.
+#[derive(Clone, Debug, Default)]
+pub struct Tools {
+    pub ffmpeg: Option<(PathBuf, String)>,
+    pub ffprobe: Option<PathBuf>,
+    pub fpcalc: Option<(PathBuf, String)>,
+}
+
+impl Tools {
+    /// The tools on `PATH`.
+    pub fn find() -> Self {
+        Tools {
+            ffmpeg: find_tool("ffmpeg").map(|f| {
+                let version = ffmpeg_version(&f);
+                (f, version)
+            }),
+            ffprobe: find_tool("ffprobe"),
+            fpcalc: find_tool("fpcalc").map(|f| {
+                let version = crate::avhash::fpcalc_version(&f);
+                (f, version)
+            }),
+        }
+    }
+}
+
 /// The major and minor version `ffmpeg -version` reports, e.g. `7.1` for `7.1.5-0+deb13u1`, or
 /// the whole version if it does not start with numbers (git builds), or `unknown`. Patch
 /// releases and distribution updates do not change decoded pixels on purpose.
@@ -173,7 +198,7 @@ pub fn ffmpeg_version(ffmpeg: &Path) -> String {
 }
 
 /// `7.1` for `7.1.5-0+deb13u1` or `n7.1.2`; other versions unchanged.
-fn major_minor(version: &str) -> String {
+pub(crate) fn major_minor(version: &str) -> String {
     let digits = version.trim_start_matches('n');
     let parts: Vec<&str> = digits.splitn(3, '.').collect();
     let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
@@ -201,7 +226,7 @@ pub fn ffmpeg_handles_heic(version: &str) -> bool {
 
 /// Run a tool and return its standard output, or an error with its standard error. Kills it
 /// after `TOOL_TIMEOUT`.
-fn run_with_timeout(mut command: Command) -> Result<Vec<u8>, DecodeError> {
+pub(crate) fn run_with_timeout(mut command: Command) -> Result<Vec<u8>, DecodeError> {
     debug!("Running {:?}", command);
     let mut child = command
         .stdin(Stdio::null())

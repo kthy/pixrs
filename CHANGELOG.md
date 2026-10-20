@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with dates from metadata or file names, an `undated` folder, collision suffixes and sidecar
   files. `pixrs dupes --quarantine <DIR>` plans moving duplicate copies out of the library.
   `pixrs apply` carries out a plan with a journal of every step, and `pixrs undo` reverses it.
+- `pixrs dupes` and the viewer find re-encoded and resized videos (frames at 9 points, with
+  `ffmpeg` and `ffprobe`) and re-encoded audio (Chromaprint fingerprints, with `fpcalc`) as
+  `similar`, without `--similar`; videos under 4 seconds need `--similar`, like images.
+  `--threshold` applies to video frames too and no longer needs `--similar`. Quarantine also
+  moves exact and same-pixel copies in `similar` groups.
 - `pixrs serve` starts a local web viewer on the catalog: browse by folder or date, view images,
   play audio and video, and compare duplicate groups. Thumbnails are cached outside the
   libraries; HEIC, AVIF and video thumbnails use `ffmpeg` if it is on `PATH`. Works offline.

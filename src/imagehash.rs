@@ -36,7 +36,7 @@ pub struct ImageHashes {
 
 /// Version of the hash definitions. Bump it when `pixel_hash`, `perceptual_hash` or the
 /// fingerprint in `hash_small` change, so every image is decoded again.
-const HASH_VERSION: u32 = 2;
+pub const HASH_VERSION: u32 = 2;
 
 /// Side of the grayscale fingerprint in pixels.
 pub const FINGERPRINT_SIDE: u32 = 32;

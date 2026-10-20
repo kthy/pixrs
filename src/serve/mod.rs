@@ -9,7 +9,7 @@ mod pages;
 mod thumbs;
 
 use crate::catalog::{library_path, Catalog, FileRecord};
-use crate::dupes::{group_dupes, load_dupes, DupeReport};
+use crate::dupes::{group_dupes, load_dupes, DupeReport, Similarity};
 use crate::error::Error;
 use crate::scan::resolve;
 use axum::body::Body;
@@ -44,9 +44,8 @@ pub struct Config {
     /// Where thumbnails are cached. Without one, every file gets a placeholder.
     pub cache_dir: Option<PathBuf>,
     pub port: u16,
-    /// Perceptual hash distance up to which images count as similar; `None` to not look for
-    /// similar images.
-    pub similar: Option<u32>,
+    /// How similar files are looked for.
+    pub similarity: Similarity,
 }
 
 /// Shared state of the running viewer.
@@ -58,7 +57,7 @@ pub(crate) struct AppState {
     ffprobe: Option<PathBuf>,
     /// The `Host` header values the viewer answers to.
     hosts: Vec<String>,
-    pub(crate) similar: Option<u32>,
+    pub(crate) similarity: Similarity,
     /// The last duplicate report, so paging through it does not compare every pair of images
     /// again. An async lock, held while a report is made, so concurrent requests share it.
     dupes: tokio::sync::Mutex<Option<CachedDupes>>,
@@ -144,13 +143,13 @@ impl AppState {
             }
         }
         let version = self.query(|catalog| catalog.data_version()).await?;
-        let (libraries, similar) = (self.libraries.clone(), self.similar.is_some());
+        let (libraries, similar) = (self.libraries.clone(), self.similarity.images);
         let input = self
             .query(move |catalog| load_dupes(catalog, &libraries, similar))
             .await?;
         let state = Arc::clone(self);
         let report = tokio::task::spawn_blocking(move || {
-            Arc::new(group_dupes(input, &state.libraries, state.similar))
+            Arc::new(group_dupes(input, &state.libraries, state.similarity))
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -230,7 +229,7 @@ impl AppState {
             thumbs: Thumbnailer::new(config.cache_dir, ffmpeg),
             ffprobe,
             hosts: allowed_hosts(port),
-            similar: config.similar,
+            similarity: config.similarity,
             dupes: tokio::sync::Mutex::new(None),
         }
     }
@@ -457,7 +456,7 @@ mod tests {
             libraries: vec![],
             cache_dir: Some(cache.clone()),
             port: 2635,
-            similar: Some(crate::dupes::DEFAULT_THRESHOLD),
+            similarity: Similarity::with_images(crate::dupes::DEFAULT_THRESHOLD),
         };
         let ffmpeg = ffmpeg.then(|| PathBuf::from("ffmpeg"));
         let app = router(Arc::new(AppState::new(config, 2635, ffmpeg, None)));
