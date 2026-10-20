@@ -38,10 +38,10 @@ jobs:
           tool: cargo-about@0.9.2
       # Offline, as `just notices` runs it, so license texts come from the crates alone.
       - run: cargo fetch --locked
-      - run: cargo about generate --frozen --fail -o target/notices.txt about.hbs
+      - run: cargo about generate --frozen --fail -o "$RUNNER_TEMP/notices.txt" about.hbs
       - name: Check that THIRD_PARTY_NOTICES.txt is current
         run: |
-          diff -u THIRD_PARTY_NOTICES.txt target/notices.txt \
+          diff -u THIRD_PARTY_NOTICES.txt "$RUNNER_TEMP/notices.txt" \
             || { echo "::error::THIRD_PARTY_NOTICES.txt is out of date: run just notices"; exit 1; }
 
   test:
