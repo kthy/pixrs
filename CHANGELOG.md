@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Scanning a folder inside a scanned library scans that part of the library instead of adding
   a second library with the same files. Scanning a folder that contains scanned libraries folds
   them into it, keeping their hashes, instead of reading and hashing their files again.
+- `pixrs scan` shows progress while it walks the library (media files found, current folder) and
+  then how many files it found and how long that took; on a network share the walk alone can take
+  hours. Each step is numbered (`[1/4] Walking` to `[4/4] Decoding`), and the progress bars show
+  an ETA and the rate instead of the estimated total time.
 
 ### Fixed
 
