@@ -9,17 +9,17 @@ set windows-shell := ["pwsh.exe", "-NoLogo", "-Command"]
 
 # Run a full, clean build
 build:
-  cargo clean && cargo build --frozen
+  cargo clean && cargo build --locked
 
 # Lint
 lint:
   cargo fmt --check
-  cargo check --frozen
+  cargo check --locked
   cargo clippy --no-deps
 
 # Regenerate THIRD_PARTY_NOTICES.txt (needs `cargo install --locked cargo-about --features cli`)
 notices:
-  cargo about generate --frozen --fail -o THIRD_PARTY_NOTICES.txt about.hbs
+  cargo about generate --locked --fail -o THIRD_PARTY_NOTICES.txt about.hbs
 
 # Run pre-commit checks
 pre-commit: lint build test
