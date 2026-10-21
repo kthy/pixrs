@@ -55,6 +55,10 @@ tools, those files are cataloged but not compared. Rescanning only reads files t
 whose size or modification time changed, and decodes media again only if an update changed the
 decoders. The library itself is never modified.
 
+Scanning a folder inside a scanned library scans only that part of the library. Scanning a
+folder that contains scanned libraries makes them part of it, keeping their hashes, so a scan
+of `photos/phone` followed by one of `photos` reads the phone's files only once.
+
 ### Report duplicates
 
 ```text

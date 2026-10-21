@@ -22,7 +22,7 @@
 use clap::{CommandFactory, Parser};
 use indicatif::HumanDuration;
 use log::{debug, error};
-use pixrs::catalog::Catalog;
+use pixrs::catalog::{display_root, Catalog};
 use pixrs::dupes::{
     find_dupes, plural, write_csv, write_json, write_text, DupeReport, Similarity, Tier,
 };
@@ -111,6 +111,18 @@ fn library_ids(catalog: &Catalog, libraries: &[PathBuf], context: &str) -> Vec<i
         match id {
             Some(id) => ids.push(id),
             None => {
+                let containing = library
+                    .canonicalize()
+                    .ok()
+                    .and_then(|path| catalog.containing_library(&path).ok().flatten());
+                if let Some((_, root)) = containing {
+                    eprintln!(
+                        "{} is part of the library {}. Pass the library instead.",
+                        library.display(),
+                        display_root(&root)
+                    );
+                    exit(exitcode::USAGE)
+                }
                 eprintln!(
                     "{} has not been scanned. Run `pixrs scan {}` first.",
                     library.display(),
@@ -283,6 +295,19 @@ fn scan(opt: ScanOpt, now: Instant) {
     let catalog = catalog_path(opt.catalog);
     match pixrs::scan::scan(&opt.library, &catalog, opt.quiet) {
         Ok(s) => {
+            for root in &s.folded {
+                println!(
+                    "Folded the library {} into this one, with its hashes.",
+                    root
+                );
+            }
+            if let Some(root) = &s.part_of {
+                println!(
+                    "{} is part of the library {}; scanned only that part.",
+                    opt.library.display(),
+                    root
+                );
+            }
             println!(
                 "Scanned {} in {}: {} added, {} updated, {} removed, {} unchanged, {} hashed, \
                  {} decoded, {} skipped",
