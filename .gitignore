@@ -2,3 +2,4 @@
 *.log
 /target
 /TODO.md
+/.envrc.local
