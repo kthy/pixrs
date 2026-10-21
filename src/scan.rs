@@ -14,12 +14,12 @@ use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, To
 use crate::error::Error;
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanCount, HumanDuration, ProgressBar, ProgressState, ProgressStyle};
 use log::debug;
 use nom_exif::{EntryValue, ExifDateTime, ExifTag, Metadata, TrackInfoTag};
 use ring::digest::{Context, SHA256};
 use std::collections::HashSet;
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::fs::{File, Metadata as FsMetadata};
 use std::io::{self, Read};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -27,7 +27,7 @@ use std::path::{absolute, Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, available_parallelism};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 /// Commit to the catalog after this many files, so an interrupted scan keeps its progress.
@@ -151,12 +151,15 @@ pub fn scan_with(
     let mut unreadable: Vec<String> = vec![];
     let mut pending: Vec<Pending> = vec![];
 
+    // Walk: find the media files and pick out the new and changed ones. On a network share this
+    // alone can take hours, so it shows the folder it is in.
+    let walk = spinner("[1/4] Walking", quiet);
     for entry in WalkDir::new(&start) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
                 let path = e.path().unwrap_or(&start).to_path_buf();
-                warn(&path, &e);
+                walk.suspend(|| warn(&path, &e));
                 if let Some(rel) = relative_path(&root, &path) {
                     unreadable.push(rel);
                 }
@@ -164,14 +167,20 @@ pub fn scan_with(
                 continue;
             }
         };
+        if entry.file_type().is_dir() {
+            let dir = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+            walk.set_message(dir.display().to_string());
+            continue;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
         let Some(media_type) = MediaType::from_path(entry.path()) else {
             continue;
         };
+        walk.inc(1);
         let Some(rel) = relative_path(&root, entry.path()) else {
-            warn(entry.path(), "file name is not valid UTF-8");
+            walk.suspend(|| warn(entry.path(), "file name is not valid UTF-8"));
             summary.skipped += 1;
             continue;
         };
@@ -182,7 +191,7 @@ pub fn scan_with(
         {
             Ok(stamp) => stamp,
             Err(e) => {
-                warn(entry.path(), &e);
+                walk.suspend(|| warn(entry.path(), &e));
                 summary.skipped += 1;
                 seen.insert(rel);
                 continue;
@@ -200,6 +209,13 @@ pub fn scan_with(
         }
         seen.insert(rel);
     }
+    walk.println(format!(
+        "Found {} media files, {} new or changed ({})",
+        HumanCount(walk.position()),
+        HumanCount(pending.len() as u64),
+        HumanDuration(walk.elapsed())
+    ));
+    walk.finish_and_clear();
 
     if seen.is_empty() && !known.is_empty() {
         return Err(Error::Usage(format!(
@@ -211,7 +227,7 @@ pub fn scan_with(
     }
 
     // Pass 1: record new and changed files. A changed file loses its hash until pass 2.
-    let pb = progress_bar(pending.len() as u64, "Reading", false, quiet);
+    let pb = progress_bar(pending.len() as u64, "[2/4] Reading", false, quiet);
     let mut tx = catalog.transaction()?;
     for (i, file) in pending.into_iter().enumerate() {
         if i > 0 && i % COMMIT_EVERY == 0 {
@@ -258,7 +274,7 @@ pub fn scan_with(
     to_hash.retain(|(rel, _)| is_within(rel, &part));
     let pb = progress_bar(
         to_hash.iter().map(|(_, size)| size).sum(),
-        "Hashing",
+        "[3/4] Hashing",
         true,
         quiet,
     );
@@ -329,7 +345,7 @@ pub fn scan_with(
             None => {}
         }
     }
-    let pb = progress_bar(to_decode.len() as u64, "Decoding", false, quiet);
+    let pb = progress_bar(to_decode.len() as u64, "[4/4] Decoding", false, quiet);
     let mut tx = Some(catalog.transaction()?);
     let mut done = 0;
     let files: Vec<(&str, MediaType)> = to_decode
@@ -559,17 +575,37 @@ fn progress_bar(len: u64, prefix: &'static str, bytes: bool, quiet: bool) -> Pro
     }
     let pb = ProgressBar::new(len).with_prefix(prefix);
     let t = if bytes {
-        "{prefix} [{elapsed}/{duration}] {wide_bar:.white/grey} {bytes:>10}/{total_bytes:10} \
-         {msg:.dim}"
+        "{prefix} [{elapsed}, ETA {eta}] {wide_bar:.white/grey} {bytes:>10}/{total_bytes:10} \
+         {binary_bytes_per_sec:>12} {msg:.dim}"
     } else {
-        "{prefix} [{elapsed}/{duration}] {wide_bar:.white/grey} {pos:>6}/{len:6} {msg:.dim}"
+        "{prefix} [{elapsed}, ETA {eta}] {wide_bar:.white/grey} {human_pos:>7}/{human_len:7} \
+         {rate:>8} {msg:.dim}"
     };
     pb.set_style(
         ProgressStyle::default_bar()
             .template(t)
             .expect("Expected a ProgressStyle!")
+            .with_key("rate", |state: &ProgressState, w: &mut dyn fmt::Write| {
+                let _ = write!(w, "{:.1}/s", state.per_sec());
+            })
             .progress_chars("##-"),
     );
+    pb
+}
+
+/// A spinner counting media files, with the current folder as its message.
+fn spinner(prefix: &'static str, quiet: bool) -> ProgressBar {
+    if quiet {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new_spinner().with_prefix(prefix);
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{prefix} [{elapsed}] {spinner} {human_pos} media files {msg:.dim}")
+            .expect("Expected a ProgressStyle!"),
+    );
+    // Tick on a timer, so the spinner moves while a slow folder listing blocks the walk.
+    pb.enable_steady_tick(Duration::from_millis(100));
     pb
 }
 
