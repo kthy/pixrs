@@ -8,7 +8,9 @@
 use crate::avhash::{
     audio_durations_match, audio_match, frames_match, has_detail, video_durations_match, Frame,
 };
-use crate::catalog::{display_root, library_path, Catalog, HashedAv, HashedFile, HashedImage};
+use crate::catalog::{
+    display_root, library_path, one_row_per_file, Catalog, HashedAv, HashedFile, HashedImage,
+};
 use crate::imagehash::{distance, fingerprints_match};
 use indicatif::HumanBytes;
 use serde::Serialize;
@@ -344,13 +346,23 @@ pub fn load_dupes(
     libraries: &[i64],
     similar_images: bool,
 ) -> rusqlite::Result<DupeInput> {
-    Ok(DupeInput {
+    let mut input = DupeInput {
         exact: catalog.duplicate_candidates()?,
         images: catalog.hashed_images(similar_images)?,
         av: catalog.hashed_av()?,
         unhashed_candidates: catalog.count_unhashed_with_shared_size(libraries)?,
         unhashed_media: catalog.count_unhashed(libraries)?,
-    })
+    };
+    let files = input.exact.iter();
+    let files = files.chain(input.images.iter().map(|image| &image.file));
+    let files = files.chain(input.av.iter().map(|av| &av.file));
+    if let Some(keep) = one_row_per_file(files) {
+        let kept = |f: &HashedFile| keep.contains(&(f.library_id, f.path.clone()));
+        input.exact.retain(|f| kept(f));
+        input.images.retain(|image| kept(&image.file));
+        input.av.retain(|av| kept(&av.file));
+    }
+    Ok(input)
 }
 
 /// Find duplicates. Files are linked when they have the same size and SHA-256 (exact), or the
@@ -829,6 +841,21 @@ mod tests {
                 (false, "c.jpg"),
                 (false, "a.jpg")
             ]
+        );
+    }
+
+    #[test]
+    fn test_file_in_overlapping_libraries_is_not_its_own_duplicate() {
+        let fx = Fixture::new();
+        // The same file, cataloged in two libraries by a version that did not fold them.
+        fx.add("/lib", "sub/a.jpg", 100, 10, Some("aaa"));
+        fx.add("/lib/sub", "a.jpg", 100, 10, Some("aaa"));
+        assert_eq!(fx.report().groups.len(), 0);
+
+        fx.add("/lib", "b.jpg", 100, 20, Some("aaa"));
+        assert_eq!(
+            kept_and_others(&fx.report().groups[0]),
+            vec![(true, "sub/a.jpg"), (false, "b.jpg")]
         );
     }
 

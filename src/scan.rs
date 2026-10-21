@@ -9,7 +9,7 @@ use crate::avhash::{
     audio_fingerprint, audio_version, video_signature, video_version, AudioFingerprint,
     VideoSignature,
 };
-use crate::catalog::{library_path, Catalog, FileRecord, MediaMeta, Stamp};
+use crate::catalog::{display_root, library_path, Catalog, FileRecord, MediaMeta, Stamp};
 use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, Tools};
 use crate::error::Error;
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
@@ -61,6 +61,11 @@ pub struct ScanSummary {
     /// 7.1 or later, video without `ffmpeg` and `ffprobe`, audio without `fpcalc`. They are tried
     /// again on every scan.
     pub media_without_decoder: usize,
+    /// The root of the library the scanned folder is part of, if it is not that library's root.
+    /// Only that part of the library was scanned.
+    pub part_of: Option<String>,
+    /// Roots of the libraries inside the scanned one that were folded into it.
+    pub folded: Vec<String>,
 }
 
 /// A media file that is new or changed since the last scan.
@@ -84,6 +89,9 @@ struct Pending {
 /// decoder versions, are decoded; files a decoder rejected are not tried again until they or
 /// the decoders change.
 ///
+/// A folder inside a cataloged library is scanned as that part of the library. Libraries inside
+/// the scanned one are folded into it first, keeping their hashes.
+///
 /// The library itself is only read.
 pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSummary, Error> {
     scan_with(library, catalog_path, quiet, &Tools::find())
@@ -96,37 +104,58 @@ pub fn scan_with(
     quiet: bool,
     tools: &Tools,
 ) -> Result<ScanSummary, Error> {
-    let root = library
+    let start = library
         .canonicalize()
         .ok()
-        .filter(|root| root.is_dir())
+        .filter(|start| start.is_dir())
         .ok_or_else(|| Error::Usage(format!("{} is not a directory", library.display())))?;
-    let root_str = root
+    let start_str = start
         .to_str()
-        .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", root.display())))?;
+        .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", start.display())))?;
     let catalog_path = resolve(catalog_path)?;
-    if catalog_path.starts_with(&root) {
-        return Err(Error::Usage(format!(
-            "The catalog {} must be outside the library {}",
-            catalog_path.display(),
-            root.display()
-        )));
-    }
+    let outside = |root: &Path| {
+        if catalog_path.starts_with(root) {
+            return Err(Error::Usage(format!(
+                "The catalog {} must be outside the library {}",
+                catalog_path.display(),
+                root.display()
+            )));
+        }
+        Ok(())
+    };
+    outside(&start)?;
 
     let catalog = Catalog::open(&catalog_path)?;
-    let library_id = catalog.library_id(root_str)?;
-    let known = catalog.stamps(library_id)?;
-
     let mut summary = ScanSummary::default();
+    // `start` may be part of a library; `root` is the library's root, and paths are relative to
+    // it. `part` is the scanned folder relative to `root`, empty for the whole library.
+    let (library_id, root) = match catalog.containing_library(&start)? {
+        Some((id, root)) => (id, PathBuf::from(root)),
+        None => (catalog.library_id(start_str)?, start.clone()),
+    };
+    outside(&root)?;
+    let part = relative_path(&root, &start)
+        .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", start.display())))?;
+    if !part.is_empty() {
+        summary.part_of = Some(display_root(&root.to_string_lossy()));
+    }
+    summary.folded = catalog
+        .fold_nested(library_id, &root)?
+        .iter()
+        .map(|r| display_root(r))
+        .collect();
+    let mut known = catalog.stamps(library_id)?;
+    known.retain(|rel, _| is_within(rel, &part));
+
     let mut seen: HashSet<String> = HashSet::new();
     let mut unreadable: Vec<String> = vec![];
     let mut pending: Vec<Pending> = vec![];
 
-    for entry in WalkDir::new(&root) {
+    for entry in WalkDir::new(&start) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                let path = e.path().unwrap_or(&root).to_path_buf();
+                let path = e.path().unwrap_or(&start).to_path_buf();
                 warn(&path, &e);
                 if let Some(rel) = relative_path(&root, &path) {
                     unreadable.push(rel);
@@ -175,8 +204,8 @@ pub fn scan_with(
     if seen.is_empty() && !known.is_empty() {
         return Err(Error::Usage(format!(
             "Found no media files in {}, but the catalog lists {} for it. If it is on a drive, \
-             is the drive mounted? The catalog was not changed.",
-            root.display(),
+             is the drive mounted? Nothing was removed from the catalog.",
+            start.display(),
             known.len()
         )));
     }
@@ -225,7 +254,8 @@ pub fn scan_with(
     tx.commit()?;
 
     // Pass 2: hash files that share their size with another file and have no hash yet.
-    let to_hash = catalog.unhashed_with_shared_size(library_id)?;
+    let mut to_hash = catalog.unhashed_with_shared_size(library_id)?;
+    to_hash.retain(|(rel, _)| is_within(rel, &part));
     let pb = progress_bar(
         to_hash.iter().map(|(_, size)| size).sum(),
         "Hashing",
@@ -261,6 +291,9 @@ pub fn scan_with(
     let mut warned_heic = false;
     let mut to_decode: Vec<(String, MediaType, String)> = vec![];
     for (rel, media_type, stored) in catalog.hash_versions(library_id)? {
+        if !is_within(&rel, &part) {
+            continue;
+        }
         let current = match media_type {
             MediaType::Image => match (image_decoder(&rel), ffmpeg_version) {
                 (Some(Decoder::InProcess), _) => hash_version(&rel, ""),
@@ -349,7 +382,9 @@ pub fn scan_with(
         Ok(())
     })?;
     pb.finish_and_clear();
-    catalog.mark_scanned(library_id)?;
+    if part.is_empty() {
+        catalog.mark_scanned(library_id)?;
+    }
     tx.expect("a transaction is open").commit()?;
 
     Ok(summary)
@@ -879,6 +914,7 @@ mod tests {
                 media_hashed: 0,
                 media_undecodable: 2,
                 media_without_decoder: 0,
+                ..Default::default()
             }
         );
         let after = fx.files();
@@ -947,6 +983,61 @@ mod tests {
         // Only files in the library being scanned are hashed; the other library may be offline.
         assert_eq!(scan(&two, &catalog, true).unwrap().hashed, 1);
         assert_eq!(scan(&one, &catalog, true).unwrap().hashed, 1);
+    }
+
+    #[test]
+    fn test_scan_of_folder_inside_library_scans_that_part() {
+        let fx = Fixture::new();
+        fx.write("a/one.jpg", b"1");
+        fx.write("b/two.jpg", b"22");
+        fx.scan();
+        fx.write("a/one.jpg", b"changed");
+        fx.write("a/new.jpg", b"new");
+        remove_file(fx.lib().join("b/two.jpg")).unwrap();
+
+        let part = scan_with(&fx.lib().join("a"), &fx.catalog(), true, &Tools::default());
+        let summary = part.unwrap();
+        assert_eq!((summary.added, summary.updated, summary.removed), (1, 1, 0));
+        let root = fx.lib().canonicalize().unwrap();
+        assert_eq!(summary.part_of, Some(display_root(root.to_str().unwrap())));
+        // No new library, and the rest of the library is left as it was.
+        let catalog = Catalog::open(&fx.catalog()).unwrap();
+        assert_eq!(catalog.libraries().unwrap().len(), 1);
+        assert_eq!(
+            paths(&fx.files()),
+            vec!["a/new.jpg", "a/one.jpg", "b/two.jpg"]
+        );
+
+        assert_eq!(fx.scan().removed, 1);
+    }
+
+    #[test]
+    fn test_scan_of_parent_folds_inner_library() {
+        let fx = Fixture::new();
+        fx.write("sub/a.jpg", b"same");
+        fx.write("sub/b.jpg", b"size");
+        fx.write("c.jpg", b"c");
+        let sub = scan_with(
+            &fx.lib().join("sub"),
+            &fx.catalog(),
+            true,
+            &Tools::default(),
+        );
+        assert_eq!(sub.unwrap().hashed, 2);
+
+        let summary = fx.scan();
+        let inner = fx.lib().join("sub").canonicalize().unwrap();
+        assert_eq!(summary.folded, vec![display_root(inner.to_str().unwrap())]);
+        // The inner library's files are not read or hashed again.
+        assert_eq!(
+            (summary.added, summary.unchanged, summary.hashed),
+            (1, 2, 0)
+        );
+        let catalog = Catalog::open(&fx.catalog()).unwrap();
+        assert_eq!(catalog.libraries().unwrap().len(), 1);
+        let files = fx.files();
+        assert_eq!(paths(&files), vec!["c.jpg", "sub/a.jpg", "sub/b.jpg"]);
+        assert!(files[1].sha256.is_some() && files[2].sha256.is_some());
     }
 
     #[test]

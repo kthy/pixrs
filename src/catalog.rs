@@ -17,9 +17,9 @@ use rusqlite::types::Value;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row, Transaction,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::create_dir_all;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// Schema version, stored in `PRAGMA user_version`.
@@ -202,6 +202,82 @@ impl Catalog {
             .query_row("SELECT id FROM libraries WHERE root = ?1", [root], |row| {
                 row.get(0)
             })
+    }
+
+    /// ID and root of the outermost library whose root is `path` or contains it, if any.
+    pub fn containing_library(&self, path: &Path) -> rusqlite::Result<Option<(i64, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, root FROM libraries")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut outermost: Option<(i64, String)> = None;
+        for row in rows {
+            let (id, root): (i64, String) = row?;
+            let shorter = outermost.as_ref().is_none_or(|(_, o)| root.len() < o.len());
+            if path.starts_with(&root) && shorter {
+                outermost = Some((id, root));
+            }
+        }
+        Ok(outermost)
+    }
+
+    /// Fold every other library inside `root`, the root of `library_id`, into that library:
+    /// its rows move there with the path from `root` to its root in front, keeping their hashes,
+    /// and the library is dropped. Where both have a row for a file with the same size and mtime,
+    /// hashes the outer row lacks are taken from the inner one; otherwise the outer row stays.
+    /// Returns the roots of the folded libraries.
+    pub fn fold_nested(&self, library_id: i64, root: &Path) -> rusqlite::Result<Vec<String>> {
+        let mut inner: Vec<(i64, String, String)> = vec![];
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, root FROM libraries WHERE id != ?1 ORDER BY root")?;
+            let rows = stmt.query_map([library_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            for row in rows {
+                let (id, inner_root): (i64, String) = row?;
+                if let Some(prefix) = rel_root(root, Path::new(&inner_root)) {
+                    inner.push((id, inner_root, prefix));
+                }
+            }
+        }
+        if inner.is_empty() {
+            return Ok(vec![]);
+        }
+        let hash_columns = HASH_COLUMNS
+            .iter()
+            .map(|c| {
+                format!(
+                    "{c} = CASE WHEN o.hash_version IS NULL THEN i.{c} ELSE o.{c} END",
+                    c = c
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, _, prefix) in &inner {
+            self.conn.execute(
+                &format!(
+                    "UPDATE files AS o SET sha256 = coalesce(o.sha256, i.sha256), {}
+                     FROM files AS i
+                     WHERE o.library_id = ?1 AND i.library_id = ?2 AND o.path = ?3 || i.path
+                       AND o.size = i.size AND o.mtime_ns = i.mtime_ns",
+                    hash_columns
+                ),
+                params![library_id, id, prefix],
+            )?;
+            self.conn.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO files (library_id, path, {cols})
+                     SELECT ?1, ?3 || path, {cols} FROM files WHERE library_id = ?2",
+                    cols = MOVED_COLUMNS
+                ),
+                params![library_id, id, prefix],
+            )?;
+            self.conn
+                .execute("DELETE FROM files WHERE library_id = ?1", [id])?;
+            self.conn
+                .execute("DELETE FROM libraries WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(inner.into_iter().map(|(_, root, _)| root).collect())
     }
 
     /// The ID of the library at `root`, if it has been scanned.
@@ -878,7 +954,11 @@ impl Catalog {
                 sha256: row.get(5)?,
             })
         })?;
-        rows.collect()
+        let mut copies: Vec<HashedFile> = rows.collect::<rusqlite::Result<_>>()?;
+        if let Some(keep) = one_row_per_file(&copies) {
+            copies.retain(|f| keep.contains(&(f.library_id, f.path.clone())));
+        }
+        Ok(copies)
     }
 }
 
@@ -998,6 +1078,65 @@ pub struct Page {
 const FILE_COLUMNS: &str =
     "path, size, mtime_ns, media_type, sha256, taken_at, camera_make, camera_model, width, height";
 
+/// Columns the hash pass fills in.
+const HASH_COLUMNS: [&str; 7] = [
+    "hash_version",
+    "pixel_hash",
+    "phash",
+    "fingerprint",
+    "duration_ms",
+    "frames",
+    "chromaprint",
+];
+
+/// Columns `fold_nested` copies, besides the library and path.
+const MOVED_COLUMNS: &str = "size, mtime_ns, media_type, sha256, taken_at, camera_make, \
+     camera_model, width, height, hash_version, pixel_hash, phash, fingerprint, duration_ms, \
+     frames, chromaprint";
+
+/// The path from `outer` to `inner` with `/` separators and a trailing `/`, if `inner` is
+/// strictly inside `outer`.
+fn rel_root(outer: &Path, inner: &Path) -> Option<String> {
+    let rel = inner.strip_prefix(outer).ok()?;
+    let mut prefix = String::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(part) => {
+                prefix.push_str(part.to_str()?);
+                prefix.push('/');
+            }
+            _ => return None,
+        }
+    }
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+/// The rows to keep so that each file on disk has one, or `None` if it already has.
+/// Overlapping libraries, which catalogs scanned before pixrs folded nested libraries can have,
+/// list a file once in each; the row from the outermost library is kept, so a file is never its
+/// own duplicate.
+pub fn one_row_per_file<'a>(
+    files: impl IntoIterator<Item = &'a HashedFile>,
+) -> Option<HashSet<(i64, String)>> {
+    let mut best: HashMap<PathBuf, &HashedFile> = HashMap::new();
+    let mut rows: HashSet<(i64, &str)> = HashSet::new();
+    for f in files {
+        rows.insert((f.library_id, &f.path));
+        best.entry(library_path(Path::new(&f.root), &f.path))
+            .and_modify(|b| {
+                if f.root.len() < b.root.len() {
+                    *b = f;
+                }
+            })
+            .or_insert(f);
+    }
+    let keep: HashSet<(i64, String)> = best
+        .into_values()
+        .map(|f| (f.library_id, f.path.clone()))
+        .collect();
+    (keep.len() < rows.len()).then_some(keep)
+}
+
 /// SQL for a file's date: the first 19 characters of `taken_at` (the camera's local time in both
 /// stored formats), or else the mtime in local time.
 const DATE_KEY: &str = "coalesce(substr(taken_at, 1, 19), \
@@ -1111,6 +1250,77 @@ mod tests {
             sha256: None,
             meta: MediaMeta::default(),
         }
+    }
+
+    #[test]
+    fn test_fold_nested_moves_rows_and_keeps_hashes() {
+        let dir = tempdir().unwrap();
+        let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+        let outer = catalog.library_id("/lib").unwrap();
+        let inner = catalog.library_id("/lib/sub").unwrap();
+        // Its root starts with the same characters, but it is not inside `/lib`.
+        let other = catalog.library_id("/library").unwrap();
+        let hashed = |path: &str, size: u64, sha256: &str| FileRecord {
+            sha256: Some(String::from(sha256)),
+            ..record(path, size)
+        };
+        catalog.upsert(inner, &hashed("a.jpg", 1, "aaa")).unwrap();
+        catalog.upsert(inner, &hashed("b.jpg", 1, "bbb")).unwrap();
+        catalog
+            .set_image_hashes(inner, "b.jpg", "v1", None)
+            .unwrap();
+        catalog.upsert(inner, &hashed("c.jpg", 2, "ccc")).unwrap();
+        // The outer library lists b.jpg too, unhashed but unchanged, and c.jpg with another size.
+        catalog.upsert(outer, &record("sub/b.jpg", 1)).unwrap();
+        catalog.upsert(outer, &record("sub/c.jpg", 3)).unwrap();
+        catalog.upsert(outer, &record("x.jpg", 1)).unwrap();
+        catalog.upsert(other, &record("y.jpg", 1)).unwrap();
+
+        let folded = catalog.fold_nested(outer, Path::new("/lib")).unwrap();
+        assert_eq!(folded, vec![String::from("/lib/sub")]);
+        assert_eq!(
+            catalog.files(outer).unwrap(),
+            vec![
+                hashed("sub/a.jpg", 1, "aaa"),
+                hashed("sub/b.jpg", 1, "bbb"),
+                record("sub/c.jpg", 3),
+                record("x.jpg", 1),
+            ]
+        );
+        let versions: Vec<Option<String>> = catalog
+            .hash_versions(outer)
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, version)| version)
+            .collect();
+        assert_eq!(versions, vec![None, Some(String::from("v1")), None, None]);
+        let roots: Vec<String> = catalog
+            .libraries()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.root)
+            .collect();
+        assert_eq!(roots, vec!["/lib", "/library"]);
+        assert_eq!(
+            catalog.fold_nested(outer, Path::new("/lib")).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_containing_library_is_the_outermost() {
+        let dir = tempdir().unwrap();
+        let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+        let outer = catalog.library_id("/lib").unwrap();
+        catalog.library_id("/lib/sub").unwrap();
+        catalog.library_id("/library").unwrap();
+        let found = |path: &str| catalog.containing_library(Path::new(path)).unwrap();
+        assert_eq!(
+            found("/lib/sub/deeper"),
+            Some((outer, String::from("/lib")))
+        );
+        assert_eq!(found("/lib"), Some((outer, String::from("/lib"))));
+        assert_eq!(found("/elsewhere"), None);
     }
 
     #[test]

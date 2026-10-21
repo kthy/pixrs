@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Scanning a folder inside a scanned library scans that part of the library instead of adding
+  a second library with the same files. Scanning a folder that contains scanned libraries folds
+  them into it, keeping their hashes, instead of reading and hashing their files again.
+
+### Fixed
+
+- A file cataloged in two overlapping libraries (one scanned inside the other) was reported as
+  a duplicate of itself, and `dupes --quarantine` planned to move it, leaving no copy in the
+  library. `dupes` and the viewer now count each file on disk once.
+
 ## [0.2.0] - 2026-10-20
 
 ### Added

@@ -23,7 +23,11 @@ The planned shape, tracked in GitHub issues #32 to #37 (one per step):
 
 - `scan`: walk the library into a SQLite catalog (path, size, mtime, media type, EXIF fields),
   then hash only files whose size matches another cataloged file. Incremental: only reread files
-  whose path, size or mtime changed.
+  whose path, size or mtime changed. Libraries never overlap: scanning a folder inside a
+  library scans that part of the library, and scanning a folder that contains libraries folds
+  them into it (rows move with their hashes; where both list a file with the same size and
+  mtime, the outer row takes the hashes it lacks). `dupes` and the viewer keep one row per file
+  on disk, for catalogs from 0.2.0 that already have overlapping libraries.
 - `dupes`: tiered matching. Group by size, then content hash, then hash of decoded pixels
   (same image, different metadata), then perceptual hash (resized or recompressed copies).
   Fuzzy video and audio matching comes last.
