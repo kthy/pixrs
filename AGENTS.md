@@ -91,8 +91,9 @@ Decided details:
   symbolic links, which could lead anywhere (the scan does not follow links, so a link inside a
   library is not cataloged and nothing else sees it): a plan puts no file into a folder that is a
   link, in any letter case, and warns; `apply` and `undo` skip a move whose source or target folder
-  is reached through a link (`through_symlink`: the parts below the plan's roots, or where no root
-  is known, the nearest existing folder must be canonical). Folders left empty stay unless
+  is reached through a link (`through_symlink`: `apply` checks the parts below the plan's library
+  root and `destination`; `undo` has no plan, so there the target's nearest existing folder must be
+  canonical, as resolved roots are). Folders left empty stay unless
   `--prune-empty` is given. Each move checks that the file still matches the plan (size, mtime) and
   that the target is free, else skips it; a move that fails before anything changed is skipped too,
   and a folder that cannot be read counts as taken, and only a half-done move stops `apply`. `undo`

@@ -7,7 +7,7 @@
 
 use crate::catalog::{Catalog, CatalogRow};
 use crate::error::Error;
-use crate::plan::{state_dir, Keeper, Move, Plan, PlanKind};
+use crate::plan::{state_dir, Keeper, Move, Plan};
 use ring::digest::{Context, SHA256};
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
@@ -502,8 +502,9 @@ fn changed(path: &Path, size: u64, mtime_ns: i64) -> Option<String> {
 
 /// Whether a symbolic link is on the way to `dir`, so that it is somewhere else than its path
 /// says. With a `base` that `dir` is below, the parts after `base` are checked, as far as they
-/// exist: the rest are created below them. Without one, the nearest existing ancestor of `dir`
-/// must be where its path says (canonical), as the roots plans are made from are.
+/// exist: the rest are created below them. Without one (`undo` has no plan), the nearest
+/// existing ancestor of `dir` must be where its path says (canonical), as the roots plans are
+/// made from are.
 fn through_symlink(dir: &Path, base: Option<&Path>) -> io::Result<bool> {
     match base {
         Some(base) if dir.starts_with(base) => {
@@ -532,20 +533,22 @@ fn through_symlink(dir: &Path, base: Option<&Path>) -> io::Result<bool> {
 /// does not follow links, so this is where it is caught.
 fn misplaced(m: &Move, plan: &Plan) -> Option<String> {
     let (from, to) = (Path::new(&m.from), Path::new(&m.to));
-    let base_of = |dir: &Path| -> Option<&Path> {
-        let roots = plan.libraries.iter().map(|l| Path::new(l.root.as_str()));
-        let quarantine =
-            (plan.kind == PlanKind::Quarantine).then(|| Path::new(plan.description.as_str()));
-        roots.chain(quarantine).find(|base| dir.starts_with(base))
-    };
-    for (what, dir) in [
-        ("its folder", from.parent()),
-        ("its target folder", to.parent()),
+    // `Plan::check` has seen to it that the source is in one of the plan's libraries and the
+    // target below its destination; the parts below those are what a link can hide in.
+    let root = plan
+        .libraries
+        .iter()
+        .map(|l| Path::new(l.root.as_str()))
+        .find(|root| from.starts_with(root));
+    let destination = Some(Path::new(plan.destination.as_str()));
+    for (what, dir, base) in [
+        ("its folder", from.parent(), root),
+        ("its target folder", to.parent(), destination),
     ] {
         let Some(dir) = dir else {
             continue;
         };
-        match through_symlink(dir, base_of(dir)) {
+        match through_symlink(dir, base) {
             Ok(false) => {}
             Ok(true) => {
                 return Some(format!(
