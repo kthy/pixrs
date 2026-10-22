@@ -47,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mtime, and both commands refuse a catalog path that does not hold a pixrs catalog.
 - `pixrs scan` no longer prints `nom_exif` errors in the middle of the progress bars (files it
   cannot read are already reported); set `RUST_LOG` to see dependencies' log output.
+- `pixrs apply` carried out whatever moves a plan file listed, so a crafted or edited plan
+  could move any file of known size and mtime anywhere, and a sidecar entry pointing at a
+  move that did not exist crashed it. A plan is now checked as a whole before anything
+  happens: every move must start in one of the plan's libraries and end below the plan's
+  target folder (the library, the `--to` folder or the quarantine folder), and must refer to
+  earlier media moves and the plan's libraries only. The plan file format is now version 2
+  (it records the target folder); plans written by 0.2.0 must be made again.
 - `pixrs scan` stops when the library disappears (an unplugged drive, a dropped network share)
   while reading metadata or hashing, as it already did while decoding, instead of failing on
   every remaining file. What was scanned so far is kept.

@@ -564,6 +564,8 @@ fn apply_journaled(
     opts: &ApplyOptions,
     journal_out: &mut Option<PathBuf>,
 ) -> Result<ApplySummary, Error> {
+    // `read_plan` checks too; a plan built in code is checked here.
+    plan.check()?;
     let catalog_path = Path::new(&plan.catalog);
     let catalog = Catalog::open_for_update(catalog_path)?;
     let _lock = Lock::take(catalog_path)?;
@@ -1800,5 +1802,19 @@ mod tests {
         );
         assert!(matches!(undo(&journal), Err(Error::Usage(_))));
         assert!(!missing.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn test_a_faulty_plan_is_refused_before_anything_happens() {
+        let f = fixture(FILES);
+        let before = tree(&f.root);
+        let (plan_path, mut plan) = organize_plan(&f, "{type}/{name}.{ext}", false);
+        plan.moves[0].sidecar_of = Some(99);
+        let error = apply(&plan_path, &plan).unwrap_err();
+        assert!(matches!(error.error, Error::Usage(_)), "{}", error.error);
+        assert!(error.journal.is_none());
+        assert_eq!(tree(&f.root), before);
+        assert!(!state_dir(&f.catalog_path, "journals").exists());
+        assert!(!state_dir(&f.catalog_path, "pixrs.lock").exists());
     }
 }

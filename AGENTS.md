@@ -75,7 +75,12 @@ Decided details:
 - Organize commands: `pixrs organize` and `pixrs dupes --quarantine <DIR>` only write a plan
   file (and print a summary); `pixrs apply <PLAN>` carries out either kind of plan and
   `pixrs undo <JOURNAL>` reverses it. An interrupted `apply` is not resumed: undo it and plan
-  again. Plans and journals live next to the catalog (`plans/`, `journals/`).
+  again. Plans and journals live next to the catalog (`plans/`, `journals/`). A plan file is
+  input like any other file: `Plan::check` (run by `read_plan` and `apply`, before the lock is
+  taken) refuses a plan unless every source is inside one of the plan's libraries, every target
+  is below the plan's `destination` (the library root, the `--to` folder or the quarantine
+  folder, which must not overlap a library), sidecar moves point at earlier media moves, and
+  the library ids and kept copies are the plan's. Plan format version 2 added `destination`.
 - Organize details: moves never overwrite (collisions get the suffix; compared case-insensitively
   on every OS, so plans are the same everywhere; a rename that only changes letter case is refused
   if another file has exactly the new name). Target folders that differ from an existing folder

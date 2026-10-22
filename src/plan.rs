@@ -22,8 +22,8 @@ use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
-/// Version of the plan file format.
-const PLAN_VERSION: u32 = 1;
+/// Version of the plan file format. Version 2 added `destination`.
+const PLAN_VERSION: u32 = 2;
 
 /// Extensions of files that belong to a media file with the same name, lowercase: edits
 /// (`xmp`), iPhone edit lists (`aae`), video thumbnails (`thm`), subtitles (`srt`) and Google
@@ -88,10 +88,80 @@ pub struct Plan {
     pub catalog: String,
     /// The template, or the quarantine folder.
     pub description: String,
+    /// The folder every move goes below: the one the files are organized into (the library
+    /// root, or the `--to` folder), or the quarantine folder. Missing from version 1 plans,
+    /// which still parse so that they are refused by version, with a message.
+    #[serde(default)]
+    pub destination: String,
     pub libraries: Vec<PlanLibrary>,
     /// Remove folders the moves leave empty.
     pub prune_empty: bool,
     pub moves: Vec<Move>,
+}
+
+impl Plan {
+    /// Why the plan must not be carried out, if it must not: a plan file is input like any
+    /// other file, so before anything is moved every source must be in one of the plan's
+    /// libraries, every target below its destination, and the moves must refer to each other
+    /// and to the libraries consistently.
+    pub fn check(&self) -> Result<(), Error> {
+        let fault =
+            |what: String| Error::Usage(format!("The plan cannot be carried out: {}", what));
+        let below = |path: &str, folder: &str| {
+            let (path, folder) = (Path::new(path), Path::new(folder));
+            path.starts_with(folder) && path != folder
+        };
+        let in_a_library = |path: &str| {
+            self.libraries
+                .iter()
+                .any(|library| below(path, &library.root))
+        };
+        let known = |library_id: i64| self.libraries.iter().any(|l| l.id == library_id);
+        if self.kind == PlanKind::Quarantine {
+            for library in &self.libraries {
+                if below(&self.destination, &library.root)
+                    || below(&library.root, &self.destination)
+                    || library.root == self.destination
+                {
+                    return Err(fault(format!(
+                        "the quarantine folder {} and the library {} overlap",
+                        self.destination,
+                        display_root(&library.root)
+                    )));
+                }
+            }
+        }
+        for (index, m) in self.moves.iter().enumerate() {
+            let fault = |what: &str| fault(format!("move {} ({}) {}", index + 1, m.from, what));
+            if !in_a_library(&m.from) {
+                return Err(fault("is not in a library of the plan"));
+            }
+            if !below(&m.to, &self.destination) {
+                return Err(fault(&format!("goes outside {}", self.destination)));
+            }
+            if let Some(media) = m.sidecar_of {
+                let earlier_media = media < index && self.moves[media].sidecar_of.is_none();
+                if !earlier_media {
+                    return Err(fault(
+                        "is a sidecar of a move that is not an earlier media move",
+                    ));
+                }
+            }
+            for (library_id, _) in m.cataloged.iter().chain(&m.cataloged_to) {
+                if !known(*library_id) {
+                    return Err(fault("refers to a library that is not in the plan"));
+                }
+            }
+            if let Some(keeper) = &m.keeper {
+                if !in_a_library(&keeper.path) {
+                    return Err(fault(
+                        "has a kept copy that is not in a library of the plan",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What planning found, besides the moves.
@@ -463,6 +533,7 @@ pub fn plan_organize(
         created: timestamp(opts.now),
         catalog: utf8(catalog_path, "Catalog")?,
         description: String::from(opts.template.source()),
+        destination: utf8(&base, "Target folder")?,
         libraries: vec![PlanLibrary {
             id: library_id,
             root: utf8(root, "Library")?,
@@ -595,6 +666,7 @@ pub fn plan_quarantine(
         created: timestamp(now),
         catalog: utf8(catalog_path, "Catalog")?,
         description: utf8(dir, "Quarantine folder")?,
+        destination: utf8(dir, "Quarantine folder")?,
         libraries: libraries
             .iter()
             .filter(|l| involved.contains(&l.id))
@@ -671,12 +743,14 @@ pub fn read_plan(path: &Path) -> Result<Plan, Error> {
         .map_err(|e| Error::Usage(format!("{} is not a plan file: {}", path.display(), e)))?;
     if plan.version != PLAN_VERSION {
         return Err(Error::Usage(format!(
-            "{} has plan version {}, but this version of pixrs only understands version {}",
+            "{} has plan version {}, but this version of pixrs only understands version {}; \
+             plan again",
             path.display(),
             plan.version,
             PLAN_VERSION
         )));
     }
+    plan.check()?;
     Ok(plan)
 }
 
@@ -943,5 +1017,101 @@ mod tests {
         assert!(outside_libraries(&f.catalog, parent, "Quarantine").is_err());
         assert!(outside_libraries(&f.catalog, &f.root.join("q"), "Quarantine").is_err());
         assert!(outside_libraries(&f.catalog, &parent.join("q"), "Quarantine").is_ok());
+    }
+
+    #[test]
+    fn test_plans_are_checked() {
+        let f = fixture(&[("a/1.jpg", None)]);
+        fs::write(f.root.join("a/1.xmp"), b"edits").unwrap();
+        let (plan, _) = organize(&f, "{name}.{ext}", false);
+        assert_eq!(plan.moves.len(), 2);
+        assert_eq!(plan.moves[1].sidecar_of, Some(0));
+        plan.check().unwrap();
+        let outside = f.root.parent().unwrap().join("elsewhere.jpg");
+        let outside = outside.to_str().unwrap();
+        let faults: Vec<(&str, Box<dyn Fn(&mut Plan)>)> = vec![
+            (
+                "sidecar of a later move",
+                Box::new(|p| p.moves[1].sidecar_of = Some(5)),
+            ),
+            (
+                "sidecar of itself",
+                Box::new(|p| p.moves[1].sidecar_of = Some(1)),
+            ),
+            (
+                "sidecar of a sidecar",
+                Box::new(|p| p.moves[0].sidecar_of = Some(1)),
+            ),
+            (
+                "source outside",
+                Box::new(|p| p.moves[0].from = String::from(outside)),
+            ),
+            (
+                "target outside",
+                Box::new(|p| p.moves[0].to = String::from(outside)),
+            ),
+            (
+                "target is the destination",
+                Box::new(|p| p.moves[0].to = p.destination.clone()),
+            ),
+            (
+                "unknown library",
+                Box::new(|p| p.moves[0].cataloged = Some((99, String::from("1.jpg")))),
+            ),
+            (
+                "unknown library at the target",
+                Box::new(|p| p.moves[0].cataloged_to = Some((99, String::from("1.jpg")))),
+            ),
+            (
+                "kept copy outside",
+                Box::new(|p| {
+                    p.moves[0].keeper = Some(Keeper {
+                        path: String::from(outside),
+                        size: 1,
+                        mtime_ns: 0,
+                    })
+                }),
+            ),
+            (
+                "quarantine folder is the library",
+                Box::new(|p| {
+                    p.kind = PlanKind::Quarantine;
+                    p.destination = p.libraries[0].root.clone();
+                }),
+            ),
+            (
+                "quarantine folder contains the library",
+                Box::new(|p| {
+                    p.kind = PlanKind::Quarantine;
+                    p.destination = String::from(f.root.parent().unwrap().to_str().unwrap());
+                    for m in &mut p.moves {
+                        m.to = m.to.replace("lib", "lib_2");
+                    }
+                }),
+            ),
+        ];
+        for (what, fault) in faults {
+            let mut faulty = plan.clone();
+            fault(&mut faulty);
+            let err = faulty.check().unwrap_err();
+            assert!(matches!(err, Error::Usage(_)), "{}: {}", what, err);
+        }
+        // Moving the files into a folder outside the library, or another library's copies into
+        // quarantine, is fine.
+        let mut moved_out = plan.clone();
+        moved_out.destination = String::from(f.root.parent().unwrap().to_str().unwrap());
+        for m in &mut moved_out.moves {
+            m.to = m.to.replace("lib", "sorted");
+        }
+        moved_out.check().unwrap();
+
+        // A plan from before the target folder was recorded is refused by its version.
+        let path = write_plan(&plan, datetime!(2026-10-20 12:00 UTC)).unwrap();
+        let old = fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"version\": 2", "\"version\": 1");
+        fs::write(&path, old).unwrap();
+        let err = read_plan(&path).unwrap_err();
+        assert!(err.to_string().contains("plan version 1"), "{}", err);
     }
 }
