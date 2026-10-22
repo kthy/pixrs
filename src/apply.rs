@@ -565,7 +565,7 @@ fn apply_journaled(
     journal_out: &mut Option<PathBuf>,
 ) -> Result<ApplySummary, Error> {
     let catalog_path = Path::new(&plan.catalog);
-    let catalog = Catalog::open(catalog_path)?;
+    let catalog = Catalog::open_for_update(catalog_path)?;
     let _lock = Lock::take(catalog_path)?;
     let (mut journal, journal_path) = new_journal(plan_path, catalog_path)?;
     *journal_out = Some(journal_path.clone());
@@ -798,7 +798,8 @@ fn locate(from: &Path, to: &Path, size: u64, mtime_ns: i64, had_copy: bool) -> i
         (None, false) => neither(),
         (Some(_), true) if same_file(from, to) => Found::AtSource,
         (Some(meta), true) => {
-            if had_copy && meta.len() == size && sha256_of(to)? == sha256_of(from)? {
+            // A copy pixrs made has the source's mtime too.
+            if had_copy && matches(&meta, size, mtime_ns) && sha256_of(to)? == sha256_of(from)? {
                 Found::Copied
             } else {
                 Found::Unclear(format!(
@@ -889,6 +890,39 @@ struct ViaFile {
     source: Option<PathBuf>,
 }
 
+/// Whether `path` is named like a temporary file `reserve_temp` makes:
+/// `.pixrs-<pid>-<nanos>-<n>.tmp`.
+fn is_temp_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(numbers) = name
+        .strip_prefix(".pixrs-")
+        .and_then(|n| n.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let parts: Vec<&str> = numbers.split('-').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether a `Via` record describes a temporary file pixrs makes for the move `from` -> `to`:
+/// named like one, in the folder of `to` (made by `apply`) or of `from` (made by `undo`), and
+/// for a copy, copied from one of the two. Undo removes and renames the files such records
+/// name, so a journal must not be able to point them at anything else.
+fn via_belongs_to(via: &ViaFile, from: &Path, to: &Path) -> bool {
+    let in_place = [to.parent(), from.parent()].contains(&via.path.parent());
+    let source_ok = match (via.kind, via.source.as_deref()) {
+        (ViaKind::Copy, Some(source)) => source == from || source == to,
+        (ViaKind::Copy, None) => false,
+        (ViaKind::Stop, _) => true,
+    };
+    is_temp_name(&via.path) && in_place && source_ok
+}
+
 /// Reverse everything the journal at `path` records, as far as it got. Safe to run again, also
 /// after a crash: it looks at where each file actually is, and journals its own steps.
 pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
@@ -900,7 +934,7 @@ pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
         )));
     };
     let catalog_path = PathBuf::from(catalog);
-    let catalog = Catalog::open(&catalog_path)?;
+    let catalog = Catalog::open_for_update(&catalog_path)?;
     let _lock = Lock::take(&catalog_path)?;
     let mut journal = append_to(path)?;
     let mut summary = UndoSummary::default();
@@ -938,8 +972,26 @@ pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
         }
     }
 
-    // Folders the moves emptied come back first, so files can go back into them.
+    // Folders the moves emptied come back first, so files can go back into them. Only folders
+    // a moved file came out of were ever removed, so only those come back.
+    let sources: Vec<&Path> = intents
+        .iter()
+        .filter_map(|record| match record {
+            Record::Intent { from, .. } => Some(Path::new(from)),
+            _ => None,
+        })
+        .collect();
     for dir in removed.iter().rev() {
+        if !sources
+            .iter()
+            .any(|from| from.starts_with(dir) && *from != dir)
+        {
+            summary.warnings.push(format!(
+                "{} is not a folder a moved file came from; not recreated",
+                dir.display()
+            ));
+            continue;
+        }
         if let Err(e) = fs::create_dir_all(dir) {
             summary
                 .warnings
@@ -961,7 +1013,18 @@ pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
             continue;
         };
         let (from, to) = (Path::new(from), Path::new(to));
-        let index_vias = vias.remove(index).unwrap_or_default();
+        let mut index_vias = vias.remove(index).unwrap_or_default();
+        index_vias.retain(|via| {
+            let ours = via_belongs_to(via, from, to);
+            if !ours {
+                summary.warnings.push(format!(
+                    "{} is not a temporary file of the move of {}; left alone",
+                    via.path.display(),
+                    from.display()
+                ));
+            }
+            ours
+        });
         for via in &index_vias {
             clean_up_via(via, from, *size, *mtime_ns, &mut summary.warnings);
         }
@@ -1536,5 +1599,206 @@ mod tests {
             summary.skipped
         );
         assert!(kept.is_file() && other.is_file());
+    }
+
+    /// A journal file of the given records, next to the fixture's catalog.
+    fn write_journal(f: &Fixture, name: &str, records: &[Record]) -> PathBuf {
+        let path = f.dir.path().join(name);
+        let lines: Vec<String> = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        path
+    }
+
+    fn start(f: &Fixture) -> Record {
+        Record::Start {
+            plan: String::from("crafted"),
+            catalog: f.catalog_path.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn intent(index: usize, from: &Path, to: &Path, size: u64, mtime_ns: i64) -> Record {
+        Record::Intent {
+            index,
+            from: from.to_string_lossy().into_owned(),
+            to: to.to_string_lossy().into_owned(),
+            size,
+            mtime_ns,
+            cataloged: None,
+            cataloged_to: None,
+        }
+    }
+
+    fn via(index: usize, path: &Path, kind: ViaKind, source: Option<&Path>) -> Record {
+        Record::Via {
+            index,
+            path: path.to_string_lossy().into_owned(),
+            kind,
+            source: source.map(|s| s.to_string_lossy().into_owned()),
+        }
+    }
+
+    #[test]
+    fn test_is_temp_name() {
+        assert!(is_temp_name(Path::new("/x/.pixrs-12-345-6.tmp")));
+        assert!(!is_temp_name(Path::new("/x/.pixrs-12-345.tmp")));
+        assert!(!is_temp_name(Path::new("/x/.pixrs-12-345-6.tmp.jpg")));
+        assert!(!is_temp_name(Path::new("/x/pixrs-12-345-6.tmp")));
+        assert!(!is_temp_name(Path::new("/x/.pixrs-1a-345-6.tmp")));
+        assert!(!is_temp_name(Path::new("/x/photo.jpg")));
+    }
+
+    #[test]
+    fn test_undo_only_touches_pixrs_temporary_files() {
+        let f = fixture(&[("photo.jpg", b"x")]);
+        let dir = f.dir.path().join("elsewhere");
+        fs::create_dir(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, b"precious").unwrap();
+        let empty = dir.join("empty.txt");
+        fs::write(&empty, b"").unwrap();
+        // A temporary name in the wrong folder, and a copy of something else.
+        let elsewhere = f.dir.path().join(".pixrs-1-2-3.tmp");
+        fs::write(&elsewhere, b"").unwrap();
+        let other = dir.join(".pixrs-1-2-4.tmp");
+        fs::write(&other, b"half").unwrap();
+        let (from, to) = (dir.join("from.jpg"), f.root.join("to.jpg"));
+        let journal = write_journal(
+            &f,
+            "crafted.jsonl",
+            &[
+                start(&f),
+                intent(0, &from, &to, 8, 0),
+                via(0, &victim, ViaKind::Copy, Some(&victim)),
+                via(0, &empty, ViaKind::Stop, None),
+                via(0, &elsewhere, ViaKind::Stop, None),
+                via(0, &other, ViaKind::Copy, Some(&victim)),
+            ],
+        );
+        let summary = undo(&journal).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(fs::read(&empty).unwrap(), b"");
+        assert_eq!(fs::read(&elsewhere).unwrap(), b"");
+        assert_eq!(fs::read(&other).unwrap(), b"half");
+        assert_eq!(summary.moved_back, 0);
+        let left_alone = summary
+            .warnings
+            .iter()
+            .filter(|w| w.ends_with("left alone"))
+            .count();
+        assert_eq!(left_alone, 4, "{:?}", summary.warnings);
+    }
+
+    #[test]
+    fn test_undo_removes_only_a_copy_pixrs_made() {
+        let f = fixture(&[("photo.jpg", b"x")]);
+        let (from, to) = (f.root.join("a.jpg"), f.root.join("b").join("a.jpg"));
+        fs::create_dir(to.parent().unwrap()).unwrap();
+        fs::write(&from, b"the same bytes").unwrap();
+        fs::write(&to, b"the same bytes").unwrap();
+        let stamp = crate::scan::stamp(&fs::metadata(&from).unwrap()).unwrap();
+        let temp = to.with_file_name(".pixrs-1-2-3.tmp");
+        let journal = write_journal(
+            &f,
+            "copied.jsonl",
+            &[
+                start(&f),
+                intent(0, &from, &to, stamp.size, stamp.mtime_ns),
+                via(0, &temp, ViaKind::Copy, Some(&from)),
+            ],
+        );
+        // Same bytes, but not the mtime pixrs gives a copy: another file. Both stay.
+        let other_time = system_time(stamp.mtime_ns - 3_600_000_000_000);
+        File::options()
+            .write(true)
+            .open(&to)
+            .unwrap()
+            .set_modified(other_time)
+            .unwrap();
+        let summary = undo(&journal).unwrap();
+        assert!(to.exists() && from.exists());
+        assert_eq!(summary.warnings.len(), 1, "{:?}", summary.warnings);
+        // With the copy's mtime, it is the copy pixrs made, and goes.
+        File::options()
+            .write(true)
+            .open(&to)
+            .unwrap()
+            .set_modified(system_time(stamp.mtime_ns))
+            .unwrap();
+        let summary = undo(&journal).unwrap();
+        assert!(!to.exists() && from.exists());
+        assert_eq!(summary.warnings, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_undo_recreates_only_folders_a_moved_file_came_from() {
+        let f = fixture(&[("photo.jpg", b"x")]);
+        let from = f.root.join("gone").join("a.jpg");
+        let unrelated = f.dir.path().join("unrelated");
+        let journal = write_journal(
+            &f,
+            "rmdir.jsonl",
+            &[
+                start(&f),
+                Record::Rmdir {
+                    path: unrelated.to_string_lossy().into_owned(),
+                },
+                Record::Rmdir {
+                    path: from.parent().unwrap().to_string_lossy().into_owned(),
+                },
+                intent(0, &from, &f.root.join("a.jpg"), 1, 0),
+            ],
+        );
+        let summary = undo(&journal).unwrap();
+        assert!(!unrelated.exists());
+        assert!(from.parent().unwrap().is_dir());
+        assert!(summary.warnings.iter().any(|w| w.contains("not recreated")));
+    }
+
+    #[test]
+    fn test_apply_and_undo_need_an_existing_catalog() {
+        let f = fixture(&[("photo.jpg", b"x")]);
+        let missing = f.dir.path().join("nowhere").join("catalog.sqlite");
+        let (plan_path, mut plan) = organize_plan(&f, "{type}/{name}.{ext}", false);
+        plan.catalog = missing.to_string_lossy().into_owned();
+        assert!(matches!(
+            apply(&plan_path, &plan).unwrap_err().error,
+            Error::Usage(_)
+        ));
+        assert!(!missing.parent().unwrap().exists());
+        assert!(f.root.join("photo.jpg").exists());
+
+        // A SQLite file that is not a catalog is left as it is.
+        let foreign = f.dir.path().join("places.sqlite");
+        let conn = rusqlite::Connection::open(&foreign).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE moz_places (url TEXT); INSERT INTO moz_places VALUES ('x');",
+        )
+        .unwrap();
+        drop(conn);
+        let before = fs::read(&foreign).unwrap();
+        let journal = write_journal(
+            &f,
+            "foreign.jsonl",
+            &[Record::Start {
+                plan: String::from("crafted"),
+                catalog: foreign.to_string_lossy().into_owned(),
+            }],
+        );
+        assert!(matches!(undo(&journal), Err(Error::Usage(_))));
+        assert_eq!(fs::read(&foreign).unwrap(), before);
+        assert!(!f.dir.path().join("pixrs.lock").exists());
+        let journal = write_journal(
+            &f,
+            "missing.jsonl",
+            &[Record::Start {
+                plan: String::from("crafted"),
+                catalog: missing.to_string_lossy().into_owned(),
+            }],
+        );
+        assert!(matches!(undo(&journal), Err(Error::Usage(_))));
+        assert!(!missing.parent().unwrap().exists());
     }
 }
