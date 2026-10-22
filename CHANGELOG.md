@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pixels per side and 512 MiB of pixels (about 130 megapixels in color), from files up to
   512 MiB; anything beyond counts as undecodable and is left out of same-pixel and similarity
   matching.
+- `ffmpeg`, which decodes HEIC, AVIF and video frames, had no limit on the frame size a file
+  claims, and decoded on several threads, each holding frames of its own; a small crafted file
+  could make it allocate gigabytes for each of the files decoded at once. It now decodes on one
+  thread per file and refuses frames over about 134 megapixels, the same budget as in-process
+  decoding; such files count as undecodable.
 - `pixrs scan` progress bars no longer garble the terminal when a file path is longer than the
   line: the path is cut to fit. The "Found … media files" line no longer runs into the next bar
   when copied.

@@ -268,9 +268,7 @@ async fn decode_with_ffmpeg(
     let max = size.pixels();
     let attempt = |seek: bool| {
         let mut command = Command::new(ffmpeg);
-        command.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
-        // Media files can reference other resources; only ever read local files.
-        command.args(["-protocol_whitelist", "file"]);
+        command.args(decode::ffmpeg_input_options());
         if seek {
             command.args(["-ss", "1"]);
         }

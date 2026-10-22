@@ -6,7 +6,7 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::decode::{file_url, major_minor, run_with_timeout, DecodeError};
+use crate::decode::{ffmpeg_input_options, file_url, major_minor, run_with_timeout, DecodeError};
 use crate::imagehash::{distance, perceptual_hash, HASH_VERSION};
 use serde::Deserialize;
 use std::path::Path;
@@ -219,11 +219,8 @@ fn parse_clock(clock: &str) -> Option<f64> {
 fn frame_at(ffmpeg: &Path, source: &Path, seconds: f64) -> Result<Frame, DecodeError> {
     let mut command = Command::new(ffmpeg);
     command
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
-        // Several files are decoded at once already; one thread each keeps them from crowding
-        // each other out.
-        .args(["-threads", "1"])
-        .args(["-protocol_whitelist", "file", "-ss"])
+        .args(ffmpeg_input_options())
+        .arg("-ss")
         .arg(format!("{:.3}", seconds))
         .arg("-i")
         .arg(file_url(source))
