@@ -14,7 +14,7 @@ use crate::media::MediaType;
 use crate::template::{sanitize, Facts, Template};
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -231,8 +231,10 @@ impl Taken {
         path.to_string_lossy().to_lowercase()
     }
 
-    /// `base` joined with `folders`, each spelled as it already is on disk or in the plan.
-    fn folder(&mut self, base: &Path, folders: &[String]) -> PathBuf {
+    /// `base` joined with `folders`, each spelled as it already is on disk or in the plan. If a
+    /// folder on the way is a symbolic link (in any letter case), `Err` with the link: files are
+    /// never moved through links, which could lead anywhere.
+    fn folder(&mut self, base: &Path, folders: &[String]) -> Result<PathBuf, PathBuf> {
         let mut dir = base.to_path_buf();
         for name in folders {
             let wanted = dir.join(name);
@@ -242,15 +244,31 @@ impl Taken {
                 continue;
             }
             let lower = name.to_lowercase();
-            let existing = listing(&mut self.on_disk, &dir)
+            let same_name: Vec<String> = listing(&mut self.on_disk, &dir)
                 .unwrap_or_default()
                 .iter()
-                .find(|n| n.to_lowercase() == lower && dir.join(n).is_dir())
+                .filter(|n| n.to_lowercase() == lower)
+                .cloned()
+                .collect();
+            let kind = |n: &String| {
+                fs::symlink_metadata(dir.join(n))
+                    .ok()
+                    .map(|m| m.file_type())
+            };
+            if let Some(link) = same_name
+                .iter()
+                .find(|n| kind(n).is_some_and(|t| t.is_symlink()))
+            {
+                return Err(dir.join(link));
+            }
+            let existing = same_name
+                .iter()
+                .find(|n| kind(n).is_some_and(|t| t.is_dir()))
                 .cloned();
             dir = existing.map_or(wanted, |n| dir.join(n));
             self.folders.insert(key, dir.clone());
         }
-        dir
+        Ok(dir)
     }
 
     /// Whether `target` is free for the file now at `own`. Anything on disk with that name in
@@ -299,6 +317,28 @@ impl Taken {
         }
         self.claim(&candidate);
         Some(candidate)
+    }
+}
+
+/// Symbolic links that files would have been moved through, and how many files each kept
+/// where they are, for one warning per link.
+#[derive(Default)]
+struct Links(BTreeMap<PathBuf, usize>);
+
+impl Links {
+    fn note(&mut self, link: PathBuf) {
+        *self.0.entry(link).or_default() += 1;
+    }
+
+    fn warn(&self, notes: &mut PlanNotes) {
+        for (link, n) in &self.0 {
+            notes.warnings.push(format!(
+                "{} {} stay: {} is a symbolic link, and files are never moved through links",
+                n,
+                plural(*n, "file", "files"),
+                link.display()
+            ));
+        }
     }
 }
 
@@ -462,6 +502,7 @@ pub fn plan_organize(
     }
     let mut notes = PlanNotes::default();
     let mut claims = Taken::default();
+    let mut links = Links::default();
     let mut targets: Vec<(PathBuf, PathBuf, crate::catalog::FileRecord)> = vec![];
     for file in catalog.files(library_id)? {
         let source = library_path(root, &file.path);
@@ -489,9 +530,16 @@ pub fn plan_organize(
         };
         let mut segments = opts.template.render(&facts, opts.undated);
         let file_name = segments.pop().expect("a template renders a file name");
-        let target = claims.folder(&base, &segments).join(file_name);
+        let target = match claims.folder(&base, &segments) {
+            Ok(folder) => folder.join(file_name),
+            Err(link) => {
+                links.note(link);
+                continue;
+            }
+        };
         targets.push((source, target, file));
     }
+    links.warn(&mut notes);
     // Deterministic: by target, then by where the file is now.
     targets.sort_by(|a, b| (Taken::key(&a.1), &a.0).cmp(&(Taken::key(&b.1), &b.0)));
 
@@ -580,6 +628,7 @@ pub fn plan_quarantine(
 
     let mut notes = PlanNotes::default();
     let mut taken = Taken::default();
+    let mut links = Links::default();
     let mut moves = vec![];
     let mut involved: Vec<i64> = vec![];
     for group in &report.groups {
@@ -630,7 +679,13 @@ pub fn plan_quarantine(
                 .chain(file.path.split('/').map(String::from))
                 .collect();
             let name = segments.pop().unwrap_or_default();
-            let target = taken.folder(dir, &segments).join(name);
+            let target = match taken.folder(dir, &segments) {
+                Ok(folder) => folder.join(name),
+                Err(link) => {
+                    links.note(link);
+                    continue;
+                }
+            };
             let Some(assigned) = taken.claim_free(&target, &source, "_{n}") else {
                 notes.warnings.push(format!(
                     "{} stays: the folder {} cannot be read",
@@ -660,6 +715,7 @@ pub fn plan_quarantine(
         }
     }
     add_sidecars(&mut moves, &mut taken, &mut notes);
+    links.warn(&mut notes);
     let plan = Plan {
         version: PLAN_VERSION,
         kind: PlanKind::Quarantine,
@@ -1114,5 +1170,37 @@ mod tests {
         fs::write(&path, old).unwrap();
         let err = read_plan(&path).unwrap_err();
         assert!(err.to_string().contains("plan version 1"), "{}", err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_no_file_is_planned_into_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+        let f = fixture(&[
+            ("incoming/IMG_20230501_143201.jpg", None),
+            ("incoming/IMG_20230502_143201.jpg", None),
+        ]);
+        let outside = f.root.parent().unwrap().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, f.root.join("2023")).unwrap();
+        let (plan, notes) = organize(&f, "{year}/{name}.{ext}", false);
+        assert_eq!(plan.moves, vec![]);
+        assert_eq!(notes.warnings.len(), 1, "{:?}", notes.warnings);
+        assert!(
+            notes.warnings[0].starts_with("2 files stay:"),
+            "{}",
+            notes.warnings[0]
+        );
+        assert!(notes.warnings[0].contains("2023"), "{}", notes.warnings[0]);
+        // A link under another letter case is that folder on Windows and macOS, so it counts
+        // everywhere.
+        symlink(&outside, f.root.join("Image")).unwrap();
+        let (plan, notes) = organize(&f, "{type}/{name}.{ext}", false);
+        assert_eq!(plan.moves, vec![]);
+        assert!(notes.warnings[0].contains("Image"), "{:?}", notes.warnings);
+        // A link elsewhere in the library is no concern.
+        symlink(&outside, f.root.join("elsewhere")).unwrap();
+        let (plan, _) = organize(&f, "{name}.{ext}", false);
+        assert_eq!(plan.moves.len(), 2);
     }
 }

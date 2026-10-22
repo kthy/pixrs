@@ -7,7 +7,7 @@
 
 use crate::catalog::{Catalog, CatalogRow};
 use crate::error::Error;
-use crate::plan::{state_dir, Keeper, Move, Plan};
+use crate::plan::{state_dir, Keeper, Move, Plan, PlanKind};
 use ring::digest::{Context, SHA256};
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
@@ -400,6 +400,16 @@ fn move_file(
     mut note_via: impl FnMut(&Path, ViaKind, Option<&Path>) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     let dir = to.parent().unwrap_or(Path::new("."));
+    match through_symlink(dir, None) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(MoveError::Failed(io::Error::other(format!(
+                "{} is reached through a symbolic link",
+                dir.display()
+            ))))
+        }
+        Err(e) => return Err(MoveError::Failed(e)),
+    }
     if case_only(from, to) {
         if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
             return Err(MoveError::Taken);
@@ -488,6 +498,66 @@ fn changed(path: &Path, size: u64, mtime_ns: i64) -> Option<String> {
     }
     let same = crate::scan::stamp(&meta).is_ok_and(|s| s.size == size && s.mtime_ns == mtime_ns);
     (!same).then(|| String::from("it changed since the plan was made"))
+}
+
+/// Whether a symbolic link is on the way to `dir`, so that it is somewhere else than its path
+/// says. With a `base` that `dir` is below, the parts after `base` are checked, as far as they
+/// exist: the rest are created below them. Without one, the nearest existing ancestor of `dir`
+/// must be where its path says (canonical), as the roots plans are made from are.
+fn through_symlink(dir: &Path, base: Option<&Path>) -> io::Result<bool> {
+    match base {
+        Some(base) if dir.starts_with(base) => {
+            let mut path = base.to_path_buf();
+            for part in dir.strip_prefix(base).expect("a prefix").components() {
+                path.push(part);
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(false)
+        }
+        _ => {
+            let existing = dir.ancestors().find(|d| exists(d)).unwrap_or(dir);
+            Ok(fs::canonicalize(existing)? != existing)
+        }
+    }
+}
+
+/// Why a move must not happen, if it must not: a symbolic link on the way to its source or its
+/// target would make the file come from, or go, somewhere else than the plan says. A link
+/// inside a library (from an extracted archive, say) is not in the catalog, since the scan
+/// does not follow links, so this is where it is caught.
+fn misplaced(m: &Move, plan: &Plan) -> Option<String> {
+    let (from, to) = (Path::new(&m.from), Path::new(&m.to));
+    let base_of = |dir: &Path| -> Option<&Path> {
+        let roots = plan.libraries.iter().map(|l| Path::new(l.root.as_str()));
+        let quarantine =
+            (plan.kind == PlanKind::Quarantine).then(|| Path::new(plan.description.as_str()));
+        roots.chain(quarantine).find(|base| dir.starts_with(base))
+    };
+    for (what, dir) in [
+        ("its folder", from.parent()),
+        ("its target folder", to.parent()),
+    ] {
+        let Some(dir) = dir else {
+            continue;
+        };
+        match through_symlink(dir, base_of(dir)) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Some(format!(
+                    "{} {} is reached through a symbolic link",
+                    what,
+                    dir.display()
+                ))
+            }
+            Err(e) => return Some(format!("cannot check {}: {}", dir.display(), e)),
+        }
+    }
+    None
 }
 
 /// Why a move should not happen now, if it should not.
@@ -592,6 +662,10 @@ fn apply_journaled(
             Ok(())
         };
         if let Some(reason) = problem(m, &done) {
+            skip(&mut journal, reason)?;
+            continue;
+        }
+        if let Some(reason) = misplaced(m, plan) {
             skip(&mut journal, reason)?;
             continue;
         }
@@ -1313,7 +1387,8 @@ mod tests {
         let report =
             crate::dupes::find_dupes(&catalog, &[], crate::dupes::Similarity::default()).unwrap();
         assert_eq!(report.groups.len(), 1);
-        let quarantine = f.dir.path().join("quarantine");
+        // Resolved, as `pixrs dupes --quarantine` resolves it.
+        let quarantine = f.dir.path().canonicalize().unwrap().join("quarantine");
         let now = datetime!(2026-10-20 12:00 UTC);
         let (plan, _) =
             plan_quarantine(&catalog, &f.catalog_path, &report, &[], &quarantine, now).unwrap();
@@ -1441,7 +1516,8 @@ mod tests {
         let catalog = Catalog::open(&f.catalog_path).unwrap();
         let report =
             crate::dupes::find_dupes(&catalog, &[], crate::dupes::Similarity::default()).unwrap();
-        let quarantine = f.dir.path().join("quarantine");
+        // Resolved, as `pixrs dupes --quarantine` resolves it.
+        let quarantine = f.dir.path().canonicalize().unwrap().join("quarantine");
         let now = datetime!(2026-10-20 12:00 UTC);
         let (plan, notes) =
             plan_quarantine(&catalog, &f.catalog_path, &report, &[], &quarantine, now).unwrap();
@@ -1816,5 +1892,45 @@ mod tests {
         assert_eq!(tree(&f.root), before);
         assert!(!state_dir(&f.catalog_path, "journals").exists());
         assert!(!state_dir(&f.catalog_path, "pixrs.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_moves_through_a_symbolic_link_are_skipped() {
+        use std::os::unix::fs::symlink;
+        let f = fixture(&[("misc/IMG_20190501_143201.jpg", b"x")]);
+        let outside = f.dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let (plan_path, plan) = organize_plan(&f, "{year}/{name}.{ext}", true);
+        assert_eq!(plan.moves.len(), 1);
+        // The target folder is a link by the time the plan is applied.
+        symlink(&outside, f.root.join("2019")).unwrap();
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert_eq!(summary.moved, 0);
+        assert!(
+            summary.skipped[0].1.contains("symbolic link"),
+            "{:?}",
+            summary.skipped
+        );
+        assert!(tree(&outside).is_empty());
+        assert!(f.root.join("misc/IMG_20190501_143201.jpg").is_file());
+        assert_eq!(undo(&summary.journal).unwrap().moved_back, 0);
+        fs::remove_file(f.root.join("2019")).unwrap();
+
+        // Applied for real, the folder the file came from is pruned; a link takes its place
+        // before undo.
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert_eq!(summary.moved, 1);
+        assert!(!f.root.join("misc").exists());
+        symlink(&outside, f.root.join("misc")).unwrap();
+        let undone = undo(&summary.journal).unwrap();
+        assert_eq!(undone.moved_back, 0);
+        assert!(
+            undone.warnings.iter().any(|w| w.contains("symbolic link")),
+            "{:?}",
+            undone.warnings
+        );
+        assert!(tree(&outside).is_empty());
+        assert!(f.root.join("2019/IMG_20190501_143201.jpg").is_file());
     }
 }
