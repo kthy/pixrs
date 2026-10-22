@@ -209,13 +209,16 @@ pub fn scan_with(
         }
         seen.insert(rel);
     }
-    walk.println(format!(
-        "Found {} media files, {} new or changed ({})",
-        HumanCount(walk.position()),
-        HumanCount(pending.len() as u64),
-        HumanDuration(walk.elapsed())
-    ));
     walk.finish_and_clear();
+    // Not `walk.println`, which pads the line to the terminal width instead of ending it.
+    if !walk.is_hidden() {
+        eprintln!(
+            "Found {} media files, {} new or changed ({})",
+            HumanCount(walk.position()),
+            HumanCount(pending.len() as u64),
+            HumanDuration(walk.elapsed())
+        );
+    }
 
     if seen.is_empty() && !known.is_empty() {
         return Err(Error::Usage(format!(
@@ -239,6 +242,11 @@ pub fn scan_with(
             Ok(meta) => meta,
             Err(e) => {
                 pb.suspend(|| warn(&file.path, &e));
+                if !root.is_dir() {
+                    pb.finish_and_clear();
+                    tx.commit()?;
+                    return Err(disappeared(&root));
+                }
                 summary.skipped += 1;
                 pb.inc(1);
                 continue;
@@ -293,6 +301,11 @@ pub fn scan_with(
             }
             Err(e) => {
                 pb.suspend(|| warn(&path, &e));
+                if !root.is_dir() {
+                    pb.finish_and_clear();
+                    tx.commit()?;
+                    return Err(disappeared(&root));
+                }
                 summary.skipped += 1;
             }
         }
@@ -377,13 +390,9 @@ pub fn scan_with(
             Err(e) => {
                 let path = library_path(&root, rel);
                 pb.suspend(|| eprintln!("Cannot decode {}: {}", path.display(), e));
-                // If the whole library is gone (an unplugged drive), stop instead of failing on
-                // every remaining file.
                 if !root.is_dir() {
-                    return Err(Error::Usage(format!(
-                        "{} disappeared during the scan",
-                        root.display()
-                    )));
+                    tx.take().expect("a transaction is open").commit()?;
+                    return Err(disappeared(&root));
                 }
                 // A file that is gone or unreadable now is tried again on the next scan; only
                 // one the decoder rejects is recorded as undecodable.
@@ -529,6 +538,16 @@ pub fn resolve(path: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// The error a scan stops with when the library is gone (an unplugged drive, a dropped network
+/// share), instead of failing on every remaining file. What it did so far is committed first.
+fn disappeared(root: &Path) -> Error {
+    Error::Usage(format!(
+        "{} disappeared during the scan. What was scanned so far is kept; scan again when it \
+         is back.",
+        root.display()
+    ))
+}
+
 /// Print a warning about a file that is skipped.
 fn warn(path: &Path, reason: impl Display) {
     eprintln!("Skipping {}: {}", path.display(), reason);
@@ -568,18 +587,19 @@ pub(crate) fn stamp(meta: &FsMetadata) -> io::Result<Stamp> {
     })
 }
 
-/// A progress bar of `len` files, or bytes if `bytes` is set.
+/// A progress bar of `len` files, or bytes if `bytes` is set. The message is cut to fit the
+/// terminal: a line that wraps is not cleared when the bar is drawn again.
 fn progress_bar(len: u64, prefix: &'static str, bytes: bool, quiet: bool) -> ProgressBar {
     if quiet {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(len).with_prefix(prefix);
     let t = if bytes {
-        "{prefix} [{elapsed}, ETA {eta}] {wide_bar:.white/grey} {bytes:>10}/{total_bytes:10} \
-         {binary_bytes_per_sec:>12} {msg:.dim}"
+        "{prefix} [{elapsed}, ETA {eta}] {bar:15.white/grey} {bytes:>10}/{total_bytes} \
+         {binary_bytes_per_sec:>11} {wide_msg:.dim}"
     } else {
-        "{prefix} [{elapsed}, ETA {eta}] {wide_bar:.white/grey} {human_pos:>7}/{human_len:7} \
-         {rate:>8} {msg:.dim}"
+        "{prefix} [{elapsed}, ETA {eta}] {bar:15.white/grey} {human_pos:>7}/{human_len:7} \
+         {rate:>8} {wide_msg:.dim}"
     };
     pb.set_style(
         ProgressStyle::default_bar()
@@ -601,7 +621,7 @@ fn spinner(prefix: &'static str, quiet: bool) -> ProgressBar {
     let pb = ProgressBar::new_spinner().with_prefix(prefix);
     pb.set_style(
         ProgressStyle::default_spinner()
-            .template("{prefix} [{elapsed}] {spinner} {human_pos} media files {msg:.dim}")
+            .template("{prefix} [{elapsed}] {spinner} {human_pos} media files {wide_msg:.dim}")
             .expect("Expected a ProgressStyle!"),
     );
     // Tick on a timer, so the spinner moves while a slow folder listing blocks the walk.
