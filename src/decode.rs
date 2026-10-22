@@ -6,7 +6,7 @@
  *************************************************************************************************/
 
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageError, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageError, ImageReader, Limits};
 use log::debug;
 use std::ffi::OsString;
 use std::fmt;
@@ -76,6 +76,18 @@ const DECODED_IN_PROCESS: &[&str] = &["bmp", "gif", "jpeg", "jpg", "png", "tif",
 /// Image extensions only `ffmpeg` decodes, lowercase.
 const DECODED_BY_FFMPEG: &[&str] = &["avif", "heic", "heif"];
 
+/// Most bytes of pixels an image decoded in-process may take (the `image` crate's default): a
+/// file can claim any size in a few bytes, and allocating what it claims aborts the process.
+/// The largest camera images, 100 megapixels, take about 400 MB.
+pub const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Most pixels along either side of an image decoded in-process.
+pub const MAX_DIMENSION: u32 = 65_536;
+
+/// Largest image file decoded in-process: a JPEG is read into memory whole before it is
+/// decoded, and a real image that large would exceed `MAX_DECODED_BYTES` as pixels anyway.
+pub const MAX_IMAGE_FILE_BYTES: u64 = MAX_DECODED_BYTES;
+
 /// How an image is decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decoder {
@@ -105,11 +117,27 @@ pub fn image_decoder(path: &str) -> Option<Decoder> {
 }
 
 /// Decode an image with the `image` crate. The pixels are as stored; the EXIF orientation that
-/// says how to show them upright is returned alongside.
+/// says how to show them upright is returned alongside. An image beyond `MAX_DIMENSION`,
+/// `MAX_DECODED_BYTES` or `MAX_IMAGE_FILE_BYTES` is invalid, not decoded.
 pub fn decode_in_process(source: &Path) -> Result<(DynamicImage, Orientation), DecodeError> {
-    let mut decoder = ImageReader::open(source)?
-        .with_guessed_format()?
-        .into_decoder()?;
+    let file_bytes = std::fs::metadata(source)?.len();
+    if file_bytes > MAX_IMAGE_FILE_BYTES {
+        return Err(DecodeError::Invalid(format!(
+            "the file is {} MB, more than the {} MB pixrs decodes",
+            file_bytes / 1_000_000,
+            MAX_IMAGE_FILE_BYTES / 1_000_000
+        )));
+    }
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    let mut reader = ImageReader::open(source)?.with_guessed_format()?;
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder()?;
+    // `into_decoder` checks the dimensions, but only `ImageReader::decode` charges the pixel
+    // buffer against the memory limit: do that here, before `from_decoder` allocates it.
+    limits.reserve(decoder.total_bytes())?;
     let orientation = decoder.orientation()?;
     let img = DynamicImage::from_decoder(decoder)?;
     Ok((img, orientation))
@@ -322,5 +350,70 @@ mod tests {
         assert!(err.is_transient(), "{:?}", err);
         let err = decode_in_process(Path::new("/no/such/file.jpg")).unwrap_err();
         assert!(err.is_transient(), "{:?}", err);
+    }
+
+    /// A PNG whose header claims `width` x `height` RGBA pixels, with no pixel data to speak of.
+    fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xffff_ffff_u32;
+            for &byte in data {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            png.extend_from_slice(&body);
+            png.extend_from_slice(&crc32(&body).to_be_bytes());
+        }
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = vec![];
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        // 8 bits per channel, RGBA, deflate, adaptive filtering, no interlace.
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &[0x78, 0x9c]);
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    #[test]
+    fn test_images_claiming_too_much_are_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        // More pixels than fit the memory limit: 20,000 x 20,000 RGBA is 1.6 GB.
+        let path = dir.path().join("bomb.png");
+        std::fs::write(&path, png_claiming(20_000, 20_000)).unwrap();
+        let err = decode_in_process(&path).unwrap_err();
+        assert!(!err.is_transient(), "{:?}", err);
+        assert_eq!(err.to_string(), "Memory limit exceeded");
+        // Beyond the dimension limit: 40 GB, refused before the decoder starts.
+        std::fs::write(&path, png_claiming(100_000, 100_000)).unwrap();
+        let err = decode_in_process(&path).unwrap_err();
+        assert!(!err.is_transient(), "{:?}", err);
+        assert_eq!(err.to_string(), "Image size exceeds limit");
+        // A file too large to read whole, without looking inside (sparse, so cheap to make).
+        let path = dir.path().join("huge.jpg");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_IMAGE_FILE_BYTES + 1)
+            .unwrap();
+        let err = decode_in_process(&path).unwrap_err();
+        assert!(!err.is_transient(), "{:?}", err);
+        assert!(err.to_string().contains("more than"), "{}", err);
+        // A small image still decodes.
+        let path = dir.path().join("ok.png");
+        let img = image::RgbImage::from_fn(64, 64, |x, y| image::Rgb([x as u8, y as u8, 7]));
+        img.save(&path).unwrap();
+        assert_eq!(decode_in_process(&path).unwrap().0.width(), 64);
     }
 }
