@@ -55,6 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   touches temporary files named and placed as pixrs makes them, only recreates pruned folders
   a moved file came from, only removes a copy at a target that also has the moved file's
   mtime, and both commands refuse a catalog path that does not hold a pixrs catalog.
+- A move to another drive wrote its copy by the name of the temporary file it had just created,
+  so someone else who can write to the target folder (a shared quarantine folder, say) could
+  swap that name for a link and have `pixrs apply` overwrite one of your files with the moved
+  photo; the thumbnail cache was written the same way. Copies and cached thumbnails are now
+  written through the file pixrs created, and a temporary file whose name no longer leads to it
+  is never put in place.
 - `pixrs scan` no longer prints `nom_exif` errors in the middle of the progress bars (files it
   cannot read are already reported); set `RUST_LOG` to see dependencies' log output.
 - `pixrs apply` carried out whatever moves a plan file listed, so a crafted or edited plan

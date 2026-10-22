@@ -184,8 +184,10 @@ enum MoveError {
 /// Number for temporary file names, unique within the process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A new, empty temporary file in `dir`, so the name is pixrs's alone.
-fn reserve_temp(dir: &Path) -> io::Result<PathBuf> {
+/// A new, empty temporary file in `dir`, so the name is pixrs's alone, open for reading and
+/// writing. Write through the open file: anyone who can write to `dir` can replace the name,
+/// with a symbolic link to another file for example, and `still_ours` tells whether they did.
+pub(crate) fn reserve_temp(dir: &Path) -> io::Result<(PathBuf, File)> {
     loop {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -196,11 +198,35 @@ fn reserve_temp(dir: &Path) -> io::Result<PathBuf> {
             nanos,
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(_) => return Ok(path),
+        let created = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        match created {
+            Ok(file) => return Ok((path, file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Whether the name `temp` still leads to `file`, the temporary file `reserve_temp` created
+/// there, and not to something put in its place.
+pub(crate) fn still_ours(temp: &Path, file: &File) -> bool {
+    let regular = fs::symlink_metadata(temp).is_ok_and(|meta| meta.file_type().is_file());
+    let ours = file.try_clone().and_then(same_file::Handle::from_file);
+    let there = same_file::Handle::from_path(temp);
+    regular && matches!((ours, there), (Ok(ours), Ok(there)) if ours == there)
+}
+
+/// Close the temporary file `file` and remove it from `temp`, if the name still leads to it:
+/// anything else there was put in its place by someone else, and stays.
+fn discard(temp: &Path, file: File) {
+    let ours = still_ours(temp, &file);
+    drop(file);
+    if ours {
+        let _ = fs::remove_file(temp);
     }
 }
 
@@ -313,11 +339,15 @@ fn system_time(mtime_ns: i64) -> SystemTime {
 
 /// SHA-256 of a file.
 fn sha256_of(path: &Path) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
+    sha256_from(File::open(path)?)
+}
+
+/// SHA-256 of everything `reader` reads.
+fn sha256_from(mut reader: impl Read) -> io::Result<Vec<u8>> {
     let mut context = Context::new(&SHA256);
     let mut buffer = vec![0; 64 * 1024];
     loop {
-        match file.read(&mut buffer) {
+        match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => context.update(&buffer[..n]),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -347,13 +377,18 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Copy `from` into the reserved temporary file `via`, flushed to disk, with `from`'s mtime,
-/// check that the copy reads back the same, and return its SHA-256. Permissions are copied
-/// later, onto the file in its final place: a read-only temporary file could not be removed on
-/// Windows.
-fn copy_verified(from: &Path, via: &Path, mtime: i64, stop_in_copy: bool) -> io::Result<Vec<u8>> {
+/// Copy `from` into `copy`, the open temporary file reserved at `via`, flushed to disk, with
+/// `from`'s mtime, check that the copy reads back the same, and return its SHA-256. All of it
+/// goes through `copy`, never through the name. Permissions are copied later, onto the file in
+/// its final place: a read-only temporary file could not be removed on Windows.
+fn copy_verified(
+    from: &Path,
+    via: &Path,
+    copy: &mut File,
+    mtime: i64,
+    stop_in_copy: bool,
+) -> io::Result<Vec<u8>> {
     let mut source = File::open(from)?;
-    let mut copy = OpenOptions::new().write(true).truncate(true).open(via)?;
     let mut context = Context::new(&SHA256);
     let mut buffer = vec![0; 256 * 1024];
     loop {
@@ -371,9 +406,9 @@ fn copy_verified(from: &Path, via: &Path, mtime: i64, stop_in_copy: bool) -> io:
     }
     copy.sync_all()?;
     copy.set_modified(system_time(mtime))?;
-    drop(copy);
     let hash = context.finish().as_ref().to_vec();
-    if sha256_of(via)? != hash {
+    copy.seek(io::SeekFrom::Start(0))?;
+    if sha256_from(copy)? != hash {
         return Err(io::Error::other(format!(
             "the copy {} does not match {}",
             via.display(),
@@ -414,7 +449,9 @@ fn move_file(
         if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
             return Err(MoveError::Taken);
         }
-        let via = reserve_temp(dir).map_err(MoveError::Failed)?;
+        let (via, reservation) = reserve_temp(dir).map_err(MoveError::Failed)?;
+        // The file itself goes to `via`, by a rename that replaces the reservation.
+        drop(reservation);
         if let Err(e) = note_via(&via, ViaKind::Stop, None).and_then(|()| fs::rename(from, &via)) {
             let _ = fs::remove_file(&via);
             return Err(MoveError::Failed(e));
@@ -450,9 +487,9 @@ fn move_file(
             Err(e) => return Err(MoveError::Failed(e)),
         }
     }
-    let via = reserve_temp(dir).map_err(MoveError::Failed)?;
+    let (via, mut copy) = reserve_temp(dir).map_err(MoveError::Failed)?;
     let copied = note_via(&via, ViaKind::Copy, Some(from))
-        .and_then(|()| copy_verified(from, &via, mtime, opts.stop_in_copy));
+        .and_then(|()| copy_verified(from, &via, &mut copy, mtime, opts.stop_in_copy));
     let hash = match copied {
         Ok(hash) => hash,
         Err(e) if opts.stop_in_copy => {
@@ -460,21 +497,30 @@ fn move_file(
             return Err(MoveError::Partial(e));
         }
         Err(e) => {
-            let _ = fs::remove_file(&via);
+            discard(&via, copy);
             return Err(MoveError::Failed(e));
         }
     };
     if exists(to) {
-        let _ = fs::remove_file(&via);
+        discard(&via, copy);
         return Err(MoveError::Taken);
     }
+    // Only the verified copy goes into place, not what someone put under its name.
+    if !still_ours(&via, &copy) {
+        return Err(MoveError::Failed(io::Error::other(format!(
+            "the temporary file {} was replaced by something else; left there",
+            via.display()
+        ))));
+    }
     if let Err(e) = fs::rename(&via, to) {
-        let _ = fs::remove_file(&via);
+        discard(&via, copy);
         return Err(MoveError::Failed(e));
     }
+    // Through the open file, which is the one at `to` now, whatever the name leads to.
     if let Ok(meta) = fs::metadata(from) {
-        let _ = fs::set_permissions(to, meta.permissions());
+        let _ = copy.set_permissions(meta.permissions());
     }
+    drop(copy);
     sync_dir(dir).map_err(MoveError::Partial)?;
     // An edit to `from` while it was copied would be lost with it.
     let unchanged = fs::symlink_metadata(from).is_ok_and(|m| matches(&m, size, mtime))
@@ -1431,6 +1477,49 @@ mod tests {
         assert!(matches!(Lock::take(&catalog), Err(Error::Usage(_))));
         drop(lock);
         assert!(Lock::take(&catalog).is_ok());
+    }
+
+    #[test]
+    fn test_a_copy_goes_through_its_reserved_file() {
+        let dir = tempdir().unwrap();
+        let from = dir.path().join("photo.jpg");
+        fs::write(&from, b"the photo").unwrap();
+        let (via, mut copy) = reserve_temp(dir.path()).unwrap();
+        assert!(still_ours(&via, &copy));
+        let hash = copy_verified(&from, &via, &mut copy, 0, false).unwrap();
+        assert_eq!(hash, sha256_of(&from).unwrap());
+        assert_eq!(fs::read(&via).unwrap(), b"the photo");
+        discard(&via, copy);
+        assert!(!exists(&via));
+
+        // Another file put under the name of a temporary file is not it, and stays.
+        let (via, copy) = reserve_temp(dir.path()).unwrap();
+        fs::remove_file(&via).unwrap();
+        fs::write(&via, b"someone else's").unwrap();
+        assert!(!still_ours(&via, &copy));
+        discard(&via, copy);
+        assert_eq!(fs::read(&via).unwrap(), b"someone else's");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_link_put_in_place_of_a_temporary_file_is_not_written_through() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let from = dir.path().join("photo.jpg");
+        fs::write(&from, b"the photo").unwrap();
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, b"precious").unwrap();
+        let (via, mut copy) = reserve_temp(dir.path()).unwrap();
+        // Someone who can write to the folder swaps the name for a link to one of your files.
+        fs::remove_file(&via).unwrap();
+        symlink(&victim, &via).unwrap();
+        copy_verified(&from, &via, &mut copy, 0, false).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        assert!(!still_ours(&via, &copy));
+        discard(&via, copy);
+        assert!(fs::symlink_metadata(&via).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
     }
 
     #[test]

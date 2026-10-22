@@ -108,7 +108,11 @@ Decided details:
   or touches a SQLite file without the pixrs schema. A source must
   still match the plan right before it is removed after a cross-filesystem copy. Cross-filesystem
   moves copy to a temporary name, verify the SHA-256, keep the mtime, rename, then remove the
-  source. The catalog is updated as files move. The quarantine folder must be outside every
+  source. Temporary files (here and in the thumbnail cache) are created exclusively by
+  `reserve_temp` and written, read back and given their permissions through the open file, never
+  by name; one is only renamed into place while its name still leads to that file
+  (`still_ours`), since anyone who can write to the folder can swap the name for a link. The
+  catalog is updated as files move. The quarantine folder must be outside every
   cataloged library and contain none; files go to `<DIR>/<library name>/<path in library>`. With
   library arguments, only copies in those libraries are quarantined, and each move requires the
   group's kept copy to still be there unchanged at `apply`. Accepted risk: each move checks that

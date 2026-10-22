@@ -6,6 +6,7 @@
  *************************************************************************************************/
 
 use super::Located;
+use crate::apply::{reserve_temp, still_ours};
 use crate::catalog::FileRecord;
 use crate::decode::{self, decode_in_process, file_url, image_decoder, TOOL_TIMEOUT};
 use crate::media::MediaType;
@@ -15,10 +16,9 @@ use log::{debug, warn};
 use ring::digest::{digest, SHA256};
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::thread::available_parallelism;
 use tokio::process::Command;
@@ -318,22 +318,27 @@ async fn run(mut command: Command) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Number for temporary file names, unique within the process.
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Write `path` so that readers never see a partial file.
+/// Write `path` so that readers never see a partial file. The contents go through a new
+/// temporary file pixrs created, which only takes the place of `path` if its name still leads
+/// to that file.
 fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = path.parent().expect("cache files are in a folder");
     fs::create_dir_all(dir)?;
-    let temp = dir.join(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&temp, contents)?;
-    fs::rename(&temp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temp);
-    })
+    let (temp, mut file) = reserve_temp(dir)?;
+    let written = file.write_all(contents).and_then(|()| {
+        if still_ours(&temp, &file) {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("{} was replaced", temp.display())))
+        }
+    });
+    drop(file);
+    match written {
+        Ok(()) => fs::rename(&temp, path).inspect_err(|_| {
+            let _ = fs::remove_file(&temp);
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 /// An SVG placeholder showing the file's extension.
