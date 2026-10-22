@@ -156,6 +156,10 @@ disk also exists elsewhere.
 The report comes from the catalog as of each library's last scan, so rescan libraries that have
 changed. It never touches the library.
 
+In CSV output, a library or path that a spreadsheet would read as a formula (one that starts with
+`=`, `+`, `-` or `@`, as Synology's `@eaDir` folders do) starts with a `'`, which spreadsheets
+read as the start of text. Scripts should read the JSON output, which has every path as it is.
+
 ### Browse the catalog
 
 ```text
