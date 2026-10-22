@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `pixrs scan` progress bars no longer garble the terminal when a file path is longer than the
+  line: the path is cut to fit. The "Found … media files" line no longer runs into the next bar
+  when copied.
+- `pixrs scan` no longer prints `nom_exif` errors in the middle of the progress bars (files it
+  cannot read are already reported); set `RUST_LOG` to see dependencies' log output.
+- `pixrs scan` stops when the library disappears (an unplugged drive, a dropped network share)
+  while reading metadata or hashing, as it already did while decoding, instead of failing on
+  every remaining file. What was scanned so far is kept.
 - A file cataloged in two overlapping libraries (one scanned inside the other) was reported as
   a duplicate of itself, and `dupes --quarantine` planned to move it, leaving no copy in the
   library. `dupes` and the viewer now count each file on disk once.

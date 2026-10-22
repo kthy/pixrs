@@ -48,8 +48,10 @@ fn main() {
     // Start the timer
     let now = Instant::now();
 
-    // Initialize logger from RUST_LOG environment variable
-    env_logger::init();
+    // Log from RUST_LOG; without it, only pixrs's own errors. Dependencies log errors pixrs
+    // already reports (nom-exif on truncated files), and the lines break the progress bars.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("pixrs=error"))
+        .init();
 
     set_ctrlc_handler();
 
