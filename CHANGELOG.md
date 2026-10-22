@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `pixrs relocate OLD NEW` points a library at the folder it was moved to (another mount point,
   drive letter or parent folder), keeping its hashes, instead of scanning it again as a new
-  library. It checks a sample of the files at the new place first; `--force` skips that check.
+  library. It checks a sample of the files at the new place first, with a progress bar;
+  `--force` skips that check.
 
 ### Changed
 
@@ -27,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stopping `pixrs apply` or `pixrs undo` with Ctrl-C left `pixrs.lock` next to the catalog,
+  so the next `apply`, `undo` or `relocate` refused to run until it was deleted by hand.
 - `pixrs scan` progress bars no longer garble the terminal when a file path is longer than the
   line: the path is cut to fit. The "Found … media files" line no longer runs into the next bar
   when copied.
