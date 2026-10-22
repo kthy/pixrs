@@ -58,7 +58,9 @@ decoders. The library itself is never modified.
 
 Scanning a folder inside a scanned library scans only that part of the library. Scanning a
 folder that contains scanned libraries makes them part of it, keeping their hashes, so a scan
-of `photos/phone` followed by one of `photos` reads the phone's files only once.
+of `photos/phone` followed by one of `photos` reads the phone's files only once. On a
+case-insensitive file system (a Windows drive under WSL, a network share) the library is found
+under any letter case.
 
 ### Move a library
 

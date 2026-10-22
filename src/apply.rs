@@ -506,6 +506,9 @@ fn problem(m: &Move, done: &[bool]) -> Option<String> {
         if changed(Path::new(path), *size, *mtime_ns).is_some() {
             return Some(format!("the kept copy {} is gone or changed", path));
         }
+        if same_file(Path::new(path), Path::new(&m.from)) {
+            return Some(format!("it is the same file as the kept copy {}", path));
+        }
     }
     changed(Path::new(&m.from), m.size, m.mtime_ns)
 }
@@ -1471,5 +1474,67 @@ mod tests {
         };
         clean_up_via(&stop, &from, 20, 0, &mut warnings);
         assert!(!via.exists() && !from.exists());
+    }
+
+    #[test]
+    fn test_quarantine_never_moves_the_kept_file_under_another_name() {
+        let f = fixture(&[("a/photo.jpg", b"one inode")]);
+        let (kept, other) = (f.root.join("a/photo.jpg"), f.root.join("b/photo.jpg"));
+        fs::create_dir(other.parent().unwrap()).unwrap();
+        fs::hard_link(&kept, &other).unwrap();
+        let rescan = || {
+            crate::scan::scan_with(
+                &f.root,
+                &f.catalog_path,
+                true,
+                &crate::decode::Tools::default(),
+            )
+            .unwrap();
+        };
+        rescan();
+        let now = datetime!(2026-10-20 12:00 UTC);
+        let quarantine = f.dir.path().join("quarantine");
+        let plan_for = |f: &Fixture| {
+            let catalog = Catalog::open(&f.catalog_path).unwrap();
+            let report =
+                crate::dupes::find_dupes(&catalog, &[], crate::dupes::Similarity::default())
+                    .unwrap();
+            assert_eq!(report.groups.len(), 1);
+            plan_quarantine(&catalog, &f.catalog_path, &report, &[], &quarantine, now).unwrap()
+        };
+        let (plan, notes) = plan_for(&f);
+        assert_eq!(plan.moves, vec![]);
+        assert!(
+            notes.warnings[0].contains("same file as the kept copy"),
+            "{:?}",
+            notes.warnings
+        );
+
+        // A real copy with the kept file's mtime is planned; it becomes the kept file's other
+        // name before the plan is applied, so it still matches the plan, but does not move.
+        fs::remove_file(&other).unwrap();
+        fs::write(&other, b"one inode").unwrap();
+        let kept_time = fs::metadata(&kept).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .set_modified(kept_time)
+            .unwrap();
+        rescan();
+        let (plan, _) = plan_for(&f);
+        assert_eq!(plan.moves.len(), 1);
+        assert_eq!(plan.moves[0].from, other.to_str().unwrap());
+        let plan_path = write_plan(&plan, now).unwrap();
+        fs::remove_file(&other).unwrap();
+        fs::hard_link(&kept, &other).unwrap();
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert_eq!(summary.moved, 0);
+        assert!(
+            summary.skipped[0].1.contains("same file as the kept copy"),
+            "{:?}",
+            summary.skipped
+        );
+        assert!(kept.is_file() && other.is_file());
     }
 }

@@ -27,7 +27,13 @@ The planned shape, tracked in GitHub issues #32 to #37 (one per step):
   library scans that part of the library, and scanning a folder that contains libraries folds
   them into it (rows move with their hashes; where both list a file with the same size and
   mtime, the outer row takes the hashes it lacks). `dupes` and the viewer keep one row per file
-  on disk, for catalogs from 0.2.0 that already have overlapping libraries. A moved library
+  on disk, for catalogs from 0.2.0 that already have overlapping libraries. A folder is matched
+  to the stored roots by spelling and then by file identity (`same_file`), since on Linux
+  `canonicalize` keeps the letter case the user typed on a case-insensitive file system (WSL's
+  `/mnt/c`, SMB, exFAT): `/mnt/c/photos` is scanned as the library `/mnt/c/Photos`, and a
+  library cataloged under another spelling is folded in like a nested one (`path_below`,
+  `cataloged_spelling` in `src/catalog.rs`). Quarantine never moves a copy that is the same
+  file as its keeper (one folder under two names, or a hard link). A moved library
   is pointed at its new place with `pixrs relocate OLD NEW` (#50): OLD is matched against the
   stored roots (it need not exist), up to 100 files spread over the library must be at NEW with
   the same size and mtime (at least 90%, unless `--force`), and NEW follows the overlap rules

@@ -9,6 +9,7 @@ use crate::apply::Lock;
 use crate::catalog::{display_root, library_path, Catalog, Library};
 use crate::error::Error;
 use crate::scan::{progress_bar, resolve, stamp};
+use same_file::is_same_file;
 use std::fs;
 use std::path::{absolute, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,7 +74,8 @@ pub fn relocate(
     let new_str = new
         .to_str()
         .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", new.display())))?;
-    if new == Path::new(&library.root) {
+    // Also under another letter case on a case-insensitive file system, which Linux keeps.
+    if new == Path::new(&library.root) || is_same_file(&new, &library.root).unwrap_or(false) {
         return Err(Error::Usage(format!(
             "The library is already at {}",
             display_root(&library.root)

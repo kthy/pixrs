@@ -9,7 +9,9 @@ use crate::avhash::{
     audio_fingerprint, audio_version, video_signature, video_version, AudioFingerprint,
     VideoSignature,
 };
-use crate::catalog::{display_root, library_path, Catalog, FileRecord, MediaMeta, Stamp};
+use crate::catalog::{
+    cataloged_spelling, display_root, library_path, Catalog, FileRecord, MediaMeta, Stamp,
+};
 use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, Tools};
 use crate::error::Error;
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
@@ -109,9 +111,6 @@ pub fn scan_with(
         .ok()
         .filter(|start| start.is_dir())
         .ok_or_else(|| Error::Usage(format!("{} is not a directory", library.display())))?;
-    let start_str = start
-        .to_str()
-        .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", start.display())))?;
     let catalog_path = resolve(catalog_path)?;
     let outside = |root: &Path| {
         if catalog_path.starts_with(root) {
@@ -126,6 +125,11 @@ pub fn scan_with(
     outside(&start)?;
 
     let catalog = Catalog::open(&catalog_path)?;
+    // One folder under another letter case is the same library.
+    let start = cataloged_spelling(&catalog.libraries()?, &start);
+    let start_str = start
+        .to_str()
+        .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", start.display())))?;
     let mut summary = ScanSummary::default();
     // `start` may be part of a library; `root` is the library's root, and paths are relative to
     // it. `part` is the scanned folder relative to `root`, empty for the whole library.
