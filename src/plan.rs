@@ -1029,7 +1029,8 @@ mod tests {
         plan.check().unwrap();
         let outside = f.root.parent().unwrap().join("elsewhere.jpg");
         let outside = outside.to_str().unwrap();
-        let faults: Vec<(&str, Box<dyn Fn(&mut Plan)>)> = vec![
+        type Fault<'a> = Box<dyn Fn(&mut Plan) + 'a>;
+        let faults: Vec<(&str, Fault)> = vec![
             (
                 "sidecar of a later move",
                 Box::new(|p| p.moves[1].sidecar_of = Some(5)),
