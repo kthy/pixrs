@@ -125,7 +125,10 @@ Decided details:
   (`--similar`) and documented as "expect burst shots". HEIC is decoded via
   `ffmpeg` 7.1 or later when available (older versions may decode one tile of a phone's HEIC
   grid); RAW is skipped with a note. `ffmpeg` applies the file's rotation itself, so for HEIC
-  and AVIF the pixel hash is of the upright image.
+  and AVIF the pixel hash is of the upright image. In-process decoding is capped at 65,536
+  pixels per side, 512 MiB of decoded pixels and 512 MiB of file (`src/decode.rs`); a file
+  beyond that is undecodable. A file can claim any size in a few bytes, and `image`'s
+  `into_decoder` does not apply its memory limit to the pixel buffer, so pixrs reserves it.
 - Video and audio similarity: a video's signature is 9 frames at 5%, 15%, ... 85% of its duration
   (`ffmpeg -ss`, duration from `ffprobe`), each with the image perceptual hash; frames shift with
   re-encoding when keyframes are used, fixed fractions do not. The fractions are of the video

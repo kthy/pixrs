@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Stopping `pixrs apply` or `pixrs undo` with Ctrl-C left `pixrs.lock` next to the catalog,
   so the next `apply`, `undo` or `relocate` refused to run until it was deleted by hand.
+- An image file claiming absurd dimensions (a few hundred bytes can claim 100,000 x 100,000
+  pixels) made `pixrs scan` and the viewer try to allocate the pixels and abort out of memory,
+  and the next scan died on the same file. Images are now decoded in-process only up to 65,536
+  pixels per side and 512 MiB of pixels (about 130 megapixels in color), from files up to
+  512 MiB; anything beyond counts as undecodable and is left out of same-pixel and similarity
+  matching.
 - `pixrs scan` progress bars no longer garble the terminal when a file path is longer than the
   line: the path is cut to fit. The "Found … media files" line no longer runs into the next bar
   when copied.
