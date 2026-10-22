@@ -589,7 +589,12 @@ pub(crate) fn stamp(meta: &FsMetadata) -> io::Result<Stamp> {
 
 /// A progress bar of `len` files, or bytes if `bytes` is set. The message is cut to fit the
 /// terminal: a line that wraps is not cleared when the bar is drawn again.
-fn progress_bar(len: u64, prefix: &'static str, bytes: bool, quiet: bool) -> ProgressBar {
+pub(crate) fn progress_bar(
+    len: u64,
+    prefix: &'static str,
+    bytes: bool,
+    quiet: bool,
+) -> ProgressBar {
     if quiet {
         return ProgressBar::hidden();
     }

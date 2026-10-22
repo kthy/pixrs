@@ -8,12 +8,18 @@
 use crate::apply::Lock;
 use crate::catalog::{display_root, library_path, Catalog, Library};
 use crate::error::Error;
-use crate::scan::{resolve, stamp};
+use crate::scan::{progress_bar, resolve, stamp};
 use std::fs;
 use std::path::{absolute, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 /// Most cataloged files compared with the new place before the catalog is changed.
 const SAMPLE: usize = 100;
+
+/// Files compared at once. On a network share each lookup waits for round trips, about a second
+/// per file on an SMB share mounted in WSL.
+const COMPARERS: usize = 8;
 
 /// Share of the compared files, in percent, that must be at the new place unchanged.
 const MIN_MATCHING: usize = 90;
@@ -84,15 +90,26 @@ pub fn relocate(
     let files = catalog.files(library.id)?;
     let step = files.len().div_ceil(SAMPLE).max(1);
     let sample: Vec<_> = files.iter().step_by(step).collect();
-    let matching = sample
-        .iter()
-        .filter(|file| {
-            let path = library_path(&new, &file.path);
-            fs::metadata(path)
-                .and_then(|meta| stamp(&meta))
-                .is_ok_and(|stamp| stamp == file.stamp)
-        })
-        .count();
+    let pb = progress_bar(sample.len() as u64, "Comparing", false, false);
+    let matching = AtomicUsize::new(0);
+    thread::scope(|s| {
+        for chunk in sample.chunks(sample.len().div_ceil(COMPARERS).max(1)) {
+            let (new, pb, matching) = (&new, &pb, &matching);
+            s.spawn(move || {
+                for file in chunk {
+                    let same = fs::metadata(library_path(new, &file.path))
+                        .and_then(|meta| stamp(&meta))
+                        .is_ok_and(|stamp| stamp == file.stamp);
+                    if same {
+                        matching.fetch_add(1, Ordering::Relaxed);
+                    }
+                    pb.inc(1);
+                }
+            });
+        }
+    });
+    pb.finish_and_clear();
+    let matching = matching.into_inner();
     if !force && matching * 100 < sample.len() * MIN_MATCHING {
         return Err(Error::Usage(format!(
             "Only {} of {} cataloged files compared are in {} with the same size and \

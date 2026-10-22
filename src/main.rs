@@ -20,7 +20,7 @@
  *************************************************************************************************/
 
 use clap::{CommandFactory, Parser};
-use indicatif::HumanDuration;
+use indicatif::{HumanCount, HumanDuration};
 use log::{debug, error};
 use pixrs::catalog::{display_root, Catalog};
 use pixrs::dupes::{
@@ -312,7 +312,7 @@ fn relocate(opt: RelocateOpt) {
     }
     println!(
         "The catalog lists the {} {} in the library {} now. Scan it to pick up any changes.",
-        s.files,
+        HumanCount(s.files as u64),
         plural(s.files, "file", "files"),
         s.library
     );
@@ -409,6 +409,7 @@ fn serve(opt: ServeOpt) {
 fn set_ctrlc_handler() {
     ctrlc::set_handler(move || {
         println!("Ctrl-C received, stopping.");
+        pixrs::apply::release_lock();
         exit(exitcode::OK);
     })
     .expect("Error setting Ctrl-C handler");

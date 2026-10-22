@@ -16,6 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One line of a journal. Every step is written, and flushed to disk, before it is taken.
@@ -94,8 +95,19 @@ impl Journal {
 }
 
 /// The lock that keeps `apply`, `undo` and `relocate` runs on one catalog apart. Removed when
-/// dropped.
+/// dropped, or by `release_lock` when the process is stopped.
 pub(crate) struct Lock(PathBuf);
+
+/// The lock this process holds, for `release_lock`.
+static HELD: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Remove the lock this process holds, if any. For the Ctrl-C handler, which exits without
+/// running destructors; an interrupted `apply` is reversed with `undo`, which needs the lock.
+pub fn release_lock() {
+    if let Some(path) = HELD.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = fs::remove_file(path);
+    }
+}
 
 impl Lock {
     pub(crate) fn take(catalog: &Path) -> Result<Lock, Error> {
@@ -103,6 +115,7 @@ impl Lock {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 let _ = writeln!(file, "{}", std::process::id());
+                *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
                 Ok(Lock(path))
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Usage(format!(
@@ -117,6 +130,10 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_ref() == Some(&self.0) {
+            held.take();
+        }
         let _ = fs::remove_file(&self.0);
     }
 }
