@@ -12,6 +12,7 @@ use crate::dupes::{plural, DupeReport, Tier};
 use crate::error::Error;
 use crate::media::MediaType;
 use crate::template::{sanitize, Facts, Template};
+use crate::text::printable;
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -818,8 +819,9 @@ pub fn write_summary(
     out: &mut impl Write,
 ) -> io::Result<()> {
     let sidecars = plan.moves.iter().filter(|m| m.sidecar_of.is_some()).count();
+    // Names from the library, and warnings that quote them.
     for m in plan.moves.iter().take(SUMMARY_MOVES) {
-        writeln!(out, "{}\n  -> {}", m.from, m.to)?;
+        writeln!(out, "{}\n  -> {}", printable(&m.from), printable(&m.to))?;
     }
     if plan.moves.len() > SUMMARY_MOVES {
         writeln!(
@@ -829,10 +831,15 @@ pub fn write_summary(
         )?;
     }
     for (wanted, got) in &notes.collisions {
-        writeln!(out, "Warning: {} is taken, using {}", wanted, got)?;
+        writeln!(
+            out,
+            "Warning: {} is taken, using {}",
+            printable(wanted),
+            printable(got)
+        )?;
     }
     for warning in &notes.warnings {
-        writeln!(out, "Warning: {}", warning)?;
+        writeln!(out, "Warning: {}", printable(warning))?;
     }
     writeln!(
         out,
@@ -1046,6 +1053,24 @@ mod tests {
         let path = write_plan(&plan, now).unwrap();
         assert!(path.starts_with(f.catalog_path.parent().unwrap().join("plans")));
         assert_eq!(read_plan(&path).unwrap(), plan);
+    }
+
+    #[test]
+    fn test_summary_escapes_control_characters_in_names() {
+        let f = fixture(&[("a.jpg", None)]);
+        let (mut plan, mut notes) = organize(&f, "image/{name}.{ext}", false);
+        plan.moves[0].from = String::from("/lib/a\u{1b}[2J.jpg");
+        notes
+            .collisions
+            .push((String::from("x\u{7}.jpg"), String::from("x\u{7}_2.jpg")));
+        notes.warnings.push(String::from("b.jpg\rDone. stays"));
+        let mut out = vec![];
+        write_summary(&plan, &notes, Path::new("plan.json"), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains(['\u{1b}', '\u{7}', '\r']), "{:?}", text);
+        assert!(text.contains("/lib/a\\u{1b}[2J.jpg\n  -> "), "{}", text);
+        assert!(text.contains("Warning: x\\u{7}.jpg is taken, using x\\u{7}_2.jpg"));
+        assert!(text.contains("Warning: b.jpg\\rDone. stays"));
     }
 
     #[cfg(unix)]

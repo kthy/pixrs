@@ -12,6 +12,7 @@ use crate::catalog::{
     display_root, library_path, one_row_per_file, Catalog, HashedAv, HashedFile, HashedImage,
 };
 use crate::imagehash::{distance, fingerprints_match};
+use crate::text::shown;
 use indicatif::HumanBytes;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -651,7 +652,7 @@ pub fn write_text(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
                 out,
                 "  {}  {}  {}",
                 if file.keep { "keep" } else { "    " },
-                library_path(Path::new(&file.library), &file.path).display(),
+                shown(&library_path(Path::new(&file.library), &file.path)),
                 human_mtime(file.mtime_ns)
             )?;
             match (group.tier, file.matches) {
@@ -953,6 +954,29 @@ mod tests {
         let mut out = vec![];
         write_text(&DupeReport::default(), &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "No duplicates found.\n");
+    }
+
+    #[test]
+    fn test_text_output_escapes_control_characters_in_names() {
+        let fx = Fixture::new();
+        fx.add("/lib", "a.jpg", 2048, 0, Some("aaa"));
+        fx.add(
+            "/lib",
+            "b\u{1b}]0;owned\u{7}\n  keep  c.jpg",
+            2048,
+            60,
+            Some("aaa"),
+        );
+        let mut out = vec![];
+        write_text(&fx.report(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains(['\u{1b}', '\u{7}']), "{:?}", text);
+        assert!(
+            text.contains("b\\u{1b}]0;owned\\u{7}\\n  keep  c.jpg"),
+            "{}",
+            text
+        );
+        assert_eq!(text.lines().filter(|l| l.contains("keep")).count(), 2);
     }
 
     #[test]
