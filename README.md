@@ -279,10 +279,12 @@ Options:
   -h, --help  Print help
 ```
 
-`apply` checks each file before moving it: a file that changed since the plan was made, or
-whose new place is taken, is skipped. Every step is written to a journal next to the catalog
-before it is taken, and the catalog is updated as files move. Moves to another drive copy the
-file, check the copy, and only then remove the original.
+`apply` first checks the plan as a whole: every move must start in one of the plan's libraries
+and end below its target folder (the library, the `--to` folder or the quarantine folder), or
+the plan is refused. It then checks each file before moving it: a file that changed since the
+plan was made, or whose new place is taken, is skipped. Every step is written to a journal next
+to the catalog before it is taken, and the catalog is updated as files move. Moves to another
+drive copy the file, check the copy, and only then remove the original.
 
 `undo` reverses an applied plan, including one that was interrupted, and restores the
 catalog. It looks at where each file actually is, so it is safe to run again.
