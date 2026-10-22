@@ -12,6 +12,7 @@ use crate::dupes::{plural, DupeReport, Tier};
 use crate::error::Error;
 use crate::media::MediaType;
 use crate::template::{sanitize, Facts, Template};
+use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -544,6 +545,16 @@ pub fn plan_quarantine(
                 continue;
             };
             let source = library_path(Path::new(root), &file.path);
+            // One file under two names (a hard link, or one folder cataloged under two
+            // spellings) is no copy: moving it would leave nothing behind.
+            if is_same_file(&source, &keeper.path).unwrap_or(false) {
+                notes.warnings.push(format!(
+                    "{} stays: it is the same file as the kept copy {}",
+                    source.display(),
+                    keeper.path
+                ));
+                continue;
+            }
             let mut segments: Vec<String> = std::iter::once(folder.clone())
                 .chain(file.path.split('/').map(String::from))
                 .collect();

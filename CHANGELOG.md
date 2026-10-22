@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A file cataloged in two overlapping libraries (one scanned inside the other) was reported as
   a duplicate of itself, and `dupes --quarantine` planned to move it, leaving no copy in the
   library. `dupes` and the viewer now count each file on disk once.
+- On Linux, a library on a case-insensitive file system (a Windows drive under WSL, an SMB
+  share, exFAT) scanned under another letter case (`/mnt/c/photos` after `/mnt/c/Photos`)
+  became a second library with the same files, every file was reported as a duplicate of
+  itself, and `dupes --quarantine` followed by `apply` moved the whole library into quarantine.
+  A folder is now recognized as a cataloged library, or part of one, whatever its letter case,
+  and a scan folds a library cataloged under another spelling into it; `relocate` and the
+  commands that take library arguments accept any spelling too. Quarantine never moves a copy
+  that is the same file as the kept one (one folder under two names, or a hard link).
 
 ## [0.2.0] - 2026-10-20
 

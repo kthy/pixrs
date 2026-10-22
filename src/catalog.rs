@@ -17,7 +17,9 @@ use rusqlite::types::Value;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row, Transaction,
 };
+use same_file::is_same_file;
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::create_dir_all;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -248,7 +250,7 @@ impl Catalog {
     ) -> rusqlite::Result<(String, Vec<String>)> {
         let new = Path::new(new_root);
         let tx = self.conn.unchecked_transaction()?;
-        let mut outer: Option<(i64, String)> = None;
+        let mut outer: Option<(i64, String, String)> = None;
         {
             let mut stmt = self
                 .conn
@@ -256,15 +258,14 @@ impl Catalog {
             let rows = stmt.query_map([library_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
             for row in rows {
                 let (id, root): (i64, String) = row?;
-                let shorter = outer.as_ref().is_none_or(|(_, o)| root.len() < o.len());
-                if new.starts_with(&root) && shorter {
-                    outer = Some((id, root));
+                let shorter = outer.as_ref().is_none_or(|(_, o, _)| root.len() < o.len());
+                if let Some(prefix) = path_below(Path::new(&root), new).filter(|_| shorter) {
+                    outer = Some((id, root, prefix));
                 }
             }
         }
         let (id, root) = match outer {
-            Some((id, root)) => {
-                let prefix = rel_root(Path::new(&root), new).unwrap_or_default();
+            Some((id, root, prefix)) => {
                 self.merge_library(library_id, id, &prefix)?;
                 (id, root)
             }
@@ -284,8 +285,8 @@ impl Catalog {
         Ok((root, inner.into_iter().map(|(_, root, _)| root).collect()))
     }
 
-    /// ID, root and path from `root` (ending in `/`) of every library other than `library_id`
-    /// inside `root`.
+    /// ID, root and path from `root` (ending in `/`, or empty for the same folder under another
+    /// spelling) of every library other than `library_id` inside `root`.
     #[allow(clippy::type_complexity)]
     fn nested(
         &self,
@@ -299,7 +300,7 @@ impl Catalog {
         let mut inner = vec![];
         for row in rows {
             let (id, inner_root): (i64, String) = row?;
-            if let Some(prefix) = rel_root(root, Path::new(&inner_root)) {
+            if let Some(prefix) = path_below(root, Path::new(&inner_root)) {
                 inner.push((id, inner_root, prefix));
             }
         }
@@ -1159,21 +1160,84 @@ const MOVED_COLUMNS: &str = "size, mtime_ns, media_type, sha256, taken_at, camer
      camera_model, width, height, hash_version, pixel_hash, phash, fingerprint, duration_ms, \
      frames, chromaprint";
 
-/// The path from `outer` to `inner` with `/` separators and a trailing `/`, if `inner` is
-/// strictly inside `outer`.
-fn rel_root(outer: &Path, inner: &Path) -> Option<String> {
-    let rel = inner.strip_prefix(outer).ok()?;
-    let mut prefix = String::new();
-    for c in rel.components() {
-        match c {
-            Component::Normal(part) => {
-                prefix.push_str(part.to_str()?);
-                prefix.push('/');
-            }
-            _ => return None,
+/// The path from `outer` to `inner` with `/` separators and a trailing `/` if `inner` is inside
+/// `outer`, or empty if they are the same folder: by spelling, or else by file identity when
+/// both exist. On a case-insensitive file system one folder has many spellings, and on Linux
+/// `canonicalize` keeps the one the user typed (`/mnt/c/photos` for `/mnt/c/Photos`), so two
+/// spellings must not become two libraries. Found by identity, the path is spelled as it is on
+/// disk, since the catalog needs one spelling and that is the one a scan sees.
+fn path_below(outer: &Path, inner: &Path) -> Option<String> {
+    let parts = |from: &Path| -> Option<Vec<&OsStr>> {
+        inner
+            .strip_prefix(from)
+            .ok()?
+            .components()
+            .map(|c| match c {
+                Component::Normal(part) => Some(part),
+                _ => None,
+            })
+            .collect()
+    };
+    let join = |parts: Vec<OsString>| -> Option<String> {
+        let mut prefix = String::new();
+        for part in parts {
+            prefix.push_str(part.to_str()?);
+            prefix.push('/');
+        }
+        Some(prefix)
+    };
+    if let Some(parts) = parts(outer) {
+        return join(parts.into_iter().map(OsStr::to_os_string).collect());
+    }
+    let ancestor = inner
+        .ancestors()
+        .find(|ancestor| is_same_file(ancestor, outer).unwrap_or(false))?;
+    let mut dir = outer.to_path_buf();
+    let mut on_disk = vec![];
+    for part in parts(ancestor)? {
+        let name = on_disk_name(&dir, part);
+        dir.push(&name);
+        on_disk.push(name);
+    }
+    join(on_disk)
+}
+
+/// The name in `dir` that is `name` in some letter case: `name` itself if it is there, else the
+/// one the file system reads it as (it is case-insensitive here), else `name` as given.
+fn on_disk_name(dir: &Path, name: &OsStr) -> OsString {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return name.to_os_string();
+    };
+    let wanted = name.to_string_lossy().to_lowercase();
+    let mut same_case = None;
+    for entry in entries.flatten() {
+        let found = entry.file_name();
+        if found == name {
+            return found;
+        }
+        if same_case.is_none() && found.to_string_lossy().to_lowercase() == wanted {
+            same_case = Some(found);
         }
     }
-    (!prefix.is_empty()).then_some(prefix)
+    same_case.unwrap_or_else(|| name.to_os_string())
+}
+
+/// `path` spelled as the catalog spells the library it is in, if it is in one under another
+/// spelling (see `path_below`); otherwise unchanged. Call it on a canonical path before looking
+/// the path up by its spelling.
+pub fn cataloged_spelling(libraries: &[Library], path: &Path) -> PathBuf {
+    if libraries.iter().any(|l| path.starts_with(&l.root)) {
+        return path.to_path_buf();
+    }
+    for library in libraries {
+        let root = Path::new(&library.root);
+        if let Some(prefix) = path_below(root, path) {
+            let mut spelled = root.to_path_buf();
+            spelled.extend(prefix.split('/').filter(|part| !part.is_empty()));
+            return spelled;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// The rows to keep so that each file on disk has one, or `None` if it already has.
@@ -1698,5 +1762,79 @@ mod tests {
             Some("/other")
         );
         assert_eq!(catalog.library_root(other + 1).unwrap(), None);
+    }
+
+    /// A symbolic link stands in for another spelling of the same folder, which only a
+    /// case-insensitive file system can give.
+    #[cfg(unix)]
+    #[test]
+    fn test_one_folder_under_two_names_is_one_library() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("sub")).unwrap();
+        let link = dir.path().join("link");
+        symlink(&lib, &link).unwrap();
+
+        assert_eq!(path_below(&lib, &link), Some(String::new()));
+        assert_eq!(
+            path_below(&lib, &link.join("sub")),
+            Some(String::from("sub/"))
+        );
+        assert_eq!(
+            path_below(&lib, &lib.join("sub/x")),
+            Some(String::from("sub/x/"))
+        );
+        assert_eq!(path_below(&lib, dir.path()), None);
+        // Found by identity, the parts below are spelled as on disk.
+        assert_eq!(
+            path_below(&lib, &link.join("SUB")),
+            Some(String::from("sub/"))
+        );
+        assert_eq!(
+            path_below(&link, &lib.join("sub")),
+            Some(String::from("sub/"))
+        );
+        assert_eq!(path_below(Path::new("/a"), Path::new("/ab")), None);
+
+        let libraries = vec![Library {
+            id: 1,
+            root: lib.to_str().unwrap().to_string(),
+            scanned_at: None,
+            files: 0,
+        }];
+        assert_eq!(
+            cataloged_spelling(&libraries, &link.join("sub")),
+            lib.join("sub")
+        );
+        assert_eq!(cataloged_spelling(&libraries, &link), lib);
+        assert_eq!(
+            cataloged_spelling(&libraries, &link.join("SUB")),
+            lib.join("sub")
+        );
+        assert_eq!(
+            cataloged_spelling(&libraries, &lib.join("x")),
+            lib.join("x")
+        );
+        assert_eq!(cataloged_spelling(&libraries, dir.path()), dir.path());
+
+        // A library cataloged under the other name is folded in, with its hashes.
+        let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+        let a = catalog.library_id(lib.to_str().unwrap()).unwrap();
+        let b = catalog.library_id(link.to_str().unwrap()).unwrap();
+        catalog.upsert(a, &record("sub/x.jpg", 1)).unwrap();
+        catalog
+            .upsert(
+                b,
+                &FileRecord {
+                    sha256: Some(String::from("xxx")),
+                    ..record("sub/x.jpg", 1)
+                },
+            )
+            .unwrap();
+        let folded = catalog.fold_nested(a, &lib).unwrap();
+        assert_eq!(folded, vec![link.to_str().unwrap().to_string()]);
+        assert_eq!(catalog.files(a).unwrap()[0].sha256.as_deref(), Some("xxx"));
+        assert_eq!(catalog.libraries().unwrap().len(), 1);
     }
 }

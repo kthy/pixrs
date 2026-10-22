@@ -22,7 +22,7 @@
 use clap::{CommandFactory, Parser};
 use indicatif::{HumanCount, HumanDuration};
 use log::{debug, error};
-use pixrs::catalog::{display_root, Catalog};
+use pixrs::catalog::{cataloged_spelling, display_root, Catalog};
 use pixrs::dupes::{
     find_dupes, plural, write_csv, write_json, write_text, DupeReport, Similarity, Tier,
 };
@@ -101,12 +101,17 @@ fn fail(context: &str, e: pixrs::error::Error) -> ! {
 
 /// The catalog IDs of the given libraries. Exits if one has not been scanned.
 fn library_ids(catalog: &Catalog, libraries: &[PathBuf], context: &str) -> Vec<i64> {
+    let known = catalog
+        .libraries()
+        .unwrap_or_else(|e| fail(context, e.into()));
     let mut ids: Vec<i64> = vec![];
     for library in libraries {
-        let root = library
+        // Canonical, and spelled as the catalog spells it on a case-insensitive file system.
+        let path = library
             .canonicalize()
             .ok()
-            .and_then(|root| root.to_str().map(String::from));
+            .map(|path| cataloged_spelling(&known, &path));
+        let root = path.as_deref().and_then(|p| p.to_str().map(String::from));
         let id = match root.map(|root| catalog.find_library(&root)).transpose() {
             Ok(id) => id.flatten(),
             Err(e) => fail(context, e.into()),
@@ -114,10 +119,9 @@ fn library_ids(catalog: &Catalog, libraries: &[PathBuf], context: &str) -> Vec<i
         match id {
             Some(id) => ids.push(id),
             None => {
-                let containing = library
-                    .canonicalize()
-                    .ok()
-                    .and_then(|path| catalog.containing_library(&path).ok().flatten());
+                let containing = path
+                    .as_deref()
+                    .and_then(|path| catalog.containing_library(path).ok().flatten());
                 if let Some((_, root)) = containing {
                     eprintln!(
                         "{} is part of the library {}. Pass the library instead.",
