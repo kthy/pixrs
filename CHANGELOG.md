@@ -57,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pixrs scan` stops when the library disappears (an unplugged drive, a dropped network share)
   while reading metadata or hashing, as it already did while decoding, instead of failing on
   every remaining file. What was scanned so far is kept.
+- A symbolic link inside a library named like a target folder (`2023`, say, as an extracted
+  archive can contain) made `pixrs organize` plan moves into it and `pixrs apply` carry them
+  out, so the files landed wherever the link pointed, while the catalog said they were in the
+  library. Files are no longer moved through links: `organize` and `dupes --quarantine` leave
+  files whose target folder is a link where they are, with a warning, and `apply` and `undo`
+  skip a move whose source or target folder is reached through a link.
 - A file cataloged in two overlapping libraries (one scanned inside the other) was reported as
   a duplicate of itself, and `dupes --quarantine` planned to move it, leaving no copy in the
   library. `dupes` and the viewer now count each file on disk once.

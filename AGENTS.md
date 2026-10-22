@@ -87,7 +87,12 @@ Decided details:
   only in letter case are that folder, so folder case is never changed. Token values are sanitized
   to names valid on Windows. Sidecar files (`.xmp`, `.aae`, `.thm`, `.srt`, Google Takeout `.json`)
   with the same base name in the same folder move and are renamed with their media file, unless
-  another media file with that base name stays in the folder. Folders left empty stay unless
+  another media file with that base name stays in the folder. Files are never moved through
+  symbolic links, which could lead anywhere (the scan does not follow links, so a link inside a
+  library is not cataloged and nothing else sees it): a plan puts no file into a folder that is a
+  link, in any letter case, and warns; `apply` and `undo` skip a move whose source or target folder
+  is reached through a link (`through_symlink`: the parts below the plan's roots, or where no root
+  is known, the nearest existing folder must be canonical). Folders left empty stay unless
   `--prune-empty` is given. Each move checks that the file still matches the plan (size, mtime) and
   that the target is free, else skips it; a move that fails before anything changed is skipped too,
   and a folder that cannot be read counts as taken, and only a half-done move stops `apply`. `undo`

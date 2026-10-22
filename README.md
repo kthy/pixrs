@@ -246,6 +246,8 @@ extension.
   warning. Names are compared without regard to letter case on every system.
 - Sidecar files with the same name (`.xmp`, `.aae`, `.thm`, `.srt`, Google Takeout `.json`)
   move with their file.
+- Files are never moved through symbolic links. A file whose target folder is a link (an
+  extracted archive can contain one) stays where it is, with a warning.
 
 `organize` moves nothing. It prints a summary and writes the plan to a file next to the
 catalog; `pixrs apply` carries it out.
