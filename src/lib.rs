@@ -35,3 +35,4 @@ pub mod serve;
 pub mod statics;
 pub mod structs;
 pub mod template;
+pub mod text;

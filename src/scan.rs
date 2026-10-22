@@ -16,6 +16,7 @@ use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, To
 use crate::error::Error;
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
+use crate::text::{printable, shown};
 use indicatif::{HumanCount, HumanDuration, ProgressBar, ProgressState, ProgressStyle};
 use log::debug;
 use nom_exif::{EntryValue, ExifDateTime, ExifTag, Metadata, TrackInfoTag};
@@ -173,7 +174,7 @@ pub fn scan_with(
         };
         if entry.file_type().is_dir() {
             let dir = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-            walk.set_message(dir.display().to_string());
+            walk.set_message(shown(dir).to_string());
             continue;
         }
         if !entry.file_type().is_file() {
@@ -241,7 +242,7 @@ pub fn scan_with(
             tx.commit()?;
             tx = catalog.transaction()?;
         }
-        pb.set_message(file.rel.clone());
+        pb.set_message(printable(&file.rel).into_owned());
         let meta = match read_meta(&file.path) {
             Ok(meta) => meta,
             Err(e) => {
@@ -296,7 +297,7 @@ pub fn scan_with(
             tx.commit()?;
             tx = catalog.transaction()?;
         }
-        pb.set_message(rel.clone());
+        pb.set_message(printable(&rel).into_owned());
         let path = library_path(&root, &rel);
         match hash_file(&path, &pb) {
             Ok(sha256) => {
@@ -376,7 +377,7 @@ pub fn scan_with(
             tx = Some(catalog.transaction()?);
         }
         done += 1;
-        pb.set_message(String::from(rel));
+        pb.set_message(printable(rel).into_owned());
         pb.inc(1);
         match result {
             Ok(Some(hashed)) => {
@@ -393,7 +394,14 @@ pub fn scan_with(
             Ok(None) => summary.media_without_decoder += 1,
             Err(e) => {
                 let path = library_path(&root, rel);
-                pb.suspend(|| eprintln!("Cannot decode {}: {}", path.display(), e));
+                // The reason can quote the file, or come from `ffmpeg`.
+                pb.suspend(|| {
+                    eprintln!(
+                        "Cannot decode {}: {}",
+                        shown(&path),
+                        printable(&e.to_string())
+                    )
+                });
                 if !root.is_dir() {
                     tx.take().expect("a transaction is open").commit()?;
                     return Err(disappeared(&root));
@@ -554,7 +562,11 @@ fn disappeared(root: &Path) -> Error {
 
 /// Print a warning about a file that is skipped.
 fn warn(path: &Path, reason: impl Display) {
-    eprintln!("Skipping {}: {}", path.display(), reason);
+    eprintln!(
+        "Skipping {}: {}",
+        shown(path),
+        printable(&reason.to_string())
+    );
 }
 
 /// Whether the relative path `rel` is `dir` or inside it. The empty string is the library root.

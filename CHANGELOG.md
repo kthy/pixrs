@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pixrs scan` progress bars no longer garble the terminal when a file path is longer than the
   line: the path is cut to fit. The "Found … media files" line no longer runs into the next bar
   when copied.
+- File names were printed as they are, so a name holding terminal escape sequences (legal on
+  every system pixrs runs on) could change the terminal's title or colors, clear the screen or
+  print lines of its own during `pixrs scan`, in `pixrs dupes` and `pixrs organize` output and
+  in `pixrs apply` and `pixrs undo` warnings. Control characters in names and in `ffmpeg`'s
+  messages are now shown escaped, as in `\u{1b}`.
 - `pixrs undo` removed or renamed any file a journal's temporary-file records named, so a
   crafted or damaged journal could delete files; it also created a catalog, or pixrs tables in
   any SQLite file, at the path the journal named, as `pixrs apply` did for a plan. Undo now only

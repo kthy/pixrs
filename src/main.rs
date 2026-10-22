@@ -37,6 +37,7 @@ use pixrs::structs::{
     ApplyOpt, Cli, Command, DupesOpt, Format, OrganizeOpt, RelocateOpt, ScanOpt, ServeOpt, UndoOpt,
 };
 use pixrs::template::Template;
+use pixrs::text::{printable, printable_lines};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -92,10 +93,10 @@ fn catalog_path(given: Option<PathBuf>) -> PathBuf {
     })
 }
 
-/// Print an error and exit with its exit code.
+/// Print an error and exit with its exit code. The message can quote names from a library.
 fn fail(context: &str, e: pixrs::error::Error) -> ! {
     debug!("{:?}", e);
-    eprintln!("{}: {}", context, e);
+    eprintln!("{}: {}", context, printable_lines(&e.to_string()));
     exit(e.exit_code())
 }
 
@@ -267,7 +268,7 @@ fn apply(opt: ApplyOpt) {
         fail(context, e.error)
     });
     for (file, reason) in &summary.skipped {
-        println!("Skipped {}: {}", file, reason);
+        println!("Skipped {}: {}", printable(file), printable(reason));
     }
     println!(
         "Moved {} {}, skipped {}, removed {} empty {}.",
@@ -288,7 +289,7 @@ fn apply(opt: ApplyOpt) {
 fn undo(opt: UndoOpt) {
     let summary = pixrs::apply::undo(&opt.journal).unwrap_or_else(|e| fail("Undo failed", e));
     for warning in &summary.warnings {
-        println!("Warning: {}", warning);
+        println!("Warning: {}", printable(warning));
     }
     println!(
         "Moved {} {} back.",

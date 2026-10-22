@@ -220,6 +220,10 @@ on the LFS files.
 - Rust 2021 edition, `max_width = 99` (see `.rustfmt.toml`).
 - New source files start with a module doc comment and the short license header from
   `src/structs.rs`. `src/lib.rs` and `src/main.rs` carry the full AGPL notice.
+- Print file names, paths from the catalog and messages of external tools through
+  `text::shown` or `text::printable` (`printable_lines` for errors of several lines), in
+  warnings, reports and progress messages alike: a file name can hold control characters, which
+  a terminal acts on.
 - `Cargo.toml` dependencies: major-version spec where possible, with the crate's license as a
   trailing comment aligned with the others. New dependencies must have AGPL-3.0-compatible
   licenses (listed in `about.toml`). After changing dependencies, run `just notices` to
