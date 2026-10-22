@@ -150,6 +150,10 @@ Decided details:
   pixels per side, 512 MiB of decoded pixels and 512 MiB of file (`src/decode.rs`); a file
   beyond that is undecodable. A file can claim any size in a few bytes, and `image`'s
   `into_decoder` does not apply its memory limit to the pixel buffer, so pixrs reserves it.
+  Every `ffmpeg` run starts with `ffmpeg_input_options` (`src/decode.rs`): one decoding thread
+  (each thread holds frames of its own) and `-max_pixels` at the same budget, 512 MiB at 4 bytes
+  a pixel, about 134 megapixels per frame. Phones store larger HEIC and AVIF photos as grids of
+  small tiles, which stay below it.
 - Video and audio similarity: a video's signature is 9 frames at 5%, 15%, ... 85% of its duration
   (`ffmpeg -ss`, duration from `ffprobe`), each with the image perceptual hash; frames shift with
   re-encoding when keyframes are used, fixed fractions do not. The fractions are of the video

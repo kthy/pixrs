@@ -88,6 +88,38 @@ pub const MAX_DIMENSION: u32 = 65_536;
 /// decoded, and a real image that large would exceed `MAX_DECODED_BYTES` as pixels anyway.
 pub const MAX_IMAGE_FILE_BYTES: u64 = MAX_DECODED_BYTES;
 
+/// Most pixels in a frame `ffmpeg` decodes: the in-process budget at 4 bytes a pixel, about 134
+/// megapixels. A file can claim any frame size in a few bytes, and `ffmpeg` allocates what it
+/// claims. Phones store larger HEIC and AVIF photos as grids of small tiles, which stay below it.
+pub const MAX_FFMPEG_PIXELS: u64 = MAX_DECODED_BYTES / 4;
+
+/// The options every `ffmpeg` run starts with, before its input: no prompts, errors only, local
+/// files only (a media file can reference other resources), one decoding thread (several files
+/// are decoded at once already, and each thread holds frames of its own), and no frame over
+/// `MAX_FFMPEG_PIXELS`.
+pub(crate) fn ffmpeg_input_options() -> Vec<String> {
+    input_options(MAX_FFMPEG_PIXELS)
+}
+
+/// `ffmpeg_input_options` with a frame limit of `max_pixels`.
+fn input_options(max_pixels: u64) -> Vec<String> {
+    let options = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+    ];
+    let local = ["-protocol_whitelist", "file", "-max_pixels"];
+    options
+        .into_iter()
+        .chain(local)
+        .map(String::from)
+        .chain([max_pixels.to_string()])
+        .collect()
+}
+
 /// How an image is decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decoder {
@@ -150,8 +182,8 @@ pub fn decode_with_ffmpeg(ffmpeg: &Path, source: &Path) -> Result<DynamicImage, 
     std::fs::File::open(source)?;
     let mut command = Command::new(ffmpeg);
     command
-        .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
-        .args(["-protocol_whitelist", "file", "-i"])
+        .args(ffmpeg_input_options())
+        .arg("-i")
         .arg(file_url(source))
         .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]);
     let png = run_with_timeout(command)?;
@@ -341,6 +373,34 @@ mod tests {
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
         let err = decode_in_process(&path).unwrap_err();
         assert!(!err.is_transient(), "{:?}", err);
+    }
+
+    #[test]
+    fn test_ffmpeg_refuses_frames_over_the_pixel_limit() {
+        let Some(ffmpeg) = find_tool("ffmpeg") else {
+            eprintln!("ffmpeg not available, skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("64x64.png");
+        let img = image::RgbImage::from_fn(64, 64, |x, y| image::Rgb([x as u8, y as u8, 7]));
+        img.save(&path).unwrap();
+        // The options must come where `ffmpeg` applies them to the decoder, before `-i`.
+        let decode = |max_pixels: u64| {
+            let mut command = Command::new(&ffmpeg);
+            command
+                .args(input_options(max_pixels))
+                .arg("-i")
+                .arg(file_url(&path))
+                .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]);
+            run_with_timeout(command)
+        };
+        let err = decode(64 * 64 - 1).unwrap_err();
+        assert!(!err.is_transient(), "{:?}", err);
+        assert!(!decode(64 * 64).unwrap().is_empty());
+        let decoded = decode_with_ffmpeg(&ffmpeg, &path).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (64, 64));
+        assert!(ffmpeg_input_options().contains(&MAX_FFMPEG_PIXELS.to_string()));
     }
 
     #[test]
