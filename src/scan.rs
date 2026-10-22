@@ -243,9 +243,12 @@ pub fn scan_with(
             tx = catalog.transaction()?;
         }
         pb.set_message(printable(&file.rel).into_owned());
-        let meta = match read_meta(&file.path) {
-            Ok(meta) => meta,
-            Err(e) => {
+        // A parser bug on one broken file should not end the scan, or keep the file out of the
+        // catalog: it is cataloged without metadata, like a file whose metadata cannot be parsed.
+        let read = catch_unwind(AssertUnwindSafe(|| read_meta(&file.path)));
+        let meta = match read {
+            Ok(Ok(meta)) => meta,
+            Ok(Err(e)) => {
                 pb.suspend(|| warn(&file.path, &e));
                 if !root.is_dir() {
                     pb.finish_and_clear();
@@ -255,6 +258,15 @@ pub fn scan_with(
                 summary.skipped += 1;
                 pb.inc(1);
                 continue;
+            }
+            Err(_) => {
+                pb.suspend(|| {
+                    eprintln!(
+                        "Cataloging {} without metadata: the metadata parser crashed on it",
+                        shown(&file.path)
+                    )
+                });
+                MediaMeta::default()
             }
         };
         let record = FileRecord {
@@ -672,6 +684,8 @@ fn hash_file(path: &Path, pb: &ProgressBar) -> io::Result<String> {
 ///
 /// Files without readable metadata get empty metadata. Only failing to read the file is an error.
 fn read_meta(path: &Path) -> io::Result<MediaMeta> {
+    #[cfg(test)]
+    tests::crash_if_asked(path);
     let meta = match nom_exif::read_metadata(path) {
         Ok(Metadata::Exif(exif)) => MediaMeta {
             taken_at: exif
@@ -1137,6 +1151,35 @@ mod tests {
         fx.write("broken.jpg", b"not really a jpeg");
         fx.scan();
         assert_eq!(fx.files()[0].meta, MediaMeta::default());
+    }
+
+    /// The name of a file `read_meta` panics on, as a metadata parser with a bug can on a
+    /// broken file.
+    const CRASHES_THE_PARSER: &str = "crashes the parser.jpg";
+
+    pub(super) fn crash_if_asked(path: &Path) {
+        if path
+            .file_name()
+            .is_some_and(|name| name == CRASHES_THE_PARSER)
+        {
+            panic!("a metadata parser bug");
+        }
+    }
+
+    #[test]
+    fn test_a_crashing_metadata_parser_does_not_end_the_scan() {
+        let fx = Fixture::new();
+        let jpeg = jpeg_with_exif("Canon", "EOS 5D", "2019:07:14 12:34:56");
+        fx.write(CRASHES_THE_PARSER, &jpeg);
+        fx.write("fine.jpg", &jpeg);
+        let summary = fx.scan();
+        assert_eq!((summary.added, summary.skipped), (2, 0));
+        let files = fx.files();
+        let meta = |name: &str| &files.iter().find(|f| f.path == name).unwrap().meta;
+        assert_eq!(*meta(CRASHES_THE_PARSER), MediaMeta::default());
+        assert_eq!(meta("fine.jpg").camera_make.as_deref(), Some("Canon"));
+        // Cataloged, so a rescan does not read it again.
+        assert_eq!(fx.scan().unchanged, 2);
     }
 
     #[test]

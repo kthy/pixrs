@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is never put in place.
 - `pixrs scan` no longer prints `nom_exif` errors in the middle of the progress bars (files it
   cannot read are already reported); set `RUST_LOG` to see dependencies' log output.
+- A file that made the metadata parser panic ended `pixrs scan`, and every later scan of the
+  library ended at the same file. The file is now cataloged without metadata, with a warning,
+  and the scan goes on, as it already did when a decoder panicked.
 - `pixrs apply` carried out whatever moves a plan file listed, so a crafted or edited plan
   could move any file of known size and mtime anywhere, and a sidecar entry pointing at a
   move that did not exist crashed it. A plan is now checked as a whole before anything
