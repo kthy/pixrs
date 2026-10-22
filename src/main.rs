@@ -34,7 +34,7 @@ use pixrs::plan::{
 use pixrs::serve::{default_cache_dir, Config};
 use pixrs::statics::{LICENSE, THIRD_PARTY_NOTICES};
 use pixrs::structs::{
-    ApplyOpt, Cli, Command, DupesOpt, Format, OrganizeOpt, ScanOpt, ServeOpt, UndoOpt,
+    ApplyOpt, Cli, Command, DupesOpt, Format, OrganizeOpt, RelocateOpt, ScanOpt, ServeOpt, UndoOpt,
 };
 use pixrs::template::Template;
 use std::io::{self, BufWriter, Write};
@@ -71,6 +71,7 @@ fn main() {
         Some(Command::Apply(opt)) => apply(opt),
         Some(Command::Dupes(opt)) => dupes(opt),
         Some(Command::Organize(opt)) => organize(opt),
+        Some(Command::Relocate(opt)) => relocate(opt),
         Some(Command::Undo(opt)) => undo(opt),
         Some(Command::Scan(opt)) => scan(opt, now),
         Some(Command::Serve(opt)) => serve(opt),
@@ -287,6 +288,31 @@ fn undo(opt: UndoOpt) {
         "Moved {} {} back.",
         summary.moved_back,
         plural(summary.moved_back, "file", "files")
+    );
+}
+
+/// Point a library at the folder it was moved to and print a summary.
+fn relocate(opt: RelocateOpt) {
+    let catalog = catalog_path(opt.catalog);
+    let s = pixrs::relocate::relocate(&catalog, &opt.old, &opt.new, opt.force)
+        .unwrap_or_else(|e| fail("Relocate failed", e));
+    println!(
+        "{} of {} files compared are at {} unchanged.",
+        s.matching,
+        s.compared,
+        opt.new.display()
+    );
+    for root in &s.folded {
+        println!(
+            "Folded the library {} into this one, with its hashes.",
+            root
+        );
+    }
+    println!(
+        "The catalog lists the {} {} in the library {} now. Scan it to pick up any changes.",
+        s.files,
+        plural(s.files, "file", "files"),
+        s.library
     );
 }
 

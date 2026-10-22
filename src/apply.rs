@@ -93,11 +93,12 @@ impl Journal {
     }
 }
 
-/// The lock that keeps two `apply` or `undo` runs on one catalog apart. Removed when dropped.
-struct Lock(PathBuf);
+/// The lock that keeps `apply`, `undo` and `relocate` runs on one catalog apart. Removed when
+/// dropped.
+pub(crate) struct Lock(PathBuf);
 
 impl Lock {
-    fn take(catalog: &Path) -> Result<Lock, Error> {
+    pub(crate) fn take(catalog: &Path) -> Result<Lock, Error> {
         let path = state_dir(catalog, "pixrs.lock");
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
@@ -105,8 +106,8 @@ impl Lock {
                 Ok(Lock(path))
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Usage(format!(
-                "{} exists: another `pixrs apply` or `pixrs undo` is running on this catalog. \
-                 If none is (it crashed), delete the file and try again.",
+                "{} exists: another `pixrs apply`, `undo` or `relocate` is running on this \
+                 catalog. If none is (it crashed), delete the file and try again.",
                 path.display()
             ))),
             Err(e) => Err(e.into()),

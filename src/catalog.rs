@@ -225,22 +225,91 @@ impl Catalog {
     /// hashes the outer row lacks are taken from the inner one; otherwise the outer row stays.
     /// Returns the roots of the folded libraries.
     pub fn fold_nested(&self, library_id: i64, root: &Path) -> rusqlite::Result<Vec<String>> {
-        let mut inner: Vec<(i64, String, String)> = vec![];
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, root FROM libraries WHERE id != ?1 ORDER BY root")?;
-            let rows = stmt.query_map([library_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            for row in rows {
-                let (id, inner_root): (i64, String) = row?;
-                if let Some(prefix) = rel_root(root, Path::new(&inner_root)) {
-                    inner.push((id, inner_root, prefix));
-                }
-            }
-        }
+        let inner = self.nested(library_id, root)?;
         if inner.is_empty() {
             return Ok(vec![]);
         }
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, _, prefix) in &inner {
+            self.merge_library(*id, library_id, prefix)?;
+        }
+        tx.commit()?;
+        Ok(inner.into_iter().map(|(_, root, _)| root).collect())
+    }
+
+    /// Point the library `library_id` at `new_root`, where its files are now, keeping its rows
+    /// and their hashes. If `new_root` is another library's root or inside it, the rows move
+    /// into that library instead, as `fold_nested` moves them; libraries inside `new_root` are
+    /// folded in. Returns the root of the library the rows are in now, and the folded roots.
+    pub fn relocate(
+        &self,
+        library_id: i64,
+        new_root: &str,
+    ) -> rusqlite::Result<(String, Vec<String>)> {
+        let new = Path::new(new_root);
+        let tx = self.conn.unchecked_transaction()?;
+        let mut outer: Option<(i64, String)> = None;
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, root FROM libraries WHERE id != ?1")?;
+            let rows = stmt.query_map([library_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            for row in rows {
+                let (id, root): (i64, String) = row?;
+                let shorter = outer.as_ref().is_none_or(|(_, o)| root.len() < o.len());
+                if new.starts_with(&root) && shorter {
+                    outer = Some((id, root));
+                }
+            }
+        }
+        let (id, root) = match outer {
+            Some((id, root)) => {
+                let prefix = rel_root(Path::new(&root), new).unwrap_or_default();
+                self.merge_library(library_id, id, &prefix)?;
+                (id, root)
+            }
+            None => {
+                self.conn.execute(
+                    "UPDATE libraries SET root = ?2 WHERE id = ?1",
+                    params![library_id, new_root],
+                )?;
+                (library_id, String::from(new_root))
+            }
+        };
+        let inner = self.nested(id, Path::new(&root))?;
+        for (inner_id, _, prefix) in &inner {
+            self.merge_library(*inner_id, id, prefix)?;
+        }
+        tx.commit()?;
+        Ok((root, inner.into_iter().map(|(_, root, _)| root).collect()))
+    }
+
+    /// ID, root and path from `root` (ending in `/`) of every library other than `library_id`
+    /// inside `root`.
+    #[allow(clippy::type_complexity)]
+    fn nested(
+        &self,
+        library_id: i64,
+        root: &Path,
+    ) -> rusqlite::Result<Vec<(i64, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, root FROM libraries WHERE id != ?1 ORDER BY root")?;
+        let rows = stmt.query_map([library_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut inner = vec![];
+        for row in rows {
+            let (id, inner_root): (i64, String) = row?;
+            if let Some(prefix) = rel_root(root, Path::new(&inner_root)) {
+                inner.push((id, inner_root, prefix));
+            }
+        }
+        Ok(inner)
+    }
+
+    /// Move the rows of library `from` into library `into`, with `prefix` in front of their
+    /// paths, and drop `from`. Where `into` has a row for a file with the same size and mtime,
+    /// it takes the hashes it lacks; otherwise it stays. Run it in a transaction.
+    fn merge_library(&self, from: i64, into: i64, prefix: &str) -> rusqlite::Result<()> {
         let hash_columns = HASH_COLUMNS
             .iter()
             .map(|c| {
@@ -251,33 +320,29 @@ impl Catalog {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let tx = self.conn.unchecked_transaction()?;
-        for (id, _, prefix) in &inner {
-            self.conn.execute(
-                &format!(
-                    "UPDATE files AS o SET sha256 = coalesce(o.sha256, i.sha256), {}
-                     FROM files AS i
-                     WHERE o.library_id = ?1 AND i.library_id = ?2 AND o.path = ?3 || i.path
-                       AND o.size = i.size AND o.mtime_ns = i.mtime_ns",
-                    hash_columns
-                ),
-                params![library_id, id, prefix],
-            )?;
-            self.conn.execute(
-                &format!(
-                    "INSERT OR IGNORE INTO files (library_id, path, {cols})
-                     SELECT ?1, ?3 || path, {cols} FROM files WHERE library_id = ?2",
-                    cols = MOVED_COLUMNS
-                ),
-                params![library_id, id, prefix],
-            )?;
-            self.conn
-                .execute("DELETE FROM files WHERE library_id = ?1", [id])?;
-            self.conn
-                .execute("DELETE FROM libraries WHERE id = ?1", [id])?;
-        }
-        tx.commit()?;
-        Ok(inner.into_iter().map(|(_, root, _)| root).collect())
+        self.conn.execute(
+            &format!(
+                "UPDATE files AS o SET sha256 = coalesce(o.sha256, i.sha256), {}
+                 FROM files AS i
+                 WHERE o.library_id = ?1 AND i.library_id = ?2 AND o.path = ?3 || i.path
+                   AND o.size = i.size AND o.mtime_ns = i.mtime_ns",
+                hash_columns
+            ),
+            params![into, from, prefix],
+        )?;
+        self.conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO files (library_id, path, {cols})
+                 SELECT ?1, ?3 || path, {cols} FROM files WHERE library_id = ?2",
+                cols = MOVED_COLUMNS
+            ),
+            params![into, from, prefix],
+        )?;
+        self.conn
+            .execute("DELETE FROM files WHERE library_id = ?1", [from])?;
+        self.conn
+            .execute("DELETE FROM libraries WHERE id = ?1", [from])?;
+        Ok(())
     }
 
     /// The ID of the library at `root`, if it has been scanned.

@@ -27,7 +27,12 @@ The planned shape, tracked in GitHub issues #32 to #37 (one per step):
   library scans that part of the library, and scanning a folder that contains libraries folds
   them into it (rows move with their hashes; where both list a file with the same size and
   mtime, the outer row takes the hashes it lacks). `dupes` and the viewer keep one row per file
-  on disk, for catalogs from 0.2.0 that already have overlapping libraries.
+  on disk, for catalogs from 0.2.0 that already have overlapping libraries. A moved library
+  is pointed at its new place with `pixrs relocate OLD NEW` (#50): OLD is matched against the
+  stored roots (it need not exist), up to 100 files spread over the library must be at NEW with
+  the same size and mtime (at least 90%, unless `--force`), and NEW follows the overlap rules
+  above (merged into a library containing it, folding libraries inside it). It takes the
+  `apply`/`undo` lock.
 - `dupes`: tiered matching. Group by size, then content hash, then hash of decoded pixels
   (same image, different metadata), then perceptual hash (resized or recompressed copies).
   Fuzzy video and audio matching comes last.
