@@ -90,7 +90,11 @@ Decided details:
   verified, and only moves catalog rows that still point at the target. Temporary files are
   journaled with their kind: a stop on the way of a case-only rename is the file itself and is only
   ever put back (next to its old place if that is taken); a copy is only removed while its source
-  still holds every byte of it, otherwise it is kept as `name.pixrs-recovered.ext`. A source must
+  still holds every byte of it, otherwise it is kept as `name.pixrs-recovered.ext`. A journal is
+  input like any other file: `undo` only acts on temporary files named (`.pixrs-<pid>-<ns>-<n>.tmp`)
+  and placed (the target's or source's folder, copied from one of the two) as pixrs makes them,
+  only recreates pruned folders a moved file came from, and like `apply` never creates a catalog
+  or touches a SQLite file without the pixrs schema. A source must
   still match the plan right before it is removed after a cross-filesystem copy. Cross-filesystem
   moves copy to a temporary name, verify the SHA-256, keep the mtime, rename, then remove the
   source. The catalog is updated as files move. The quarantine folder must be outside every

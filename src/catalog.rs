@@ -163,6 +163,38 @@ impl Catalog {
         Ok(Catalog { conn })
     }
 
+    /// Open the catalog at `path` for writing. It must exist and have the current schema: unlike
+    /// `open`, nothing is created, so a path from a plan or journal file cannot make a catalog,
+    /// or put tables into another SQLite file.
+    pub fn open_for_update(path: &Path) -> Result<Self, Error> {
+        if !path.is_file() {
+            return Err(Error::Usage(format!(
+                "There is no catalog at {}",
+                path.display()
+            )));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        // Before anything is written to the file, such as the journal mode.
+        let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(Error::Usage(format!(
+                "{} is not a catalog this version of pixrs understands (schema version {}, \
+                 expected {})",
+                path.display(),
+                version,
+                SCHEMA_VERSION
+            )));
+        }
+        conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Catalog { conn })
+    }
+
     /// Open the catalog at `path` read-only. It must exist and have the current schema.
     pub fn open_existing(path: &Path) -> Result<Self, Error> {
         if !path.is_file() {

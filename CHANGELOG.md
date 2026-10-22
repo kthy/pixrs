@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pixrs scan` progress bars no longer garble the terminal when a file path is longer than the
   line: the path is cut to fit. The "Found … media files" line no longer runs into the next bar
   when copied.
+- `pixrs undo` removed or renamed any file a journal's temporary-file records named, so a
+  crafted or damaged journal could delete files; it also created a catalog, or pixrs tables in
+  any SQLite file, at the path the journal named, as `pixrs apply` did for a plan. Undo now only
+  touches temporary files named and placed as pixrs makes them, only recreates pruned folders
+  a moved file came from, only removes a copy at a target that also has the moved file's
+  mtime, and both commands refuse a catalog path that does not hold a pixrs catalog.
 - `pixrs scan` no longer prints `nom_exif` errors in the middle of the progress bars (files it
   cannot read are already reported); set `RUST_LOG` to see dependencies' log output.
 - `pixrs scan` stops when the library disappears (an unplugged drive, a dropped network share)
