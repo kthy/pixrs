@@ -29,6 +29,7 @@ pub mod error;
 pub mod imagehash;
 pub mod media;
 pub mod plan;
+pub mod relocate;
 pub mod scan;
 pub mod serve;
 pub mod statics;

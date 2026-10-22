@@ -14,6 +14,7 @@ Commands:
   apply     Carry out a plan from `organize` or `dupes --quarantine`
   dupes     Report duplicate and similar files in the catalog
   organize  Plan how to rename and move a library's files by a template
+  relocate  Point a library at the folder it was moved to
   scan      Scan a media library into the catalog
   serve     Browse the catalog in a local web viewer
   undo      Reverse an applied plan, from its journal
@@ -58,6 +59,30 @@ decoders. The library itself is never modified.
 Scanning a folder inside a scanned library scans only that part of the library. Scanning a
 folder that contains scanned libraries makes them part of it, keeping their hashes, so a scan
 of `photos/phone` followed by one of `photos` reads the phone's files only once.
+
+### Move a library
+
+```text
+Usage: pixrs relocate [OPTIONS] <OLD> <NEW>
+
+Arguments:
+  <OLD>  Where the library was when it was scanned
+  <NEW>  Where the library is now
+
+Options:
+      --catalog <CATALOG>  The catalog file [default: catalog.sqlite in the OS
+                           data directory]
+      --force              Move the library even if most of its files are not
+                           found unchanged at NEW
+  -h, --help               Print help
+```
+
+When a library moves (another mount point, drive letter or parent folder), `relocate` points
+the catalog at the new place instead of scanning it again as a new library, keeping every hash.
+It first compares up to 100 cataloged files with what is at the new place and refuses if fewer
+than 90% are there with the same size and modification time, so a wrong folder is not taken for
+the library. Like `scan`, it makes a library inside another one part of it, and folds libraries
+inside the new place into it. Scan the library afterwards to pick up any changes.
 
 ### Report duplicates
 

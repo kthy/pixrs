@@ -41,6 +41,8 @@ pub enum Command {
     Dupes(DupesOpt),
     /// Plan how to rename and move a library's files by a template
     Organize(OrganizeOpt),
+    /// Point a library at the folder it was moved to
+    Relocate(RelocateOpt),
     /// Scan a media library into the catalog
     Scan(ScanOpt),
     /// Browse the catalog in a local web viewer
@@ -150,6 +152,24 @@ pub struct ApplyOpt {
 pub struct UndoOpt {
     /// The journal file `apply` wrote
     pub journal: PathBuf,
+}
+
+/// Options for `pixrs relocate`.
+#[derive(Debug, Args)]
+pub struct RelocateOpt {
+    /// Where the library was when it was scanned
+    pub old: PathBuf,
+
+    /// Where the library is now
+    pub new: PathBuf,
+
+    /// The catalog file [default: catalog.sqlite in the OS data directory]
+    #[arg(long)]
+    pub catalog: Option<PathBuf>,
+
+    /// Move the library even if most of its files are not found unchanged at NEW
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Options for `pixrs serve`.

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `pixrs relocate OLD NEW` points a library at the folder it was moved to (another mount point,
+  drive letter or parent folder), keeping its hashes, instead of scanning it again as a new
+  library. It checks a sample of the files at the new place first; `--force` skips that check.
+
 ### Changed
 
 - Scanning a folder inside a scanned library scans that part of the library instead of adding
