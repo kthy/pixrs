@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an ETA and the rate instead of the estimated total time.
 - `pixrs scan` hashes up to four files at a time instead of one, which keeps an SSD or a network
   share busy; decoding was already parallel.
+- `pixrs apply` and `pixrs undo` check each folder once a run instead of for every file moved,
+  so a batch of files into the same folders asks the file system far fewer questions: 200 moves
+  on a drive mounted in WSL took 1.5 s instead of 4 s, and on a network share, where every
+  question is a round trip, the difference is larger.
 
 ### Fixed
 

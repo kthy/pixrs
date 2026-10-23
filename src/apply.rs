@@ -448,16 +448,6 @@ fn move_file(
     mut note_via: impl FnMut(&Path, ViaKind, Option<&Path>) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     let dir = to.parent().unwrap_or(Path::new("."));
-    match through_symlink(dir, None) {
-        Ok(false) => {}
-        Ok(true) => {
-            return Err(MoveError::Failed(io::Error::other(format!(
-                "{} is reached through a symbolic link",
-                dir.display()
-            ))))
-        }
-        Err(e) => return Err(MoveError::Failed(e)),
-    }
     if case_only(from, to) {
         if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
             return Err(MoveError::Taken);
@@ -559,30 +549,65 @@ fn changed(path: &Path, size: u64, mtime_ns: i64) -> Option<String> {
     (!same).then(|| String::from("it changed since the plan was made"))
 }
 
+/// Folders a run of `apply` or `undo` has found to be real: they exist, and no symbolic link is
+/// on the way to them. Files mostly share folders with the files before them, and on a network
+/// share each check is a round trip, so each folder is checked once a run. A folder replaced by
+/// a link while the run goes on is not noticed; that is the same race as a file turning up at a
+/// target between its check and the rename (#44).
+#[derive(Default)]
+struct KnownFolders(HashSet<PathBuf>);
+
 /// Whether a symbolic link is on the way to `dir`, so that it is somewhere else than its path
-/// says. With a `base` that `dir` is below, the parts after `base` are checked, as far as they
+/// says. With a `base` that `dir` is below, `base` must be where its path says (canonical), as
+/// the roots plans are made from are, and the parts after it must not be links, as far as they
 /// exist: the rest are created below them. Without one (`undo` has no plan), the nearest
-/// existing ancestor of `dir` must be where its path says (canonical), as the roots plans are
-/// made from are.
-fn through_symlink(dir: &Path, base: Option<&Path>) -> io::Result<bool> {
-    match base {
-        Some(base) if dir.starts_with(base) => {
-            let mut path = base.to_path_buf();
-            for part in dir.strip_prefix(base).expect("a prefix").components() {
-                path.push(part);
-                match fs::symlink_metadata(&path) {
-                    Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-                    Err(e) => return Err(e),
-                }
+/// existing ancestor of `dir` must be canonical. What is found real is remembered in `known`.
+fn through_symlink(dir: &Path, base: Option<&Path>, known: &mut KnownFolders) -> io::Result<bool> {
+    if known.0.contains(dir) {
+        return Ok(false);
+    }
+    let Some(base) = base.filter(|base| dir.starts_with(base)) else {
+        let existing = dir.ancestors().find(|d| exists(d)).unwrap_or(dir);
+        if known.0.contains(existing) {
+            return Ok(false);
+        }
+        let real = fs::canonicalize(existing)? == existing;
+        if real {
+            known.0.insert(existing.to_path_buf());
+        }
+        return Ok(!real);
+    };
+    if through_symlink(base, None, known)? {
+        return Ok(true);
+    }
+    let mut path = base.to_path_buf();
+    for part in dir.strip_prefix(base).expect("a prefix").components() {
+        path.push(part);
+        if known.0.contains(&path) {
+            continue;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
+            Ok(meta) if meta.is_dir() => {
+                known.0.insert(path.clone());
             }
-            Ok(false)
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
         }
-        _ => {
-            let existing = dir.ancestors().find(|d| exists(d)).unwrap_or(dir);
-            Ok(fs::canonicalize(existing)? != existing)
-        }
+    }
+    Ok(false)
+}
+
+/// `Err` for a move into `dir` if a symbolic link is on the way to it, or it cannot be checked.
+fn link_free(dir: &Path, known: &mut KnownFolders) -> Result<(), MoveError> {
+    match through_symlink(dir, None, known) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(MoveError::Failed(io::Error::other(format!(
+            "{} is reached through a symbolic link",
+            dir.display()
+        )))),
+        Err(e) => Err(MoveError::Failed(e)),
     }
 }
 
@@ -590,7 +615,7 @@ fn through_symlink(dir: &Path, base: Option<&Path>) -> io::Result<bool> {
 /// target would make the file come from, or go, somewhere else than the plan says. A link
 /// inside a library (from an extracted archive, say) is not in the catalog, since the scan
 /// does not follow links, so this is where it is caught.
-fn misplaced(m: &Move, plan: &Plan) -> Option<String> {
+fn misplaced(m: &Move, plan: &Plan, known: &mut KnownFolders) -> Option<String> {
     let (from, to) = (Path::new(&m.from), Path::new(&m.to));
     // `Plan::check` has seen to it that the source is in one of the plan's libraries and the
     // target below its destination; the parts below those are what a link can hide in.
@@ -607,7 +632,7 @@ fn misplaced(m: &Move, plan: &Plan) -> Option<String> {
         let Some(dir) = dir else {
             continue;
         };
-        match through_symlink(dir, base) {
+        match through_symlink(dir, base, known) {
             Ok(false) => {}
             Ok(true) => {
                 return Some(format!(
@@ -713,6 +738,7 @@ fn apply_journaled(
     })?;
 
     let mut done = vec![false; plan.moves.len()];
+    let mut known = KnownFolders::default();
     for (index, m) in plan.moves.iter().enumerate() {
         let (from, to) = (Path::new(&m.from), Path::new(&m.to));
         let mut skip = |journal: &mut Journal, reason: String| -> Result<(), Error> {
@@ -727,11 +753,11 @@ fn apply_journaled(
             skip(&mut journal, reason)?;
             continue;
         }
-        if let Some(reason) = misplaced(m, plan) {
+        if let Some(reason) = misplaced(m, plan, &mut known) {
             skip(&mut journal, reason)?;
             continue;
         }
-        if let Err(e) = create_folders(to.parent(), &mut journal) {
+        if let Err(e) = create_folders(to.parent(), &mut journal, &mut known) {
             skip(&mut journal, format!("cannot create its folder: {}", e))?;
             continue;
         }
@@ -812,12 +838,20 @@ fn is_empty_dir(dir: &Path) -> bool {
     fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
 }
 
-/// Create the missing folders of `dir`, outermost first, each journaled first.
-fn create_folders(dir: Option<&Path>, journal: &mut Journal) -> io::Result<()> {
+/// Create the missing folders of `dir`, outermost first, each journaled first. Folders in
+/// `known` exist; the ones made here join them.
+fn create_folders(
+    dir: Option<&Path>,
+    journal: &mut Journal,
+    known: &mut KnownFolders,
+) -> io::Result<()> {
     let Some(dir) = dir else {
         return Ok(());
     };
-    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !exists(d)).collect();
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|d| !known.0.contains(*d) && !exists(d))
+        .collect();
     for folder in missing.into_iter().rev() {
         journal.write(&Record::Mkdir {
             path: folder.to_string_lossy().into_owned(),
@@ -829,6 +863,7 @@ fn create_folders(dir: Option<&Path>, journal: &mut Journal) -> io::Result<()> {
         if let Some(parent) = folder.parent() {
             sync_dir(parent)?;
         }
+        known.0.insert(folder.to_path_buf());
     }
     Ok(())
 }
@@ -1137,6 +1172,7 @@ pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
         }
     }
     let opts = ApplyOptions::default();
+    let mut known = KnownFolders::default();
     for record in intents.iter().rev() {
         let Record::Intent {
             index,
@@ -1176,12 +1212,17 @@ pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
         };
         let back = match found {
             Found::AtTarget => {
-                let moved = move_file(to, from, *size, *mtime_ns, &opts, |via, kind, source| {
-                    journal.write(&Record::Via {
-                        index: *index,
-                        path: via.to_string_lossy().into_owned(),
-                        kind,
-                        source: source.map(|s| s.to_string_lossy().into_owned()),
+                // Without a plan, the folder it goes back to must at least be where its path
+                // says, as the roots plans are made from are.
+                let back_to = from.parent().unwrap_or(Path::new("."));
+                let moved = link_free(back_to, &mut known).and_then(|()| {
+                    move_file(to, from, *size, *mtime_ns, &opts, |via, kind, source| {
+                        journal.write(&Record::Via {
+                            index: *index,
+                            path: via.to_string_lossy().into_owned(),
+                            kind,
+                            source: source.map(|s| s.to_string_lossy().into_owned()),
+                        })
                     })
                 });
                 match moved {
@@ -2055,6 +2096,47 @@ mod tests {
         assert_eq!(tree(&f.root), before);
         assert!(!state_dir(&f.catalog_path, "journals").exists());
         assert!(!state_dir(&f.catalog_path, "pixrs.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_destination_swapped_for_a_link_is_caught_once_a_run() {
+        use std::os::unix::fs::symlink;
+        let f = fixture(FILES);
+        let sorted = f.dir.path().canonicalize().unwrap().join("sorted");
+        let elsewhere = f.dir.path().join("elsewhere");
+        fs::create_dir_all(&sorted).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        let catalog = Catalog::open(&f.catalog_path).unwrap();
+        let id = catalog.library_id(f.root.to_str().unwrap()).unwrap();
+        let template = Template::parse("{year}/{name}.{ext}").unwrap();
+        let now = datetime!(2026-10-20 12:00 UTC);
+        let opts = OrganizeOptions {
+            template: &template,
+            undated: "undated",
+            suffix: "_{n}",
+            trust_dates: true,
+            to: Some(sorted.clone()),
+            prune_empty: false,
+            now,
+        };
+        let (plan, _) = plan_organize(&catalog, &f.catalog_path, id, &f.root, &opts).unwrap();
+        drop(catalog);
+        let plan_path = write_plan(&plan, now).unwrap();
+        // The folder the plan sorts into becomes a link before the plan is applied.
+        fs::remove_dir(&sorted).unwrap();
+        symlink(&elsewhere, &sorted).unwrap();
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert_eq!(summary.moved, 0);
+        let reasons: Vec<&str> = summary.skipped.iter().map(|(_, r)| r.as_str()).collect();
+        assert!(
+            reasons
+                .iter()
+                .all(|r| r.contains("symbolic link") || *r == "its media file was not moved"),
+            "{:?}",
+            reasons
+        );
+        assert!(tree(&elsewhere).is_empty());
     }
 
     #[cfg(unix)]
