@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pixrs scan` shows progress while it walks the library (media files found, current folder) and
   then how many files it found and how long that took; on a network share the walk alone can take
   hours. Each step is numbered (`[1/4] Walking` to `[4/4] Decoding`), and the progress bars show
-  an ETA and the rate instead of the estimated total time.
+  an ETA and the rate instead of the estimated total time. After each step a line says what it
+  did and how long it took (`Hashed 286 files, 1.33 GiB (3 minutes)`).
 - `pixrs scan` hashes up to four files at a time instead of one, which keeps an SSD or a network
   share busy; decoding was already parallel.
 - `pixrs apply` and `pixrs undo` check each folder once a run instead of for every file moved,
