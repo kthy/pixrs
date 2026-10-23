@@ -160,13 +160,14 @@ impl Template {
     /// Where a file goes: folder names and the file name, valid on every OS.
     ///
     /// Folder levels that need a date (or time) the file lacks become one `undated` folder. A
-    /// file name that needs a value the file lacks becomes its original name.
+    /// file name that needs a value the file lacks becomes its original name, except that a
+    /// WhatsApp file's counter stands in for a missing `{time}` (see `whatsapp_counter`).
     pub fn render(&self, facts: &Facts, undated: &str) -> Vec<String> {
         let mut out: Vec<String> = vec![];
         let mut in_undated = false;
         for segment in &self.folders {
             if has(segment, facts) {
-                out.push(sanitize(&fill(segment, facts)));
+                out.push(sanitize(&fill(segment, facts, None)));
                 in_undated = false;
             } else if !in_undated {
                 out.push(sanitize(undated));
@@ -174,13 +175,41 @@ impl Template {
             }
         }
         let file = if has(&self.file, facts) {
-            fill(&self.file, facts)
+            fill(&self.file, facts, None)
+        } else if let Some(counter) = self.counter_for_time(facts) {
+            fill(&self.file, facts, Some(counter))
         } else {
             format!("{}.{}", facts.name, facts.ext)
         };
         out.push(sanitize(&file));
         out
     }
+
+    /// The WhatsApp counter to put in place of `{time}` in the file name, if the file has a
+    /// date but no time, its name has a counter, and the time is only needed as `{time}`: a
+    /// counter cannot fill `{hour}`, `{minute}` or `{second}`.
+    fn counter_for_time<'a>(&self, facts: &Facts<'a>) -> Option<&'a str> {
+        let date_only = facts.taken.is_some_and(|d| d.time.is_none());
+        let only_time_token = !self.file.iter().any(|part| {
+            matches!(
+                part,
+                Part::Token(Token::Hour | Token::Minute | Token::Second)
+            )
+        });
+        (date_only && only_time_token)
+            .then(|| whatsapp_counter(facts.name))
+            .flatten()
+    }
+}
+
+/// The counter at the end of a WhatsApp file name: `WA0001` in `IMG-20190501-WA0001` (also
+/// `VID-`, `AUD-`, `PTT-` and the like), and in `2019-05-01_WA0001`, the name pixrs gives such
+/// a file. WhatsApp numbers the files of a day in the order they arrived, so the counter sorts
+/// them within the day as a time would, and the names sort among the dated files around them.
+fn whatsapp_counter(name: &str) -> Option<&str> {
+    let (_, counter) = name.rsplit_once(['-', '_'])?;
+    let digits = counter.strip_prefix("WA")?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(counter)
 }
 
 /// Parse one `/`-free part of a template.
@@ -235,8 +264,8 @@ fn has(segment: &[Part], facts: &Facts) -> bool {
     })
 }
 
-/// The segment filled in; `has` must be true.
-fn fill(segment: &[Part], facts: &Facts) -> String {
+/// The segment filled in; `has` must be true, or `time` must stand in for the missing time.
+fn fill(segment: &[Part], facts: &Facts, time: Option<&str>) -> String {
     let date = facts.taken.unwrap_or(Taken {
         year: 0,
         month: 0,
@@ -256,7 +285,10 @@ fn fill(segment: &[Part], facts: &Facts) -> String {
                 Token::Minute => format!("{:02}", minute),
                 Token::Second => format!("{:02}", second),
                 Token::Date => format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
-                Token::Time => format!("{:02}{:02}{:02}", hour, minute, second),
+                Token::Time => match time {
+                    Some(time) => String::from(time),
+                    None => format!("{:02}{:02}{:02}", hour, minute, second),
+                },
                 Token::Type => String::from(facts.media_type.as_str()),
                 Token::Camera => String::from(facts.camera.unwrap_or("unknown")),
                 Token::Name => String::from(facts.name),
@@ -341,6 +373,67 @@ mod tests {
         assert_eq!(
             t.render(&facts(Some(date_only)), "undated"),
             ["Canon EOS 80D", "2023-05-01 DSC0047.mp4"]
+        );
+    }
+
+    #[test]
+    fn test_whatsapp_counter_stands_in_for_the_time() {
+        let date_only = Taken {
+            time: None,
+            ..MAY_FIRST
+        };
+        let named = |name| Facts {
+            name,
+            ext: "jpg",
+            ..facts(Some(date_only))
+        };
+        let t = Template::from_layout("year").unwrap();
+        for (name, file) in [
+            ("IMG-20230501-WA0001", "2023-05-01_WA0001.jpg"),
+            ("VID-20230501-WA0012", "2023-05-01_WA0012.jpg"),
+            // A name pixrs gave, renamed again the same way: stable.
+            ("2023-05-01_WA0001", "2023-05-01_WA0001.jpg"),
+            // Not a WhatsApp counter: the original name, as for any file without a time.
+            ("IMG-20230501-WA", "IMG-20230501-WA.jpg"),
+            ("IMG-20230501-WAx1", "IMG-20230501-WAx1.jpg"),
+            ("holiday-WAVES", "holiday-WAVES.jpg"),
+        ] {
+            assert_eq!(
+                t.render(&named(name), "undated"),
+                ["2023", file],
+                "{}",
+                name
+            );
+        }
+        // Another template puts the counter where it puts the time.
+        let t = Template::parse("{year}{month}{day}-{time}.{ext}").unwrap();
+        assert_eq!(
+            t.render(&named("IMG-20230501-WA0001"), "undated"),
+            ["20230501-WA0001.jpg"]
+        );
+        // A counter cannot be an hour, minute or second.
+        let t = Template::parse("{date} {hour}h{minute}.{ext}").unwrap();
+        assert_eq!(
+            t.render(&named("IMG-20230501-WA0001"), "undated"),
+            ["IMG-20230501-WA0001.jpg"]
+        );
+        // With a time, the time is used; undated files keep their names.
+        let t = Template::from_layout("year").unwrap();
+        let timed = Facts {
+            name: "IMG-20230501-WA0001",
+            ..facts(Some(MAY_FIRST))
+        };
+        assert_eq!(
+            t.render(&timed, "undated"),
+            ["2023", "2023-05-01_143205.mp4"]
+        );
+        let undated = Facts {
+            name: "IMG-20230501-WA0001",
+            ..facts(None)
+        };
+        assert_eq!(
+            t.render(&undated, "undated"),
+            ["undated", "IMG-20230501-WA0001.mp4"]
         );
     }
 

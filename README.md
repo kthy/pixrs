@@ -245,7 +245,9 @@ extension.
   unless `--trust-dates` is given.
 - A file without a date keeps its name and goes in an `undated` folder in place of the date
   folders, e.g. `video/undated/DSC0047.mp4`. A file with a date but no time gets the date
-  folders and keeps its name.
+  folders and keeps its name, except WhatsApp files: their counter takes the place of the time,
+  so `IMG-20190501-WA0001.jpg` becomes `2019-05-01_WA0001.jpg` and sorts among that day's
+  photos.
 - Nothing is ever overwritten: a file whose new name is taken gets `_2`, `_3` and so on, with a
   warning. Names are compared without regard to letter case on every system.
 - Sidecar files with the same name (`.xmp`, `.aae`, `.thm`, `.srt`, Google Takeout `.json`)

@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `pixrs organize` names WhatsApp files by their date and WhatsApp's counter, which stands in for
+  the time they lack: `IMG-20190501-WA0001.jpg` becomes `2019-05-01_WA0001.jpg` with the
+  presets (`{date}_{time}.{ext}`), so they sort among the other files of the day instead of
+  keeping WhatsApp's name. Templates that use `{hour}`, `{minute}` or `{second}` keep the name.
 - Scanning a folder inside a scanned library scans that part of the library instead of adding
   a second library with the same files. Scanning a folder that contains scanned libraries folds
   them into it, keeping their hashes, instead of reading and hashing their files again.

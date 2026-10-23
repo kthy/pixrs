@@ -66,10 +66,14 @@ Decided details:
 - Date source: EXIF date taken. Fallback: a date parsed from the file name. If there is none,
   keep the original file name (e.g. `DSC0047.jpg`) and put it in a configurable `undated`
   folder in place of the date folders, e.g. `video/undated/DSC0047.mp4`. A date without a time
-  (e.g. WhatsApp `IMG-20190501-WA0001`) fills the date folders, and the file keeps its original
-  name when the template needs a time. Dates before 1980 or more than a day in the future
-  count as missing (broken metadata, e.g. QuickTime's 1904 epoch); `--trust-dates` turns that
-  check off, for scans of old photos named with their real date.
+  fills the date folders, and the file keeps its original name when the template needs a time,
+  except a WhatsApp name: its counter stands in for `{time}` (`IMG-20190501-WA0001.jpg` becomes
+  `2019-05-01_WA0001.jpg` with the presets), so the day's WhatsApp files sort among the other
+  files of that day; a name pixrs gave this way keeps its counter on the next run. A counter
+  cannot fill `{hour}`, `{minute}` or `{second}`: there the name stays. Dates before 1980 or
+  more than a day in the future count as missing (broken metadata, e.g. QuickTime's 1904
+  epoch); `--trust-dates` turns that check off, for scans of old photos named with their real
+  date.
 - Duplicates: report only by default. A flag enables quarantine, which keeps the oldest file and
   moves the others to a quarantine folder. "Oldest" means earliest mtime, with path order as the
   tie-breaker. Exception: in `similar` groups the largest file is kept (most pixels, then most

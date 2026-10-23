@@ -969,7 +969,7 @@ mod tests {
             [
                 "a/2017-10-08 18.15.36.jpg -> image/2017/2017-10-08_181536.jpg",
                 "a/DSC0047.mp4 -> video/undated/DSC0047.mp4",
-                "a/IMG-20190501-WA0001.jpg -> image/2019/IMG-20190501-WA0001.jpg",
+                "a/IMG-20190501-WA0001.jpg -> image/2019/2019-05-01_WA0001.jpg",
                 "a/broken.mov -> video/undated/broken.mov",
                 "a/exif.jpg -> image/2023/2023-05-01_143205.jpg",
                 "a/scan 1965-07-14.jpg -> image/undated/scan 1965-07-14.jpg",
