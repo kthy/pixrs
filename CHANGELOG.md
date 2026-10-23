@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then how many files it found and how long that took; on a network share the walk alone can take
   hours. Each step is numbered (`[1/4] Walking` to `[4/4] Decoding`), and the progress bars show
   an ETA and the rate instead of the estimated total time.
+- `pixrs scan` hashes up to four files at a time instead of one, which keeps an SSD or a network
+  share busy; decoding was already parallel.
 
 ### Fixed
 

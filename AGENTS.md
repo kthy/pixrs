@@ -22,7 +22,10 @@ optimize beyond that without a measured need.
 The planned shape, tracked in GitHub issues #32 to #37 (one per step):
 
 - `scan`: walk the library into a SQLite catalog (path, size, mtime, media type, EXIF fields),
-  then hash only files whose size matches another cataloged file. Incremental: only reread files
+  then hash only files whose size matches another cataloged file, on up to 4 threads
+  (`MAX_HASHERS`: a few reads at once hide a network share's round trips without making a
+  spinning disk seek much), with one thread writing the catalog, as the decoding pass does
+  (`in_parallel` in `src/scan.rs`). Incremental: only reread files
   whose path, size or mtime changed. A metadata parser that panics on a file is caught, as the
   decoders are: the file is cataloged without metadata, with a warning, and the scan goes on.
   Libraries never overlap: scanning a folder inside a
