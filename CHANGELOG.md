@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On an SMB share mounted in WSL, `pixrs apply` skipped the first file moved into each new
+  folder ("cannot create its folder: Input/output error"), and would have stopped after a copy
+  to another drive: the share answers every request to flush a folder to disk with an I/O
+  error. That is now taken, like the "not supported" answers of other network file systems, as
+  a file system that cannot flush folders, and the move goes on.
 - Stopping `pixrs apply` or `pixrs undo` with Ctrl-C left `pixrs.lock` next to the catalog,
   so the next `apply`, `undo` or `relocate` refused to run until it was deleted by hand.
 - An image file claiming absurd dimensions (a few hundred bytes can claim 100,000 x 100,000
