@@ -45,16 +45,16 @@ Options:
 
 The catalog keeps one row per media file: path, size, modification time and, where the file has
 them, date taken, camera and dimensions. Only files that share their size with another cataloged
-file can be exact duplicates, so only those are hashed (SHA-256); files with a unique size are
-never read in full. Images are also decoded, in parallel, for a hash of their pixels and a
-perceptual hash, which find copies that are not byte-identical. JPEG, PNG, GIF, WebP, BMP and
-TIFF are decoded in-process; HEIC and AVIF need [FFmpeg][ffmpeg] 7.1 or later on `PATH`; RAW
-files are skipped. Videos get a signature of 9 frames, which needs `ffmpeg` and `ffprobe` on
-`PATH`, and audio a fingerprint from `fpcalc`, part of [Chromaprint][chromaprint] (on Debian
-and Ubuntu, `apt install libchromaprint-tools`), for finding re-encoded copies. Without these
-tools, those files are cataloged but not compared. Rescanning only reads files that are new or
-whose size or modification time changed, and decodes media again only if an update changed the
-decoders. The library itself is never modified.
+file can be exact duplicates, so only those are hashed (SHA-256), up to four at a time; files with
+a unique size are never read in full. Images are also decoded, in parallel, for a hash of their
+pixels and a perceptual hash, which find copies that are not byte-identical. JPEG, PNG, GIF,
+WebP, BMP and TIFF are decoded in-process; HEIC and AVIF need [FFmpeg][ffmpeg] 7.1 or later on
+`PATH`; RAW files are skipped. Videos get a signature of 9 frames, which needs `ffmpeg` and
+`ffprobe` on `PATH`, and audio a fingerprint from `fpcalc`, part of [Chromaprint][chromaprint]
+(on Debian and Ubuntu, `apt install libchromaprint-tools`), for finding re-encoded copies.
+Without these tools, those files are cataloged but not compared. Rescanning only reads files that
+are new or whose size or modification time changed, and decodes media again only if an update
+changed the decoders. The library itself is never modified.
 
 Scanning a folder inside a scanned library scans only that part of the library. Scanning a
 folder that contains scanned libraries makes them part of it, keeping their hashes, so a scan

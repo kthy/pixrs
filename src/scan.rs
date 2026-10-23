@@ -39,6 +39,10 @@ const COMMIT_EVERY: usize = 256;
 /// Most images decoded at once. Each can take a few hundred MB while it is decoded.
 const MAX_DECODERS: usize = 8;
 
+/// Most files hashed at once. A few reads at once keep an SSD or a network share busy (each
+/// read on a share waits for round trips); many would make a spinning disk seek between them.
+const MAX_HASHERS: usize = 4;
+
 /// What a scan did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ScanSummary {
@@ -303,32 +307,38 @@ pub fn scan_with(
         true,
         quiet,
     );
-    let mut tx = catalog.transaction()?;
-    for (i, (rel, _)) in to_hash.into_iter().enumerate() {
-        if i > 0 && i % COMMIT_EVERY == 0 {
-            tx.commit()?;
-            tx = catalog.transaction()?;
+    let mut tx = Some(catalog.transaction()?);
+    let mut done = 0;
+    let hash = |(rel, _): &(String, u64)| {
+        pb.set_message(printable(rel).into_owned());
+        hash_file(&library_path(&root, rel), &pb)
+    };
+    in_parallel(&to_hash, MAX_HASHERS, hash, |i, hashed| {
+        let rel = &to_hash[i].0;
+        if done > 0 && done % COMMIT_EVERY == 0 {
+            tx.take().expect("a transaction is open").commit()?;
+            tx = Some(catalog.transaction()?);
         }
-        pb.set_message(printable(&rel).into_owned());
-        let path = library_path(&root, &rel);
-        match hash_file(&path, &pb) {
+        done += 1;
+        match hashed {
             Ok(sha256) => {
-                catalog.set_sha256(library_id, &rel, &sha256)?;
+                catalog.set_sha256(library_id, rel, &sha256)?;
                 summary.hashed += 1;
             }
             Err(e) => {
-                pb.suspend(|| warn(&path, &e));
+                pb.suspend(|| warn(&library_path(&root, rel), &e));
                 if !root.is_dir() {
                     pb.finish_and_clear();
-                    tx.commit()?;
+                    tx.take().expect("a transaction is open").commit()?;
                     return Err(disappeared(&root));
                 }
                 summary.skipped += 1;
             }
         }
-    }
+        Ok(())
+    })?;
     pb.finish_and_clear();
-    tx.commit()?;
+    tx.expect("a transaction is open").commit()?;
 
     // Pass 3: image hashes, video signatures and audio fingerprints of files that have none
     // yet, or were made with other decoder versions.
@@ -499,32 +509,44 @@ fn hash_files(
     root: &Path,
     files: &[(&str, MediaType)],
     tools: &Tools,
-    mut record: impl FnMut(usize, Result<Option<Hashed>, DecodeError>) -> Result<(), Error>,
+    record: impl FnMut(usize, Result<Option<Hashed>, DecodeError>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let work = |&(rel, media_type): &(&str, MediaType)| {
+        let path = library_path(root, rel);
+        // A decoder bug on one broken file should not end the scan.
+        catch_unwind(AssertUnwindSafe(|| {
+            hash_media(&path, rel, media_type, tools)
+        }))
+        .unwrap_or_else(|_| Err(DecodeError::Invalid(String::from("the decoder crashed"))))
+    };
+    in_parallel(files, MAX_DECODERS, work, record)
+}
+
+/// `work` on each of `items` on up to `max_workers` threads (no more than there are cores),
+/// passing each result with its index in `items` to `record` on this thread, in the order they
+/// finish. `record` is where the catalog is written: it has one connection, and one writer.
+/// Stops at the first error from `record`.
+fn in_parallel<T: Sync, R: Send>(
+    items: &[T],
+    max_workers: usize,
+    work: impl Fn(&T) -> R + Sync,
+    mut record: impl FnMut(usize, R) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let workers = available_parallelism()
         .map_or(1, |n| n.get())
-        .min(MAX_DECODERS)
-        .min(files.len().max(1));
+        .min(max_workers)
+        .min(items.len().max(1));
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::sync_channel(workers * 2);
     thread::scope(|scope| {
         for _ in 0..workers {
-            let tx = tx.clone();
-            let next = &next;
+            let (tx, next, work) = (tx.clone(), &next, &work);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(&(rel, media_type)) = files.get(i) else {
+                let Some(item) = items.get(i) else {
                     break;
                 };
-                let path = library_path(root, rel);
-                // A decoder bug on one broken file should not end the scan.
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    hash_media(&path, rel, media_type, tools)
-                }))
-                .unwrap_or_else(|_| {
-                    Err(DecodeError::Invalid(String::from("the decoder crashed")))
-                });
-                if tx.send((i, result)).is_err() {
+                if tx.send((i, work(item))).is_err() {
                     break;
                 }
             });
@@ -1058,6 +1080,65 @@ mod tests {
         let files = fx.files();
         assert!(files[0].sha256.is_some());
         assert_eq!(files[0].sha256, files[1].sha256);
+    }
+
+    #[test]
+    fn test_many_files_are_hashed_in_parallel_each_with_its_own_hash() {
+        let fx = Fixture::new();
+        // All the same size, all different, so all are hashed; more than one commit's worth.
+        let n = COMMIT_EVERY + 44;
+        for i in 0..n {
+            fx.write(
+                &format!("d{}/{:05}.jpg", i % 7, i),
+                format!("{:05}", i).as_bytes(),
+            );
+        }
+        let summary = fx.scan();
+        assert_eq!((summary.hashed, summary.skipped), (n, 0));
+        for file in fx.files() {
+            let name = file.path.rsplit('/').next().unwrap();
+            let expected = ring::digest::digest(&SHA256, name.trim_end_matches(".jpg").as_bytes());
+            assert_eq!(
+                file.sha256.as_deref(),
+                Some(data_encoding::HEXLOWER.encode(expected.as_ref()).as_str()),
+                "{}",
+                file.path
+            );
+        }
+    }
+
+    #[test]
+    fn test_in_parallel_does_each_item_once_and_stops_at_an_error() {
+        let items: Vec<usize> = (0..1000).collect();
+        let mut seen = vec![0; items.len()];
+        in_parallel(
+            &items,
+            4,
+            |&i| i * 2,
+            |i, doubled| {
+                assert_eq!(doubled, i * 2);
+                seen[i] += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(seen.iter().all(|&n| n == 1));
+
+        let mut recorded = 0;
+        let stopped = in_parallel(
+            &items,
+            4,
+            |&i| i,
+            |_, _| {
+                recorded += 1;
+                if recorded == 10 {
+                    return Err(Error::Usage(String::from("stop")));
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(stopped, Err(Error::Usage(_))));
+        assert_eq!(recorded, 10);
     }
 
     #[test]
