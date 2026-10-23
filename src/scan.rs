@@ -17,7 +17,9 @@ use crate::error::Error;
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
 use crate::text::{printable, shown};
-use indicatif::{HumanCount, HumanDuration, ProgressBar, ProgressState, ProgressStyle};
+use indicatif::{
+    HumanBytes, HumanCount, HumanDuration, ProgressBar, ProgressState, ProgressStyle,
+};
 use log::debug;
 use nom_exif::{EntryValue, ExifDateTime, ExifTag, Metadata, TrackInfoTag};
 use ring::digest::{Context, SHA256};
@@ -288,7 +290,7 @@ pub fn scan_with(
         }
         pb.inc(1);
     }
-    pb.finish_and_clear();
+    finish_step(&pb, format!("Read {} files", HumanCount(pb.position())));
 
     for rel in known.keys() {
         if !seen.contains(rel) && !unreadable.iter().any(|dir| is_within(rel, dir)) {
@@ -337,7 +339,14 @@ pub fn scan_with(
         }
         Ok(())
     })?;
-    pb.finish_and_clear();
+    finish_step(
+        &pb,
+        format!(
+            "Hashed {} files, {}",
+            HumanCount(done as u64),
+            HumanBytes(pb.position())
+        ),
+    );
     tx.expect("a transaction is open").commit()?;
 
     // Pass 3: image hashes, video signatures and audio fingerprints of files that have none
@@ -440,7 +449,7 @@ pub fn scan_with(
         }
         Ok(())
     })?;
-    pb.finish_and_clear();
+    finish_step(&pb, format!("Decoded {} files", HumanCount(pb.position())));
     if part.is_empty() {
         catalog.mark_scanned(library_id)?;
     }
@@ -666,6 +675,16 @@ pub(crate) fn progress_bar(
             .progress_chars("##-"),
     );
     pb
+}
+
+/// Clear a finished step's progress bar and print what the step did and how long it took, as
+/// the walk does, unless the bars are hidden.
+fn finish_step(pb: &ProgressBar, done: String) {
+    pb.finish_and_clear();
+    // Not `pb.println`, which pads the line to the terminal width instead of ending it.
+    if !pb.is_hidden() {
+        eprintln!("{} ({})", done, HumanDuration(pb.elapsed()));
+    }
 }
 
 /// A spinner counting media files, with the current folder as its message.
