@@ -8,6 +8,7 @@
 use crate::catalog::{Catalog, CatalogRow};
 use crate::error::Error;
 use crate::plan::{state_dir, Keeper, Move, Plan};
+use log::debug;
 use ring::digest::{Context, SHA256};
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
@@ -359,22 +360,34 @@ fn sha256_from(mut reader: impl Read) -> io::Result<Vec<u8>> {
 
 /// Flush a folder's entries to disk, so a rename in it survives a power cut. Windows has no
 /// such call for folders; its file systems journal metadata. Some network and FUSE file systems
-/// cannot do it either and say so; that is not an error.
+/// cannot do it either and say so; that is not an error: the rename or new folder it follows is
+/// in place already, and only its durability is not guaranteed.
 fn sync_dir(dir: &Path) -> io::Result<()> {
     if !cfg!(unix) {
         return Ok(());
     }
-    match File::open(dir).and_then(|d| d.sync_all()) {
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
-            ) =>
-        {
+    let synced = File::open(dir).and_then(|d| d.sync_all());
+    #[cfg(test)]
+    let synced = synced.and_then(|()| tests::folder_sync_result());
+    match synced {
+        Err(e) if cannot_sync_folders(&e) => {
+            debug!("Cannot flush the folder {}: {}", dir.display(), e);
             Ok(())
         }
         other => other,
     }
+}
+
+/// `EIO` on Linux and macOS.
+const EIO: i32 = 5;
+
+/// Whether a failed folder flush means the file system cannot flush folders. Most say so with
+/// `EINVAL` or `ENOTSUP`; an SMB share mounted in WSL answers every folder flush with `EIO`.
+fn cannot_sync_folders(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    ) || e.raw_os_error() == Some(EIO)
 }
 
 /// Copy `from` into `copy`, the open temporary file reserved at `via`, flushed to disk, with
@@ -1467,6 +1480,64 @@ mod tests {
         undo(&summary.journal).unwrap();
         assert_eq!(tree(&f.root), before);
         assert_eq!(rows(&f), catalog_before);
+    }
+
+    thread_local! {
+        /// The OS error every folder flush on this thread fails with, as on a file system that
+        /// cannot flush folders.
+        static FOLDER_SYNC_ERROR: std::cell::Cell<Option<i32>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn folder_sync_result() -> io::Result<()> {
+        match FOLDER_SYNC_ERROR.with(std::cell::Cell::get) {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => Ok(()),
+        }
+    }
+
+    #[test]
+    fn test_which_folder_flush_errors_mean_it_cannot_be_done() {
+        assert!(cannot_sync_folders(&io::Error::from_raw_os_error(EIO)));
+        assert!(cannot_sync_folders(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(cannot_sync_folders(&io::Error::from(
+            io::ErrorKind::InvalidInput
+        )));
+        // A full disk or a refused permission is a real failure.
+        assert!(!cannot_sync_folders(&io::Error::from_raw_os_error(28)));
+        assert!(!cannot_sync_folders(&io::Error::from_raw_os_error(13)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_carries_on_where_folders_cannot_be_flushed() {
+        for force_copy in [false, true] {
+            let f = fixture(FILES);
+            let (plan_path, plan) = organize_plan(&f, "{type}/{year}/{date}_{time}.{ext}", true);
+            FOLDER_SYNC_ERROR.with(|e| e.set(Some(EIO)));
+            let opts = ApplyOptions {
+                force_copy,
+                ..ApplyOptions::default()
+            };
+            let summary = apply_with(&plan_path, &plan, &opts);
+            FOLDER_SYNC_ERROR.with(|e| e.set(None));
+            let summary = summary.unwrap();
+            assert_eq!(summary.skipped, vec![], "force_copy {}", force_copy);
+            assert_eq!(summary.moved, plan.moves.len());
+        }
+
+        // Any other error is a failure: here the journal's folder cannot be flushed, so apply
+        // stops before it moves anything.
+        let f = fixture(FILES);
+        let before = tree(&f.root);
+        let (plan_path, plan) = organize_plan(&f, "{type}/{year}/{date}_{time}.{ext}", true);
+        FOLDER_SYNC_ERROR.with(|e| e.set(Some(28)));
+        let applied = apply(&plan_path, &plan);
+        FOLDER_SYNC_ERROR.with(|e| e.set(None));
+        assert!(matches!(applied.unwrap_err().error, Error::Io(_)));
+        assert_eq!(tree(&f.root), before);
     }
 
     #[test]
