@@ -8,7 +8,7 @@
 use super::Located;
 use crate::apply::{reserve_temp, still_ours};
 use crate::catalog::FileRecord;
-use crate::decode::{self, decode_in_process, file_url, image_decoder, TOOL_TIMEOUT};
+use crate::decode::{self, decode_in_process, file_url, image_decoder, DecodeError, TOOL_TIMEOUT};
 use crate::media::MediaType;
 use crate::text::{printable_lines, shown};
 use image::codecs::jpeg::JpegEncoder;
@@ -31,10 +31,6 @@ const SHOWN_BY_BROWSERS: &[&str] = &["avif", "bmp", "gif", "jpeg", "jpg", "png",
 
 /// Image extensions browsers cannot show but the viewer can make a preview of, lowercase.
 const SHOWN_AS_PREVIEW: &[&str] = &["heic", "heif", "tif", "tiff"];
-
-/// The error of a tool that ran out of time. Not remembered as a failure: the system may only
-/// have been busy.
-const TIMED_OUT: &str = "timed out";
 
 /// The renditions the viewer makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,8 +156,7 @@ impl Thumbnailer {
         let made = match ffmpeg {
             None => tokio::task::spawn_blocking(move || render_in_process(&source, size.pixels()))
                 .await
-                .map_err(|e| e.to_string())
-                .and_then(|made| made),
+                .unwrap_or(Err(DecodeError::Crashed)),
             Some(ffmpeg) => {
                 decode_with_ffmpeg(&ffmpeg, &source, size, decoder == Decoder::FfmpegVideo).await
             }
@@ -183,9 +178,11 @@ impl Thumbnailer {
                 warn!(
                     "No thumbnail for {}: {}",
                     shown(&located.full_path),
-                    printable_lines(&e)
+                    printable_lines(&e.to_string())
                 );
-                if e != TIMED_OUT {
+                // A tool that ran out of time is not remembered as a failure: the system may
+                // only have been busy.
+                if !matches!(e, DecodeError::TimedOut) {
                     self.failed().insert(key);
                 }
                 None
@@ -235,8 +232,8 @@ fn cache_key(located: &Located, size: Size) -> String {
 }
 
 /// Decode an image with the `image` crate, upright, shrunk to fit `max` pixels, as JPEG.
-fn render_in_process(source: &Path, max: u32) -> Result<Vec<u8>, String> {
-    let (mut img, orientation) = decode_in_process(source).map_err(|e| e.to_string())?;
+fn render_in_process(source: &Path, max: u32) -> Result<Vec<u8>, DecodeError> {
+    let (mut img, orientation) = decode_in_process(source)?;
     img.apply_orientation(orientation);
     if img.width() > max || img.height() > max {
         img = img.thumbnail(max, max);
@@ -245,7 +242,7 @@ fn render_in_process(source: &Path, max: u32) -> Result<Vec<u8>, String> {
     let mut jpeg = vec![];
     JpegEncoder::new_with_quality(&mut jpeg, 80)
         .encode_image(&rgb)
-        .map_err(|e| e.to_string())?;
+        .map_err(DecodeError::Image)?;
     Ok(jpeg)
 }
 
@@ -273,7 +270,7 @@ async fn decode_with_ffmpeg(
     source: &Path,
     size: Size,
     video: bool,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, DecodeError> {
     let max = size.pixels();
     let attempt = |seek: bool| {
         let mut command = Command::new(ffmpeg);
@@ -301,14 +298,14 @@ async fn decode_with_ffmpeg(
         attempt(false).await?
     };
     if jpeg.is_empty() {
-        Err(String::from("ffmpeg produced no frame"))
+        Err(DecodeError::NoFrame)
     } else {
         Ok(jpeg)
     }
 }
 
 /// Run a tool and return its standard output, or an error with its standard error.
-async fn run(mut command: Command) -> Result<Vec<u8>, String> {
+async fn run(mut command: Command) -> Result<Vec<u8>, DecodeError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -317,12 +314,13 @@ async fn run(mut command: Command) -> Result<Vec<u8>, String> {
     debug!("Running {command:?}");
     let output = timeout(TOOL_TIMEOUT, command.output())
         .await
-        .map_err(|_| String::from(TIMED_OUT))?
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| DecodeError::TimedOut)??;
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(DecodeError::Tool {
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
     }
 }
 

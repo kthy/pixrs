@@ -10,7 +10,7 @@ use image::{DynamicImage, ImageDecoder, ImageError, ImageReader, Limits};
 use log::debug;
 use std::ffi::OsString;
 use std::fmt;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -19,30 +19,65 @@ use std::time::{Duration, Instant};
 /// How long `ffmpeg` and `ffprobe` may take for one file.
 pub const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Why an image could not be decoded.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why a file could not be decoded.
+#[derive(Debug)]
 pub enum DecodeError {
-    /// The file could not be read, or `ffmpeg` could not be started. Worth trying again later:
+    /// The file could not be read, or the tool could not be started. Worth trying again later:
     /// a drive may have dropped out.
-    Unreadable(String),
-    /// `ffmpeg` ran out of time. Worth trying again later: the system may only have been busy.
+    Unreadable(io::Error),
+    /// The tool ran out of time. Worth trying again later: the system may only have been busy.
     TimedOut,
-    /// The file is not an image the decoder understands.
-    Invalid(String),
+    /// The file is larger than pixrs decodes in-process.
+    TooLarge { bytes: u64 },
+    /// The `image` crate cannot decode it.
+    Image(ImageError),
+    /// The tool failed; its standard error.
+    Tool { stderr: String },
+    /// The tool's output is not what it should print.
+    Output(serde_json::Error),
+    /// `ffmpeg` produced no frame.
+    NoFrame,
+    /// `ffprobe` found no duration.
+    NoDuration,
+    /// The decoder panicked.
+    Crashed,
 }
 
 impl DecodeError {
     /// Whether trying again later might succeed.
     pub const fn is_transient(&self) -> bool {
-        !matches!(self, Self::Invalid(_))
+        matches!(self, Self::Unreadable(_) | Self::TimedOut)
     }
 }
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unreadable(msg) | Self::Invalid(msg) => write!(f, "{msg}"),
+            Self::Unreadable(e) => write!(f, "{e}"),
             Self::TimedOut => write!(f, "timed out"),
+            Self::TooLarge { bytes } => write!(
+                f,
+                "the file is {} MB, more than the {} MB pixrs decodes",
+                bytes / 1_000_000,
+                MAX_IMAGE_FILE_BYTES / 1_000_000
+            ),
+            Self::Image(e) => write!(f, "{e}"),
+            Self::Tool { stderr } => write!(f, "{stderr}"),
+            Self::Output(e) => write!(f, "{e}"),
+            Self::NoFrame => write!(f, "ffmpeg produced no frame"),
+            Self::NoDuration => write!(f, "ffprobe found no duration"),
+            Self::Crashed => write!(f, "the decoder crashed"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unreadable(e) => Some(e),
+            Self::Image(e) => Some(e),
+            Self::Output(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -51,18 +86,23 @@ impl From<ImageError> for DecodeError {
     fn from(e: ImageError) -> Self {
         match e {
             // A file that ends early is broken, not unreadable: trying again will not help.
-            ImageError::IoError(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Self::Invalid(e.to_string())
+            ImageError::IoError(e) if e.kind() != io::ErrorKind::UnexpectedEof => {
+                Self::Unreadable(e)
             }
-            ImageError::IoError(e) => Self::Unreadable(e.to_string()),
-            e => Self::Invalid(e.to_string()),
+            e => Self::Image(e),
         }
     }
 }
 
-impl From<std::io::Error> for DecodeError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Unreadable(e.to_string())
+impl From<io::Error> for DecodeError {
+    fn from(e: io::Error) -> Self {
+        Self::Unreadable(e)
+    }
+}
+
+impl From<serde_json::Error> for DecodeError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Output(e)
     }
 }
 
@@ -154,11 +194,7 @@ pub fn image_decoder(path: &str) -> Option<Decoder> {
 pub fn decode_in_process(source: &Path) -> Result<(DynamicImage, Orientation), DecodeError> {
     let file_bytes = std::fs::metadata(source)?.len();
     if file_bytes > MAX_IMAGE_FILE_BYTES {
-        return Err(DecodeError::Invalid(format!(
-            "the file is {} MB, more than the {} MB pixrs decodes",
-            file_bytes / 1_000_000,
-            MAX_IMAGE_FILE_BYTES / 1_000_000
-        )));
+        return Err(DecodeError::TooLarge { bytes: file_bytes });
     }
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_DIMENSION);
@@ -188,11 +224,9 @@ pub fn decode_with_ffmpeg(ffmpeg: &Path, source: &Path) -> Result<DynamicImage, 
         .args(["-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]);
     let png = run_with_timeout(command)?;
     if png.is_empty() {
-        return Err(DecodeError::Invalid(String::from(
-            "ffmpeg produced no frame",
-        )));
+        return Err(DecodeError::NoFrame);
     }
-    image::load_from_memory(&png).map_err(|e| DecodeError::Invalid(e.to_string()))
+    image::load_from_memory(&png).map_err(DecodeError::Image)
 }
 
 /// `source` as an `ffmpeg` input. The `file:` prefix keeps names like `a:b.mov` from being read
@@ -326,9 +360,9 @@ pub(crate) fn run_with_timeout(mut command: Command) -> Result<Vec<u8>, DecodeEr
     if status.success() {
         Ok(out)
     } else {
-        Err(DecodeError::Invalid(
-            String::from_utf8_lossy(&err).trim().to_string(),
-        ))
+        Err(DecodeError::Tool {
+            stderr: String::from_utf8_lossy(&err).trim().to_string(),
+        })
     }
 }
 

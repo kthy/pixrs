@@ -7,7 +7,7 @@
 
 use crate::apply::Lock;
 use crate::catalog::{display_root, library_path, Catalog, Library};
-use crate::error::Error;
+use crate::error::{utf8, Error};
 use crate::names::{nfc, respelled_path};
 use crate::scan::{progress_bar, resolve, stamp};
 use same_file::is_same_file;
@@ -57,10 +57,7 @@ pub fn relocate(
 ) -> Result<RelocateSummary, Error> {
     let catalog_path = resolve(catalog_path)?;
     if !catalog_path.is_file() {
-        return Err(Error::Usage(format!(
-            "There is no catalog at {}. Run `pixrs scan <LIBRARY>` first.",
-            catalog_path.display()
-        )));
+        return Err(Error::NoCatalog(catalog_path));
     }
     let _lock = Lock::take(&catalog_path)?;
     let catalog = Catalog::open(&catalog_path)?;
@@ -71,23 +68,19 @@ pub fn relocate(
         .canonicalize()
         .ok()
         .filter(|new| new.is_dir())
-        .ok_or_else(|| Error::Usage(format!("{} is not a directory", new.display())))?;
-    let new_str = new
-        .to_str()
-        .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", new.display())))?;
+        .ok_or_else(|| Error::NotADirectory(new.to_path_buf()))?;
+    let new_str = utf8(&new, "Folder")?;
     // Also under another letter case on a case-insensitive file system, which Linux keeps.
     if new == Path::new(&library.root) || is_same_file(&new, &library.root).unwrap_or(false) {
-        return Err(Error::Usage(format!(
-            "The library is already at {}",
-            display_root(&library.root)
-        )));
+        return Err(Error::AlreadyThere {
+            root: library.root.clone(),
+        });
     }
     if catalog_path.starts_with(&new) {
-        return Err(Error::Usage(format!(
-            "The catalog {} must be outside the library {}",
-            catalog_path.display(),
-            new.display()
-        )));
+        return Err(Error::CatalogInLibrary {
+            catalog: catalog_path,
+            library: new,
+        });
     }
 
     let files = catalog.files(library.id)?;
@@ -118,14 +111,11 @@ pub fn relocate(
     pb.finish_and_clear();
     let matching = matching.into_inner();
     if !force && matching * 100 < sample.len() * MIN_MATCHING {
-        return Err(Error::Usage(format!(
-            "Only {} of {} cataloged files compared are in {} with the same size and \
-             modification time. Is it the right folder? With --force the library is moved \
-             anyway, and the next scan reads the files that differ again.",
+        return Err(Error::TooFewMatch {
             matching,
-            sample.len(),
-            new.display()
-        )));
+            compared: sample.len(),
+            folder: new,
+        });
     }
 
     let (root, folded) = catalog.relocate(library.id, new_str)?;
@@ -156,16 +146,12 @@ fn find<'a>(libraries: &'a [Library], old: &Path) -> Result<&'a Library, Error> 
     };
     let in_nfc = |path: &Path| PathBuf::from(nfc(&path.to_string_lossy()).as_ref());
     let found = find_by(&|a, b| a == b).or_else(|| find_by(&|a, b| in_nfc(a) == in_nfc(b)));
-    found.ok_or_else(|| {
-        let roots: Vec<String> = libraries
+    found.ok_or_else(|| Error::UnknownLibrary {
+        path: old.to_path_buf(),
+        roots: libraries
             .iter()
-            .map(|library| format!("\n  {}", display_root(&library.root)))
-            .collect();
-        Error::Usage(format!(
-            "{} is not a library in the catalog. The libraries are:{}",
-            old.display(),
-            roots.concat()
-        ))
+            .map(|library| library.root.clone())
+            .collect(),
     })
 }
 

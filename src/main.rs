@@ -22,7 +22,7 @@
 use clap::{CommandFactory, Parser};
 use indicatif::{HumanCount, HumanDuration};
 use log::{debug, error};
-use pixrs::catalog::{cataloged_spelling, display_root, Catalog};
+use pixrs::catalog::{cataloged_spelling, Catalog};
 use pixrs::dupes::{
     find_dupes, plural, write_csv, write_json, write_text, DupeReport, Similarity, Tier,
 };
@@ -69,45 +69,54 @@ fn main() {
         exit(exitcode::OK);
     }
 
-    match cli.command {
-        Some(Command::Apply(opt)) => apply(&opt),
-        Some(Command::Dupes(opt)) => dupes(opt),
-        Some(Command::Organize(opt)) => organize(opt),
-        Some(Command::Relocate(opt)) => relocate(opt),
-        Some(Command::Undo(opt)) => undo(&opt),
-        Some(Command::Scan(opt)) => scan(opt, now),
-        Some(Command::Serve(opt)) => serve(opt),
-        None => {
-            Cli::command().print_help().expect("Unable to print help!");
-            exit(exitcode::USAGE);
-        }
+    let Some(command) = cli.command else {
+        let _ = Cli::command().print_help();
+        exit(exitcode::USAGE);
+    };
+    let context = context(&command);
+    let done = match command {
+        Command::Apply(opt) => apply(&opt),
+        Command::Dupes(opt) => dupes(opt),
+        Command::Organize(opt) => organize(opt),
+        Command::Relocate(opt) => relocate(opt),
+        Command::Undo(opt) => undo(&opt),
+        Command::Scan(opt) => scan(opt, now),
+        Command::Serve(opt) => serve(opt),
+    };
+    if let Err(e) = done {
+        fail(context, &e);
+    }
+}
+
+/// What the error message of a failed command starts with.
+const fn context(command: &Command) -> &'static str {
+    match command {
+        Command::Apply(_) => "Apply failed",
+        Command::Dupes(opt) if opt.quarantine.is_some() => "Quarantine failed",
+        Command::Dupes(_) => "Dupes failed",
+        Command::Organize(_) => "Organize failed",
+        Command::Relocate(_) => "Relocate failed",
+        Command::Undo(_) => "Undo failed",
+        Command::Scan(_) => "Scan failed",
+        Command::Serve(_) => "Serve failed",
     }
 }
 
 /// The catalog path given on the command line, or the default one.
-fn catalog_path(given: Option<PathBuf>) -> PathBuf {
-    given.or_else(Catalog::default_path).unwrap_or_else(|| {
-        eprintln!("Unable to find a data directory for the catalog; pass --catalog");
-        exit(exitcode::USAGE)
-    })
+fn catalog_path(given: Option<PathBuf>) -> Result<PathBuf, Error> {
+    given.or_else(Catalog::default_path).ok_or(Error::NoDataDir)
 }
 
 /// Print an error and exit with its exit code. The message can quote names from a library.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "takes the error it ends the program with"
-)]
-fn fail(context: &str, e: pixrs::error::Error) -> ! {
+fn fail(context: &str, e: &Error) -> ! {
     debug!("{e:?}");
     eprintln!("{}: {}", context, printable_lines(&e.to_string()));
     exit(e.exit_code())
 }
 
-/// The catalog IDs of the given libraries. Exits if one has not been scanned.
-fn library_ids(catalog: &Catalog, libraries: &[PathBuf], context: &str) -> Vec<i64> {
-    let known = catalog
-        .libraries()
-        .unwrap_or_else(|e| fail(context, e.into()));
+/// The catalog IDs of the given libraries, which must have been scanned.
+fn library_ids(catalog: &Catalog, libraries: &[PathBuf]) -> Result<Vec<i64>, Error> {
+    let known = catalog.libraries()?;
     let mut ids: Vec<i64> = vec![];
     for library in libraries {
         // Canonical, and spelled as the catalog spells it on a case-insensitive file system.
@@ -116,10 +125,10 @@ fn library_ids(catalog: &Catalog, libraries: &[PathBuf], context: &str) -> Vec<i
             .ok()
             .map(|path| cataloged_spelling(&known, &path));
         let root = path.as_deref().and_then(|p| p.to_str().map(String::from));
-        let id = match root.map(|root| catalog.find_library(&root)).transpose() {
-            Ok(id) => id.flatten(),
-            Err(e) => fail(context, e.into()),
-        };
+        let id = root
+            .map(|root| catalog.find_library(&root))
+            .transpose()?
+            .flatten();
         if let Some(id) = id {
             ids.push(id);
         } else {
@@ -127,41 +136,29 @@ fn library_ids(catalog: &Catalog, libraries: &[PathBuf], context: &str) -> Vec<i
                 .as_deref()
                 .and_then(|path| catalog.containing_library(path).ok().flatten());
             if let Some((_, root)) = containing {
-                eprintln!(
-                    "{} is part of the library {}. Pass the library instead.",
-                    library.display(),
-                    display_root(&root)
-                );
-                exit(exitcode::USAGE)
+                return Err(Error::PartOfLibrary {
+                    path: library.clone(),
+                    root,
+                });
             }
-            eprintln!(
-                "{} has not been scanned. Run `pixrs scan {}` first.",
-                library.display(),
-                library.display()
-            );
-            exit(exitcode::USAGE)
+            return Err(Error::NotScanned(library.clone()));
         }
     }
-    ids
+    Ok(ids)
 }
 
 /// Report exact duplicates in the catalog.
-fn dupes(opt: DupesOpt) {
-    let catalog_path = catalog_path(opt.catalog);
-    let catalog =
-        Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail("Dupes failed", e));
-    let libraries = library_ids(&catalog, &opt.libraries, "Dupes failed");
+fn dupes(opt: DupesOpt) -> Result<(), Error> {
+    let catalog_path = catalog_path(opt.catalog)?;
+    let catalog = Catalog::open_existing(&catalog_path)?;
+    let libraries = library_ids(&catalog, &opt.libraries)?;
     let similarity = Similarity {
         threshold: opt.threshold,
         images: opt.similar,
     };
-    let report = match find_dupes(&catalog, &libraries, similarity) {
-        Ok(report) => report,
-        Err(e) => fail("Dupes failed", e.into()),
-    };
+    let report = find_dupes(&catalog, &libraries, similarity)?;
     if let Some(dir) = &opt.quarantine {
-        quarantine(&catalog, &catalog_path, &report, &libraries, dir);
-        return;
+        return quarantine(&catalog, &catalog_path, &report, &libraries, dir);
     }
 
     let mut out = BufWriter::new(io::stdout().lock());
@@ -171,9 +168,7 @@ fn dupes(opt: DupesOpt) {
         Format::Csv => write_csv(&report, &mut out),
     }
     .and_then(|()| out.flush());
-    if let Err(e) = written {
-        fail("Dupes failed", e.into());
-    }
+    written?;
 
     let unhashed = report.summary.unhashed_candidates;
     if unhashed > 0 {
@@ -182,6 +177,7 @@ fn dupes(opt: DupesOpt) {
              there may be more duplicates. Scan their libraries again to hash them."
         );
     }
+    Ok(())
 }
 
 /// Plan moving every exact and same-pixel copy of a kept file to `dir`; with library
@@ -192,14 +188,11 @@ fn quarantine(
     report: &DupeReport,
     libraries: &[i64],
     dir: &Path,
-) {
-    let context = "Quarantine failed";
-    let dir = outside_libraries(catalog, dir, "The quarantine folder")
-        .unwrap_or_else(|e| fail(context, e));
+) -> Result<(), Error> {
+    let dir = outside_libraries(catalog, dir, "The quarantine folder")?;
     let now = OffsetDateTime::now_utc();
-    let (plan, notes) = plan_quarantine(catalog, catalog_path, report, libraries, &dir, now)
-        .unwrap_or_else(|e| fail(context, e));
-    let path = write_plan(&plan, now).unwrap_or_else(|e| fail(context, e));
+    let (plan, notes) = plan_quarantine(catalog, catalog_path, report, libraries, &dir, now)?;
+    let path = write_plan(&plan, now)?;
     let similar = report
         .groups
         .iter()
@@ -213,30 +206,22 @@ fn quarantine(
             plural(similar, "file is", "files are")
         );
     }
-    write_summary(&plan, &notes, &path, &mut io::stdout().lock())
-        .unwrap_or_else(|e| fail(context, e.into()));
+    write_summary(&plan, &notes, &path, &mut io::stdout().lock())?;
+    Ok(())
 }
 
 /// Plan how to organize a library and print the plan.
-fn organize(opt: OrganizeOpt) {
-    let context = "Organize failed";
-    let catalog_path = catalog_path(opt.catalog);
-    let catalog = Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail(context, e));
-    let library_id = library_ids(&catalog, std::slice::from_ref(&opt.library), context)[0];
-    let root = opt
-        .library
-        .canonicalize()
-        .unwrap_or_else(|e| fail(context, e.into()));
+fn organize(opt: OrganizeOpt) -> Result<(), Error> {
+    let catalog_path = catalog_path(opt.catalog)?;
+    let catalog = Catalog::open_existing(&catalog_path)?;
+    let library_id = library_ids(&catalog, std::slice::from_ref(&opt.library))?[0];
+    let root = opt.library.canonicalize()?;
     let template = match (&opt.template, &opt.layout) {
         (Some(template), _) => Template::parse(template),
         (None, Some(layout)) => Template::from_layout(layout),
         (None, None) => unreachable!("clap requires --template or --layout"),
-    }
-    .unwrap_or_else(|e| fail(context, Error::Usage(e)));
-    let to = opt
-        .to
-        .as_deref()
-        .map(|to| pixrs::scan::resolve(to).unwrap_or_else(|e| fail(context, e.into())));
+    }?;
+    let to = opt.to.as_deref().map(pixrs::scan::resolve).transpose()?;
     let now = OffsetDateTime::now_utc();
     let opts = OrganizeOptions {
         template: &template,
@@ -247,18 +232,16 @@ fn organize(opt: OrganizeOpt) {
         prune_empty: opt.prune_empty,
         now,
     };
-    let (plan, notes) = plan_organize(&catalog, &catalog_path, library_id, &root, &opts)
-        .unwrap_or_else(|e| fail(context, e));
-    let path = write_plan(&plan, now).unwrap_or_else(|e| fail(context, e));
-    write_summary(&plan, &notes, &path, &mut io::stdout().lock())
-        .unwrap_or_else(|e| fail(context, e.into()));
+    let (plan, notes) = plan_organize(&catalog, &catalog_path, library_id, &root, &opts)?;
+    let path = write_plan(&plan, now)?;
+    write_summary(&plan, &notes, &path, &mut io::stdout().lock())?;
+    Ok(())
 }
 
 /// Carry out a plan file.
-fn apply(opt: &ApplyOpt) {
-    let context = "Apply failed";
-    let plan = read_plan(&opt.plan).unwrap_or_else(|e| fail(context, e));
-    let summary = pixrs::apply::apply(&opt.plan, &plan).unwrap_or_else(|e| {
+fn apply(opt: &ApplyOpt) -> Result<(), Error> {
+    let plan = read_plan(&opt.plan)?;
+    let summary = pixrs::apply::apply(&opt.plan, &plan).map_err(|e| {
         if let Some(journal) = &e.journal {
             eprintln!(
                 "Stopped before the plan was done. To reverse what was done, run:\n  pixrs \
@@ -266,8 +249,8 @@ fn apply(opt: &ApplyOpt) {
                 journal.display()
             );
         }
-        fail(context, e.error)
-    });
+        e.error
+    })?;
     for (file, reason) in &summary.skipped {
         println!("Skipped {}: {}", printable(file), printable(reason));
     }
@@ -284,11 +267,12 @@ fn apply(opt: &ApplyOpt) {
         summary.journal.display(),
         summary.journal.display()
     );
+    Ok(())
 }
 
 /// Reverse an applied plan from its journal.
-fn undo(opt: &UndoOpt) {
-    let summary = pixrs::apply::undo(&opt.journal).unwrap_or_else(|e| fail("Undo failed", e));
+fn undo(opt: &UndoOpt) -> Result<(), Error> {
+    let summary = pixrs::apply::undo(&opt.journal)?;
     for warning in &summary.warnings {
         println!("Warning: {}", printable(warning));
     }
@@ -297,13 +281,13 @@ fn undo(opt: &UndoOpt) {
         summary.moved_back,
         plural(summary.moved_back, "file", "files")
     );
+    Ok(())
 }
 
 /// Point a library at the folder it was moved to and print a summary.
-fn relocate(opt: RelocateOpt) {
-    let catalog = catalog_path(opt.catalog);
-    let s = pixrs::relocate::relocate(&catalog, &opt.old, &opt.new, opt.force)
-        .unwrap_or_else(|e| fail("Relocate failed", e));
+fn relocate(opt: RelocateOpt) -> Result<(), Error> {
+    let catalog = catalog_path(opt.catalog)?;
+    let s = pixrs::relocate::relocate(&catalog, &opt.old, &opt.new, opt.force)?;
     println!(
         "{} of {} files compared are at {} unchanged.",
         s.matching,
@@ -319,75 +303,72 @@ fn relocate(opt: RelocateOpt) {
         plural(s.files, "file", "files"),
         s.library
     );
+    Ok(())
 }
 
 /// Scan a media library into the catalog and print a summary.
-fn scan(opt: ScanOpt, now: Instant) {
-    let catalog = catalog_path(opt.catalog);
+fn scan(opt: ScanOpt, now: Instant) -> Result<(), Error> {
+    let catalog = catalog_path(opt.catalog)?;
     let options = ScanOptions {
         quiet: opt.quiet,
         allow_empty: opt.allow_empty,
     };
-    match pixrs::scan::scan(&opt.library, &catalog, options) {
-        Ok(s) => {
-            for root in &s.folded {
-                println!("Folded the library {root} into this one, with its hashes.");
-            }
-            if let Some(root) = &s.part_of {
-                println!(
-                    "{} is part of the library {}; scanned only that part.",
-                    opt.library.display(),
-                    root
-                );
-            }
-            println!(
-                "Scanned {} in {}: {} added, {} updated, {} removed, {} unchanged, {} hashed, \
-                 {} decoded, {} skipped",
-                opt.library.display(),
-                HumanDuration(now.elapsed()),
-                s.added,
-                s.updated,
-                s.removed,
-                s.unchanged,
-                s.hashed,
-                s.media_hashed,
-                s.skipped
-            );
-            if s.respelled > 0 {
-                println!(
-                    "{} cataloged files have their names in another Unicode normalization on \
-                     disk (accents composed or decomposed, as on macOS); the catalog now spells \
-                     them as on disk, keeping their hashes.",
-                    s.respelled
-                );
-            }
-            if s.media_undecodable > 0 {
-                println!(
-                    "{} files could not be decoded; they are left out of similarity matching \
-                     until they or the decoders change.",
-                    s.media_undecodable
-                );
-            }
-            if s.media_without_decoder > 0 {
-                println!(
-                    "{} files have no decoder (RAW; HEIC/AVIF without ffmpeg 7.1 or later; video \
-                     without ffmpeg and ffprobe; audio without fpcalc on PATH); they are left \
-                     out of same-pixel and similarity matching.",
-                    s.media_without_decoder
-                );
-            }
-            println!("Catalog: {}", catalog.display());
-        }
-        Err(e) => fail("Scan failed", e),
+    let s = pixrs::scan::scan(&opt.library, &catalog, options)?;
+    for root in &s.folded {
+        println!("Folded the library {root} into this one, with its hashes.");
     }
+    if let Some(root) = &s.part_of {
+        println!(
+            "{} is part of the library {}; scanned only that part.",
+            opt.library.display(),
+            root
+        );
+    }
+    println!(
+        "Scanned {} in {}: {} added, {} updated, {} removed, {} unchanged, {} hashed, \
+         {} decoded, {} skipped",
+        opt.library.display(),
+        HumanDuration(now.elapsed()),
+        s.added,
+        s.updated,
+        s.removed,
+        s.unchanged,
+        s.hashed,
+        s.media_hashed,
+        s.skipped
+    );
+    if s.respelled > 0 {
+        println!(
+            "{} cataloged files have their names in another Unicode normalization on \
+             disk (accents composed or decomposed, as on macOS); the catalog now spells \
+             them as on disk, keeping their hashes.",
+            s.respelled
+        );
+    }
+    if s.media_undecodable > 0 {
+        println!(
+            "{} files could not be decoded; they are left out of similarity matching \
+             until they or the decoders change.",
+            s.media_undecodable
+        );
+    }
+    if s.media_without_decoder > 0 {
+        println!(
+            "{} files have no decoder (RAW; HEIC/AVIF without ffmpeg 7.1 or later; video \
+             without ffmpeg and ffprobe; audio without fpcalc on PATH); they are left \
+             out of same-pixel and similarity matching.",
+            s.media_without_decoder
+        );
+    }
+    println!("Catalog: {}", catalog.display());
+    Ok(())
 }
 
 /// Browse the catalog in the local viewer until stopped.
-fn serve(opt: ServeOpt) {
-    let catalog_path = catalog_path(opt.catalog);
-    let catalog =
-        Catalog::open_existing(&catalog_path).unwrap_or_else(|e| fail("Serve failed", e));
-    let libraries = library_ids(&catalog, &opt.libraries, "Serve failed");
+fn serve(opt: ServeOpt) -> Result<(), Error> {
+    let catalog_path = catalog_path(opt.catalog)?;
+    let catalog = Catalog::open_existing(&catalog_path)?;
+    let libraries = library_ids(&catalog, &opt.libraries)?;
     let cache_dir = opt.cache.or_else(default_cache_dir);
     if cache_dir.is_none() {
         eprintln!("No cache directory found; pass --cache to get thumbnails");
@@ -412,9 +393,7 @@ fn serve(opt: ServeOpt) {
             });
         }
     };
-    if let Err(e) = pixrs::serve::run(config, ready) {
-        fail("Serve failed", e);
-    }
+    pixrs::serve::run(config, ready)
 }
 
 /// Set Ctrl-C handler
@@ -422,7 +401,7 @@ fn set_ctrlc_handler() {
     ctrlc::set_handler(move || {
         println!("Ctrl-C received, stopping.");
         pixrs::apply::release_lock();
-        exit(exitcode::OK);
+        exit(pixrs::error::INTERRUPTED);
     })
     .expect("Error setting Ctrl-C handler");
 }

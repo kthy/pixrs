@@ -169,8 +169,7 @@ fn video_span(ffprobe: &Path, source: &Path) -> Result<(f64, f64), DecodeError> 
         .args(["-of", "json"])
         .arg(file_url(source));
     let out = run_with_timeout(command)?;
-    let json: serde_json::Value =
-        serde_json::from_slice(&out).map_err(|e| DecodeError::Invalid(e.to_string()))?;
+    let json: serde_json::Value = serde_json::from_slice(&out)?;
     let number = |v: &serde_json::Value, key: &str| {
         v.get(key)
             .and_then(|x| x.as_str())
@@ -197,7 +196,7 @@ fn video_span(ffprobe: &Path, source: &Path) -> Result<(f64, f64), DecodeError> 
         .filter(|d| *d > 0.0)
         .or_else(|| number(format, "duration"))
         .filter(|d| *d > 0.0)
-        .ok_or_else(|| DecodeError::Invalid(String::from("ffprobe found no duration")))?;
+        .ok_or(DecodeError::NoDuration)?;
     let start = match (number(stream, "start_time"), number(format, "start_time")) {
         (Some(stream), Some(format)) => (stream - format).max(0.0),
         _ => 0.0,
@@ -235,7 +234,7 @@ fn frame_at(ffmpeg: &Path, source: &Path, seconds: f64) -> Result<Frame, DecodeE
     if png.is_empty() {
         return Ok(None);
     }
-    let img = image::load_from_memory(&png).map_err(|e| DecodeError::Invalid(e.to_string()))?;
+    let img = image::load_from_memory(&png).map_err(DecodeError::Image)?;
     Ok(perceptual_hash(&img).map(|(hash, _)| hash))
 }
 
@@ -268,11 +267,11 @@ pub fn video_signature(
                 frames.push(frame);
                 decoded += 1;
             }
-            Err(e @ DecodeError::Invalid(_)) => {
+            Err(e) if e.is_transient() => return Err(e),
+            Err(e) => {
                 frames.push(None);
                 invalid = Some(e);
             }
-            Err(e) => return Err(e),
         }
     }
     if let Some(e) = invalid.filter(|_| decoded == 0) {
@@ -307,7 +306,8 @@ pub fn audio_fingerprint(fpcalc: &Path, source: &Path) -> Result<AudioFingerprin
         .arg(AUDIO_SECONDS.to_string())
         .arg(source);
     let out = match run_with_timeout(command) {
-        Err(DecodeError::Invalid(msg)) if msg.contains("Empty fingerprint") => {
+        // What `fpcalc` says about audio too short to fingerprint.
+        Err(DecodeError::Tool { stderr }) if stderr.contains("Empty fingerprint") => {
             return Ok(AudioFingerprint {
                 duration_ms: 0,
                 values: vec![],
@@ -315,8 +315,7 @@ pub fn audio_fingerprint(fpcalc: &Path, source: &Path) -> Result<AudioFingerprin
         }
         out => out?,
     };
-    let parsed: Fpcalc =
-        serde_json::from_slice(&out).map_err(|e| DecodeError::Invalid(e.to_string()))?;
+    let parsed: Fpcalc = serde_json::from_slice(&out)?;
     Ok(AudioFingerprint {
         duration_ms: (parsed.duration * 1000.0).round() as i64,
         values: parsed.fingerprint.iter().map(|&v| v as u32).collect(),

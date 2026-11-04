@@ -14,7 +14,7 @@ use crate::catalog::{
 };
 use crate::dates::quicktime_creation;
 use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, Tools};
-use crate::error::Error;
+use crate::error::{utf8, Error};
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
 use crate::names::nfc;
@@ -158,15 +158,14 @@ pub fn scan_with(
         .canonicalize()
         .ok()
         .filter(|start| start.is_dir())
-        .ok_or_else(|| Error::Usage(format!("{} is not a directory", library.display())))?;
+        .ok_or_else(|| Error::NotADirectory(library.to_path_buf()))?;
     let catalog_path = resolve(catalog_path)?;
     let outside = |root: &Path| {
         if catalog_path.starts_with(root) {
-            return Err(Error::Usage(format!(
-                "The catalog {} must be outside the library {}",
-                catalog_path.display(),
-                root.display()
-            )));
+            return Err(Error::CatalogInLibrary {
+                catalog: catalog_path.clone(),
+                library: root.to_path_buf(),
+            });
         }
         Ok(())
     };
@@ -175,9 +174,7 @@ pub fn scan_with(
     let catalog = Catalog::open(&catalog_path)?;
     // One folder under another letter case is the same library.
     let start = cataloged_spelling(&catalog.libraries()?, &start);
-    let start_str = start
-        .to_str()
-        .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", start.display())))?;
+    let start_str = utf8(&start, "Library")?;
     let mut summary = ScanSummary::default();
     // `start` may be part of a library; `root` is the library's root, and paths are relative to
     // it. `part` is the scanned folder relative to `root`, empty for the whole library.
@@ -186,8 +183,10 @@ pub fn scan_with(
         None => (catalog.library_id(start_str)?, start.clone()),
     };
     outside(&root)?;
-    let part = relative_path(&root, &start)
-        .ok_or_else(|| Error::Usage(format!("{} is not valid UTF-8", start.display())))?;
+    let part = relative_path(&root, &start).ok_or_else(|| Error::NotUtf8 {
+        what: "Library",
+        path: start.clone(),
+    })?;
     if !part.is_empty() {
         summary.part_of = Some(display_root(&root.to_string_lossy()));
     }
@@ -292,21 +291,16 @@ pub fn scan_with(
     // be listed.
     if seen.is_empty() && !known.is_empty() {
         if unreadable.contains(&part) {
-            return Err(Error::Usage(format!(
-                "Cannot list the files in {}, which the catalog lists {} files for. Nothing was \
-                 removed from the catalog.",
-                start.display(),
-                known.len()
-            )));
+            return Err(Error::Unlistable {
+                folder: start,
+                cataloged: known.len(),
+            });
         }
         if !options.allow_empty {
-            return Err(Error::Usage(format!(
-                "Found no media files in {}, but the catalog lists {} for it. If it is on a \
-                 drive, is the drive mounted? Nothing was removed from the catalog. If the \
-                 folder really is empty now, scan it with --allow-empty to remove them.",
-                start.display(),
-                known.len()
-            )));
+            return Err(Error::NoMedia {
+                folder: start,
+                cataloged: known.len(),
+            });
         }
     }
 
@@ -598,7 +592,7 @@ fn hash_files(
         catch_unwind(AssertUnwindSafe(|| {
             hash_media(&path, rel, media_type, tools)
         }))
-        .unwrap_or_else(|_| Err(DecodeError::Invalid(String::from("the decoder crashed"))))
+        .unwrap_or_else(|_| Err(DecodeError::Crashed))
     };
     in_parallel(files, MAX_DECODERS, work, record)
 }
@@ -668,11 +662,7 @@ pub fn resolve(path: &Path) -> io::Result<PathBuf> {
 /// The error a scan stops with when the library is gone (an unplugged drive, a dropped network
 /// share), instead of failing on every remaining file. What it did so far is committed first.
 fn disappeared(root: &Path) -> Error {
-    Error::Usage(format!(
-        "{} disappeared during the scan. What was scanned so far is kept; scan again when it \
-         is back.",
-        root.display()
-    ))
+    Error::Disappeared(root.to_path_buf())
 }
 
 /// Print a warning about a file that is skipped.
@@ -1336,12 +1326,12 @@ mod tests {
             |_, _| {
                 recorded += 1;
                 if recorded == 10 {
-                    return Err(Error::Usage(String::from("stop")));
+                    return Err(Error::Interrupted);
                 }
                 Ok(())
             },
         );
-        assert!(matches!(stopped, Err(Error::Usage(_))));
+        assert!(matches!(stopped, Err(Error::Interrupted)));
         assert_eq!(recorded, 10);
     }
 
@@ -1640,10 +1630,7 @@ mod tests {
         remove_file(fx.lib().join("a.jpg")).unwrap();
 
         let result = scan(&fx.lib(), &fx.catalog(), ScanOptions::QUIET);
-        assert!(
-            matches!(&result, Err(Error::Usage(m)) if m.contains("--allow-empty")),
-            "{result:?}"
-        );
+        assert!(matches!(&result, Err(Error::NoMedia { .. })), "{result:?}");
         assert_eq!(paths(&fx.files()), vec!["a.jpg"]);
     }
 
@@ -1685,7 +1672,7 @@ mod tests {
         let part = fx.lib().join("a");
 
         let refused = scan_with(&part, &fx.catalog(), ScanOptions::QUIET, &Tools::default());
-        assert!(matches!(refused, Err(Error::Usage(_))));
+        assert!(matches!(refused, Err(Error::NoMedia { .. })));
         assert_eq!(paths(&fx.files()), vec!["a/one.jpg", "b/two.jpg"]);
 
         let summary = scan_with(&part, &fx.catalog(), ALLOW_EMPTY, &Tools::default()).unwrap();
@@ -1718,7 +1705,7 @@ mod tests {
         std::fs::remove_dir(fx.lib().join("a")).unwrap();
 
         let result = scan(&fx.lib().join("a"), &fx.catalog(), ALLOW_EMPTY);
-        assert!(matches!(result, Err(Error::Usage(_))));
+        assert!(matches!(result, Err(Error::NotADirectory(_))));
         assert_eq!(paths(&fx.files()), vec!["a/one.jpg"]);
     }
 
@@ -1740,7 +1727,7 @@ mod tests {
         let result = scan(&lib, &fx.catalog(), ALLOW_EMPTY);
         std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            matches!(&result, Err(Error::Usage(m)) if m.starts_with("Cannot list")),
+            matches!(&result, Err(Error::Unlistable { .. })),
             "{result:?}"
         );
         assert_eq!(paths(&fx.files()), vec!["a.jpg"]);
@@ -1757,7 +1744,7 @@ mod tests {
             &fx.lib().join("catalog.sqlite"),
             ScanOptions::QUIET,
         );
-        assert!(matches!(result, Err(Error::Usage(_))));
+        assert!(matches!(result, Err(Error::CatalogInLibrary { .. })));
         assert!(!fx.lib().join("catalog.sqlite").exists());
     }
 
@@ -1771,7 +1758,7 @@ mod tests {
             .join("deeper")
             .join("catalog.sqlite");
         let result = scan(&fx.lib(), &nested, ScanOptions::QUIET);
-        assert!(matches!(result, Err(Error::Usage(_))));
+        assert!(matches!(result, Err(Error::CatalogInLibrary { .. })));
         assert!(!fx.lib().join("deeper").exists());
     }
 
@@ -1782,7 +1769,7 @@ mod tests {
         let link = fx.dir.path().join("link");
         std::os::unix::fs::symlink(fx.lib(), &link).unwrap();
         let result = scan(&fx.lib(), &link.join("catalog.sqlite"), ScanOptions::QUIET);
-        assert!(matches!(result, Err(Error::Usage(_))));
+        assert!(matches!(result, Err(Error::CatalogInLibrary { .. })));
         assert!(!fx.lib().join("catalog.sqlite").exists());
     }
 
@@ -1794,7 +1781,7 @@ mod tests {
             &fx.lib().join("catalog.sqlite"),
             ScanOptions::QUIET,
         );
-        assert!(matches!(result, Err(Error::Usage(_))));
+        assert!(matches!(result, Err(Error::CatalogInLibrary { .. })));
         assert!(!fx.lib().join("catalog.sqlite").exists());
     }
 
@@ -1802,7 +1789,7 @@ mod tests {
     fn test_missing_library_is_refused() {
         let fx = Fixture::new();
         let result = scan(&fx.lib().join("nope"), &fx.catalog(), ScanOptions::QUIET);
-        assert!(matches!(result, Err(Error::Usage(_))));
+        assert!(matches!(result, Err(Error::NotADirectory(_))));
     }
 
     #[test]

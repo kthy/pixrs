@@ -442,8 +442,8 @@ pub(crate) mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("x.heic");
         fs::write(&path, b"whatever").unwrap();
-        assert_eq!(hash_image(&path, "x.heic", None), Ok(None));
-        assert_eq!(hash_image(&path, "x.nef", None), Ok(None));
+        assert!(matches!(hash_image(&path, "x.heic", None), Ok(None)));
+        assert!(matches!(hash_image(&path, "x.nef", None), Ok(None)));
         assert!(hash_image(&path, "x.jpg", None).is_err());
     }
 }
