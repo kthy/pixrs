@@ -348,15 +348,44 @@ impl<'c> Scan<'c> {
         known: &HashMap<String, Stamp>,
         respellable: &HashMap<String, Row>,
     ) -> Walked {
-        let mut walked = Walked::default();
         let walk = spinner("[1/4] Walking", self.quiet);
-        let root = &self.root;
+        let mut walked = Walked::default();
+        let media = self.find_media(&walk, &mut walked);
+        let respeller = Respeller {
+            root: &self.root,
+            known,
+            respellable,
+        };
+        for file in media {
+            classify(file, &respeller, &walk, &mut walked, &mut self.summary);
+        }
+        walk.finish_and_clear();
+        // Not `walk.println`, which pads the line to the terminal width instead of ending it.
+        if !walk.is_hidden() {
+            eprintln!(
+                "Found {} media files, {} new or changed ({})",
+                HumanCount(walk.position()),
+                HumanCount(walked.pending.len() as u64),
+                HumanDuration(walk.elapsed())
+            );
+        }
+        walked
+    }
+
+    /// The media files below the scanned folder, sorted by path, counted on `walk`. Folders
+    /// and files that cannot be read go into `walked`.
+    fn find_media(&mut self, walk: &ProgressBar, walked: &mut Walked) -> Vec<MediaFile> {
+        let Self {
+            root,
+            start,
+            summary,
+            ..
+        } = self;
         let listing = |dir: &Path| {
-            walk.set_message(shown(dir.strip_prefix(root).unwrap_or(dir)).to_string());
+            walk.set_message(shown(dir.strip_prefix(&*root).unwrap_or(dir)).to_string());
         };
         let mut media = vec![];
-        let summary = &mut self.summary;
-        crate::walk::walk(&self.start, MAX_WALKERS, listing, |found| match found {
+        crate::walk::walk(start, MAX_WALKERS, listing, |found| match found {
             Found::Media(file) => {
                 walk.inc(1);
                 media.push(file);
@@ -372,61 +401,7 @@ impl<'c> Scan<'c> {
         // The walk finds files in any order; taken by path, which row a respelled name takes
         // does not depend on it.
         media.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-        for MediaFile {
-            path,
-            media_type,
-            stamp,
-        } in media
-        {
-            let Some(rel) = relative_path(&self.root, &path) else {
-                walk.suspend(|| warn(&path, "file name is not valid UTF-8"));
-                self.summary.skipped += 1;
-                continue;
-            };
-            let mut known_stamp = known.get(&rel).copied();
-            if known_stamp.is_none() {
-                let found = respelling(&rel, &path, &self.root, known, respellable, &walked.seen);
-                if let Some(row) = found {
-                    walked.seen.insert(row.path.clone());
-                    known_stamp = Some(row.stamp);
-                    walked.respelled.push(Respelled {
-                        old: row.path,
-                        new: rel.clone(),
-                    });
-                }
-            }
-            let stamp = match stamp {
-                Ok(stamp) => stamp,
-                Err(e) => {
-                    walk.suspend(|| warn(&path, &e));
-                    self.summary.skipped += 1;
-                    walked.seen.insert(rel);
-                    continue;
-                }
-            };
-            match known_stamp {
-                Some(known_stamp) if known_stamp == stamp => self.summary.unchanged += 1,
-                known_stamp => walked.pending.push(Pending {
-                    rel: rel.clone(),
-                    path,
-                    stamp,
-                    media_type,
-                    new: known_stamp.is_none(),
-                }),
-            }
-            walked.seen.insert(rel);
-        }
-        walk.finish_and_clear();
-        // Not `walk.println`, which pads the line to the terminal width instead of ending it.
-        if !walk.is_hidden() {
-            eprintln!(
-                "Found {} media files, {} new or changed ({})",
-                HumanCount(walk.position()),
-                HumanCount(walked.pending.len() as u64),
-                HumanDuration(walk.elapsed())
-            );
-        }
-        walked
+        media
     }
 
     /// Refuse a walk that found no media where `known` lists some: an unmounted drive or share
@@ -483,8 +458,14 @@ impl<'c> Scan<'c> {
             // parsed.
             catch_unwind(AssertUnwindSafe(|| read_meta(&file.path)))
         };
-        let (catalog, library_id, root) = (self.catalog, self.library_id, &self.root);
-        let summary = &mut self.summary;
+        let Self {
+            catalog,
+            library_id,
+            root,
+            summary,
+            ..
+        } = self;
+        let (catalog, library_id) = (*catalog, *library_id);
         in_parallel(&pending, MAX_READERS, read, |file, read| {
             batch.tick()?;
             pb.inc(1);
@@ -540,8 +521,14 @@ impl<'c> Scan<'c> {
         let bytes = to_hash.iter().map(|file| file.size).sum();
         let pb = progress_bar(bytes, "[3/4] Hashing", Unit::Bytes, self.quiet);
         let mut batch = Batch::begin(self.catalog)?;
-        let (catalog, library_id, root) = (self.catalog, self.library_id, &self.root);
-        let summary = &mut self.summary;
+        let Self {
+            catalog,
+            library_id,
+            root,
+            summary,
+            ..
+        } = self;
+        let (catalog, library_id) = (*catalog, *library_id);
         let hash = |file: &UnhashedFile| {
             pb.set_message(printable(&file.path).into_owned());
             hash_file(&library_path(root, &file.path), &pb)
@@ -634,8 +621,14 @@ impl<'c> Scan<'c> {
             self.quiet,
         );
         let mut batch = Batch::begin(self.catalog)?;
-        let (catalog, library_id, root) = (self.catalog, self.library_id, &self.root);
-        let summary = &mut self.summary;
+        let Self {
+            catalog,
+            library_id,
+            root,
+            summary,
+            ..
+        } = self;
+        let (catalog, library_id) = (*catalog, *library_id);
         hash_files(root, &to_decode, |file, result| {
             batch.tick()?;
             pb.set_message(printable(&file.rel).into_owned());
@@ -808,38 +801,96 @@ fn respellable(known: &HashMap<String, Stamp>, part: &str) -> HashMap<String, Ro
     rows
 }
 
-/// The cataloged row that is the file at `path` (`rel` in the library at `root`) under another
-/// Unicode normalization of its name: a row in `known` whose path is `rel` in NFC, or one in
-/// `respellable`. Not if `seen` has it, as the file of another name, or if its path leads to
-/// another file (on Linux, which keeps names as given, both spellings can be files of their
-/// own).
-fn respelling(
-    rel: &str,
-    path: &Path,
-    root: &Path,
-    known: &HashMap<String, Stamp>,
-    respellable: &HashMap<String, Row>,
-    seen: &HashSet<String>,
-) -> Option<Row> {
-    let rel_nfc = nfc(rel);
-    let row = match respellable.get(rel_nfc.as_ref()) {
-        Some(row) => row.clone(),
-        None if rel_nfc != rel => {
-            let stamp = *known.get(rel_nfc.as_ref())?;
-            Row {
-                path: rel_nfc.into_owned(),
-                stamp,
-            }
-        }
-        None => return None,
+/// Sort a walked media file: unchanged (counted in `summary`), or new or changed (pending in
+/// `walked`), taking the row of its name in another Unicode normalization if it has one.
+fn classify(
+    file: MediaFile,
+    respeller: &Respeller,
+    walk: &ProgressBar,
+    walked: &mut Walked,
+    summary: &mut ScanSummary,
+) {
+    let MediaFile {
+        path,
+        media_type,
+        stamp,
+    } = file;
+    let Some(rel) = relative_path(respeller.root, &path) else {
+        walk.suspend(|| warn(&path, "file name is not valid UTF-8"));
+        summary.skipped += 1;
+        return;
     };
-    if seen.contains(&row.path) {
-        return None;
+    let mut known_stamp = respeller.known.get(&rel).copied();
+    if known_stamp.is_none() {
+        if let Some(row) = respeller.row(&rel, &path, &walked.seen) {
+            walked.seen.insert(row.path.clone());
+            known_stamp = Some(row.stamp);
+            walked.respelled.push(Respelled {
+                old: row.path,
+                new: rel.clone(),
+            });
+        }
     }
-    let old_path = library_path(root, &row.path);
-    let elsewhere =
-        symlink_metadata(&old_path).is_ok() && !is_same_file(&old_path, path).unwrap_or(false);
-    (!elsewhere).then_some(row)
+    let stamp = match stamp {
+        Ok(stamp) => stamp,
+        Err(e) => {
+            walk.suspend(|| warn(&path, &e));
+            summary.skipped += 1;
+            walked.seen.insert(rel);
+            return;
+        }
+    };
+    match known_stamp {
+        Some(known_stamp) if known_stamp == stamp => summary.unchanged += 1,
+        known_stamp => walked.pending.push(Pending {
+            rel: rel.clone(),
+            path,
+            stamp,
+            media_type,
+            new: known_stamp.is_none(),
+        }),
+    }
+    walked.seen.insert(rel);
+}
+
+/// Finds the cataloged rows of walked files whose names are spelled in another Unicode
+/// normalization than the catalog has them.
+struct Respeller<'a> {
+    /// The library's root.
+    root: &'a Path,
+    /// The cataloged rows of the scanned part, by path.
+    known: &'a HashMap<String, Stamp>,
+    /// Rows whose paths are not in NFC, by their path in NFC (`respellable`).
+    respellable: &'a HashMap<String, Row>,
+}
+
+impl Respeller<'_> {
+    /// The cataloged row that is the file at `path` (`rel` in the library) under another
+    /// Unicode normalization of its name: a row in `known` whose path is `rel` in NFC, or one
+    /// in `respellable`. Not if `seen` has it, as the file of another name, or if its path leads
+    /// to another file (on Linux, which keeps names as given, both spellings can be files of
+    /// their own).
+    fn row(&self, rel: &str, path: &Path, seen: &HashSet<String>) -> Option<Row> {
+        let rel_nfc = nfc(rel);
+        let row = match self.respellable.get(rel_nfc.as_ref()) {
+            Some(row) => row.clone(),
+            None if rel_nfc != rel => {
+                let stamp = *self.known.get(rel_nfc.as_ref())?;
+                Row {
+                    path: rel_nfc.into_owned(),
+                    stamp,
+                }
+            }
+            None => return None,
+        };
+        if seen.contains(&row.path) {
+            return None;
+        }
+        let old_path = library_path(self.root, &row.path);
+        let elsewhere =
+            symlink_metadata(&old_path).is_ok() && !is_same_file(&old_path, path).unwrap_or(false);
+        (!elsewhere).then_some(row)
+    }
 }
 
 /// `path` relative to `root` with `/` separators, or `None` if any part is not valid UTF-8.
