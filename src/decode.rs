@@ -75,10 +75,12 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `Display` shows the cause, so the chain goes on below it: a reporter that prints
+        // every source shows each message once.
         match self {
-            Self::Unreadable(e) => Some(e),
-            Self::Image(e) => Some(e),
-            Self::Output(e) => Some(e),
+            Self::Unreadable(e) => e.source(),
+            Self::Image(e) => e.source(),
+            Self::Output(e) => e.source(),
             _ => None,
         }
     }

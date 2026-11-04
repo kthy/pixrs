@@ -273,8 +273,10 @@ impl fmt::Display for MoveProblem {
 
 impl std::error::Error for PlanError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `Display` shows the cause, so the chain goes on below it: a reporter that prints
+        // every source shows each message once.
         match self {
-            Self::NotAPlan { source, .. } => Some(source),
+            Self::NotAPlan { source, .. } => source.source(),
             _ => None,
         }
     }

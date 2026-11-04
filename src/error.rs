@@ -248,13 +248,17 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `Display` shows the cause, so the chain goes on below it: a reporter that prints
+        // every source shows each message once.
         match self {
-            Self::Template(e) => Some(e),
-            Self::Plan(e) => Some(e),
-            Self::Journal(e) => Some(e),
-            Self::Io(e) | Self::File { source: e, .. } | Self::Listen { source: e, .. } => Some(e),
-            Self::Move { fault, .. } => Some(&**fault),
-            Self::Catalog(e) => Some(e),
+            Self::Template(e) => e.source(),
+            Self::Plan(e) => e.source(),
+            Self::Journal(e) => e.source(),
+            Self::Io(e) | Self::File { source: e, .. } | Self::Listen { source: e, .. } => {
+                e.source()
+            }
+            Self::Move { fault, .. } => fault.source(),
+            Self::Catalog(e) => e.source(),
             _ => None,
         }
     }
