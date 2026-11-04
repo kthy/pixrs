@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside one, that holds no media files any more. Without it a scan that finds no media where
   the catalog lists some is still refused, since an unmounted drive looks the same. The folder
   must exist and be readable, and the library stays in the catalog with no files.
+- Release binaries for Linux (x86_64, static), Windows (x86_64) and macOS (Apple silicon),
+  attached to each release with SHA-256 checksums and build provenance attestations. The
+  README explains how to download, run and verify them.
 
 ### Changed
 
