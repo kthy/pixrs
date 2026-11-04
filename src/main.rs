@@ -28,11 +28,12 @@ use pixrs::dupes::{
 };
 use pixrs::error::{utf8, AtPath, Error};
 use pixrs::library::{LibraryId, Root};
+use pixrs::paths::canonical;
 use pixrs::plan::{
     outside_libraries, plan_organize, plan_quarantine, read_plan, write_plan, write_summary,
     OrganizeOptions,
 };
-use pixrs::scan::{canonical, ScanOptions};
+use pixrs::scan::ScanOptions;
 use pixrs::serve::{default_cache_dir, Config};
 use pixrs::statics::{LICENSE, THIRD_PARTY_NOTICES};
 use pixrs::structs::{
@@ -216,7 +217,7 @@ fn organize(opt: OrganizeOpt) -> Result<(), Error> {
     let to = opt
         .to
         .as_deref()
-        .map(|to| pixrs::scan::resolve(to).at(to))
+        .map(|to| pixrs::paths::resolve(to).at(to))
         .transpose()?;
     let now = OffsetDateTime::now_utc();
     let opts = OrganizeOptions {

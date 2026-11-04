@@ -7,7 +7,6 @@
 
 use crate::catalog::Stamp;
 use crate::media::MediaType;
-use crate::scan::stamp;
 use std::fs::{self, DirEntry};
 use std::io;
 use std::mem;
@@ -67,7 +66,7 @@ pub(crate) fn walk(
                         }
                         Job::Stat(files) => {
                             for (entry, media_type) in files {
-                                let stamp = entry.metadata().and_then(|m| stamp(&m));
+                                let stamp = entry.metadata().and_then(|m| Stamp::of(&m));
                                 let path = entry.path();
                                 let file = MediaFile {
                                     path,

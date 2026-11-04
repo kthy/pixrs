@@ -31,7 +31,7 @@ use pixrs::catalog::{library_path, Catalog, HashedAv};
 use pixrs::decode::{Tool, Tools};
 use pixrs::dupes::{aspects_match, DEFAULT_THRESHOLD};
 use pixrs::imagehash::distance;
-use pixrs::scan::resolve;
+use pixrs::paths::resolve;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};

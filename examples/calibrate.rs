@@ -36,7 +36,7 @@ use pixrs::catalog::{library_path, Catalog, HashedImage};
 use pixrs::decode::{decode_in_process, decode_with_ffmpeg, find_tool, image_decoder, Decoder};
 use pixrs::dupes::aspects_match;
 use pixrs::imagehash::{distance, fingerprint_differences, perceptual_hash};
-use pixrs::scan::resolve;
+use pixrs::paths::resolve;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Write as _;
