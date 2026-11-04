@@ -31,7 +31,7 @@ use pixrs::plan::{
     outside_libraries, plan_organize, plan_quarantine, read_plan, write_plan, write_summary,
     OrganizeOptions,
 };
-use pixrs::scan::ScanOptions;
+use pixrs::scan::{canonical, ScanOptions};
 use pixrs::serve::{default_cache_dir, Config};
 use pixrs::statics::{LICENSE, THIRD_PARTY_NOTICES};
 use pixrs::structs::{
@@ -126,23 +126,7 @@ fn cataloged_library(
     library: &Path,
 ) -> Result<LibraryRoot, Error> {
     let not_scanned = || Error::NotScanned(library.to_path_buf());
-    let path = match library.canonicalize() {
-        Ok(path) => path,
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Err(not_scanned());
-        }
-        Err(source) => {
-            return Err(Error::File {
-                path: library.to_path_buf(),
-                source,
-            })
-        }
-    };
+    let path = canonical(library)?.ok_or_else(not_scanned)?;
     // Spelled as the catalog spells it on a case-insensitive file system.
     let path = cataloged_spelling(known, &path);
     if let Some(root) = path.to_str() {

@@ -6,7 +6,9 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::catalog::{display_root, library_path, Catalog, FileRecord, FileRef, Library, Stamp};
+use crate::catalog::{
+    display_root, library_path, within, Catalog, FileRecord, FileRef, Library, Stamp,
+};
 use crate::dates::{from_name, Taken};
 use crate::dupes::{plural, DupeFile, DupeGroup, DupeReport, Role, Tier};
 use crate::error::{AtPath, Error};
@@ -295,7 +297,7 @@ impl Plan {
         let quarantine = self.kind == PlanKind::Quarantine;
         if quarantine {
             let overlapping = self.libraries.iter().find(|l| {
-                self.destination.starts_with(&l.root) || l.root.starts_with(&self.destination)
+                within(&self.destination, &l.root) || within(&l.root, &self.destination)
             });
             if let Some(library) = overlapping {
                 return Err(PlanError::QuarantineOverlap {
@@ -1090,9 +1092,10 @@ pub fn outside_libraries(
     dir: &Path,
     what: &'static str,
 ) -> Result<PathBuf, Error> {
-    let resolved = crate::scan::resolve(dir)?;
+    let resolved = crate::scan::resolve(dir).at(dir)?;
     for library in catalog.libraries()? {
-        if resolved.starts_with(&library.root) || Path::new(&library.root).starts_with(&resolved) {
+        let root = Path::new(&library.root);
+        if within(&resolved, root) || within(root, &resolved) {
             return Err(PlanError::Overlap {
                 what,
                 folder: resolved,

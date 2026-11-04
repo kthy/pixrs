@@ -69,8 +69,12 @@ pub enum Error {
     Disappeared(PathBuf),
     /// The viewer cannot listen on its port.
     Listen { port: u16, source: io::Error },
-    /// A move failed halfway; only `undo` should touch the file now.
-    Move(MoveFault),
+    /// The move of `from` to `to` failed halfway; only `undo` should touch the file now.
+    Move {
+        from: PathBuf,
+        to: PathBuf,
+        fault: Box<MoveFault>,
+    },
     /// The catalog database failed.
     Catalog(rusqlite::Error),
     /// The command was stopped before it finished.
@@ -104,7 +108,7 @@ impl Error {
             | Self::Unlistable { .. }
             | Self::Disappeared(_)
             | Self::Listen { .. }
-            | Self::Move(_) => exitcode::IOERR,
+            | Self::Move { .. } => exitcode::IOERR,
             Self::Catalog(_) => exitcode::SOFTWARE,
             Self::Interrupted => INTERRUPTED,
         }
@@ -228,7 +232,13 @@ impl fmt::Display for Error {
             Self::Listen { port, source } => {
                 write!(f, "Unable to listen on 127.0.0.1:{port}: {source}")
             }
-            Self::Move(e) => write!(f, "{e}"),
+            Self::Move { from, to, fault } => write!(
+                f,
+                "Moving {} to {} failed halfway: {}",
+                from.display(),
+                to.display(),
+                fault
+            ),
             Self::Catalog(e) => write!(f, "catalog error: {e}"),
             Self::Interrupted => write!(f, "stopped"),
         }
@@ -242,7 +252,7 @@ impl std::error::Error for Error {
             Self::Plan(e) => Some(e),
             Self::Journal(e) => Some(e),
             Self::Io(e) | Self::File { source: e, .. } | Self::Listen { source: e, .. } => Some(e),
-            Self::Move(e) => Some(e),
+            Self::Move { fault, .. } => Some(&**fault),
             Self::Catalog(e) => Some(e),
             _ => None,
         }
@@ -276,16 +286,6 @@ impl From<PlanError> for Error {
 impl From<JournalError> for Error {
     fn from(e: JournalError) -> Self {
         Self::Journal(e)
-    }
-}
-
-impl From<MoveFault> for Error {
-    fn from(e: MoveFault) -> Self {
-        match e {
-            MoveFault::Io(e) => Self::Io(e),
-            MoveFault::Stopped => Self::Interrupted,
-            e => Self::Move(e),
-        }
     }
 }
 

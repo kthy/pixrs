@@ -73,6 +73,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The thumbnail cache (`pixrs serve --cache`), the catalog and the quarantine folder are refused
+  inside a library also when spelled in another letter case on a file system that ignores it
+  (WSL's `/mnt/c`, SMB, exFAT): `--cache /mnt/c/photos/thumbs` no longer passes for the library
+  `/mnt/c/Photos` and writes thumbnails into it.
+- `pixrs scan` reported files it failed to hash as hashed in "Hashed N files".
+- The viewer showed an empty page for a month like `/dates/2024-+5`; it is now not found.
+- A move that fails halfway in `pixrs apply` names the file and its target in the error, and
+  errors creating the catalog's folder or resolving the catalog or cache path name the path.
+- `pixrs relocate` reports a new folder it cannot read (e.g. no permission) as an I/O error
+  (exit code 74) naming the folder, instead of "is not a directory".
 - A file whose name has accents spelled another way than in the catalog (macOS may decompose
   `é` into `e` and a combining accent, where Linux and Windows compose it) no longer looks like
   a new file whose cataloged row is gone. `pixrs scan` matches names in Unicode NFC, keeps the

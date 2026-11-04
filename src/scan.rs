@@ -10,13 +10,13 @@ use crate::avhash::{
     VideoSignature,
 };
 use crate::catalog::{
-    cataloged_spelling, display_root, library_path, Catalog, FileRecord, HashVersion, MediaMeta,
-    Stamp, UnhashedFile,
+    cataloged_spelling, display_root, library_path, within, Catalog, FileRecord, HashVersion,
+    MediaMeta, Stamp, UnhashedFile,
 };
 use crate::dates::quicktime_creation;
 use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, Tools};
 use crate::digest::sha256_from;
-use crate::error::{utf8, Error};
+use crate::error::{utf8, AtPath, Error};
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
 use crate::names::nfc;
@@ -206,7 +206,7 @@ pub fn scan_with(
     tools: &Tools,
 ) -> Result<ScanSummary, Error> {
     let start = scanned_folder(library)?;
-    let catalog_path = resolve(catalog_path)?;
+    let catalog_path = resolve(catalog_path).at(catalog_path)?;
     outside_library(&catalog_path, &start)?;
     let catalog = Catalog::open(&catalog_path)?;
     let mut scan = Scan::new(&catalog, &catalog_path, &start, options.quiet)?;
@@ -225,26 +225,31 @@ pub fn scan_with(
 /// The folder `library`, canonical. A path that does not lead to a folder is a usage error;
 /// one that cannot be resolved for another reason, like permissions, an I/O error.
 fn scanned_folder(library: &Path) -> Result<PathBuf, Error> {
-    match library.canonicalize() {
-        Ok(start) if start.is_dir() => Ok(start),
+    canonical(library)?
+        .filter(|start| start.is_dir())
+        .ok_or_else(|| Error::NotADirectory(library.to_path_buf()))
+}
+
+/// `path` canonical, or `None` if nothing is there. An error names `path` if it cannot be
+/// resolved for another reason, like permissions.
+pub fn canonical(path: &Path) -> Result<Option<PathBuf>, Error> {
+    match path.canonicalize() {
+        Ok(canonical) => Ok(Some(canonical)),
         Err(e)
-            if !matches!(
+            if matches!(
                 e.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
             ) =>
         {
-            Err(Error::File {
-                path: library.to_path_buf(),
-                source: e,
-            })
+            Ok(None)
         }
-        _ => Err(Error::NotADirectory(library.to_path_buf())),
+        Err(e) => Err(e).at(path),
     }
 }
 
 /// Refuse a catalog at `catalog`, inside the library at `root`.
 fn outside_library(catalog: &Path, root: &Path) -> Result<(), Error> {
-    if catalog.starts_with(root) {
+    if within(catalog, root) {
         return Err(Error::CatalogInLibrary {
             catalog: catalog.to_path_buf(),
             library: root.to_path_buf(),
@@ -533,7 +538,7 @@ impl<'c> Scan<'c> {
             &pb,
             &format!(
                 "Hashed {} files, {}",
-                HumanCount(batch.done as u64),
+                HumanCount(self.summary.hashed as u64),
                 HumanBytes(pb.position())
             ),
         );
