@@ -28,6 +28,7 @@ pub mod dupes;
 pub mod error;
 pub mod imagehash;
 pub mod media;
+pub mod names;
 pub mod plan;
 pub mod relocate;
 pub mod scan;

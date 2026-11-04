@@ -69,7 +69,9 @@ Scanning a folder inside a scanned library scans only that part of the library. 
 folder that contains scanned libraries makes them part of it, keeping their hashes, so a scan
 of `photos/phone` followed by one of `photos` reads the phone's files only once. On a
 case-insensitive file system (a Windows drive under WSL, a network share) the library is found
-under any letter case.
+under any letter case. File names are matched regardless of how their accents are encoded
+(macOS may store `é` as `e` plus a combining accent, other systems as one character), so a
+library copied between systems keeps its hashes.
 
 ### Move a library
 
@@ -258,7 +260,7 @@ extension.
   so `IMG-20190501-WA0001.jpg` becomes `2019-05-01_WA0001.jpg` and sorts among that day's
   photos.
 - Nothing is ever overwritten: a file whose new name is taken gets `_2`, `_3` and so on, with a
-  warning. Names are compared without regard to letter case on every system.
+  warning. Names are compared without regard to letter case or accent encoding on every system.
 - Sidecar files with the same name (`.xmp`, `.aae`, `.thm`, `.srt`, Google Takeout `.json`)
   move with their file.
 - Files are never moved through symbolic links. A file whose target folder is a link (an

@@ -7,6 +7,7 @@
 
 use crate::catalog::{Catalog, CatalogRow};
 use crate::error::Error;
+use crate::names::folded;
 use crate::plan::{state_dir, Keeper, Move, Plan};
 use log::debug;
 use ring::digest::{Context, SHA256};
@@ -74,8 +75,8 @@ enum Record {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum ViaKind {
-    /// The file itself, stopped on its way during a rename that only changes letter case. It may
-    /// be the only copy: never removed.
+    /// The file itself, stopped on its way during a rename that only changes letter case or
+    /// Unicode normalization. It may be the only copy: never removed.
     Stop,
     /// A copy being made across file systems. Redundant while its source exists.
     Copy,
@@ -235,10 +236,10 @@ fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-/// Whether `a` and `b` differ only in letter case, so they are the same file on Windows and
-/// macOS.
-fn case_only(a: &Path, b: &Path) -> bool {
-    a != b && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+/// Whether `a` and `b` differ only in letter case or Unicode normalization, so they are the same
+/// file on macOS (and, for letter case, on Windows).
+fn spelling_only(a: &Path, b: &Path) -> bool {
+    a != b && folded(&a.to_string_lossy()) == folded(&b.to_string_lossy())
 }
 
 /// Whether `a` and `b` are the same file (one name in another letter case, or a hard link).
@@ -433,12 +434,12 @@ fn copy_verified(
 
 /// Move `from` (which has `size` and `mtime`) to `to`, never overwriting.
 ///
-/// A rename that only changes letter case goes through a temporary name: refused if another
-/// file has exactly the new name, and undone if anything turns up at `to` once `from` is out of
-/// the way. Otherwise `to` must not exist in any letter case. Renames if it can; across file
-/// systems it copies to a temporary file in the target folder, checks the copy, renames it into
-/// place, flushes the folder, checks that `from` did not change meanwhile, and only then
-/// removes `from`. `note_via` is called with each temporary file before it is used.
+/// A rename that only changes letter case or Unicode normalization goes through a temporary
+/// name: refused if another file has exactly the new name, and undone if anything turns up at
+/// `to` once `from` is out of the way. Otherwise `to` must not exist in any letter case.
+/// Renames if it can; across file systems it copies to a temporary file in the target folder,
+/// checks the copy, renames it into place, flushes the folder, checks that `from` did not change
+/// meanwhile, and only then removes `from`. `note_via` is called with each temporary file before it is used.
 fn move_file(
     from: &Path,
     to: &Path,
@@ -448,7 +449,7 @@ fn move_file(
     mut note_via: impl FnMut(&Path, ViaKind, Option<&Path>) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     let dir = to.parent().unwrap_or(Path::new("."));
-    if case_only(from, to) {
+    if spelling_only(from, to) {
         if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
             return Err(MoveError::Taken);
         }
@@ -943,7 +944,7 @@ fn locate(from: &Path, to: &Path, size: u64, mtime_ns: i64, had_copy: bool) -> i
             to.display()
         ))
     };
-    if case_only(from, to) {
+    if spelling_only(from, to) {
         // One file under two spellings on Windows and macOS: look at the exact names.
         return Ok(match (exactly_there(to)?, exactly_there(from)?) {
             (true, false) if fs::metadata(to).is_ok_and(|m| matches(&m, size, mtime_ns)) => {

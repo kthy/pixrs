@@ -12,6 +12,7 @@ use crate::avhash::{
 use crate::error::Error;
 use crate::imagehash::ImageHashes;
 use crate::media::MediaType;
+use crate::names::folded;
 use directories::ProjectDirs;
 use rusqlite::types::Value;
 use rusqlite::{
@@ -450,6 +451,17 @@ impl Catalog {
                 file.meta.width,
                 file.meta.height,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Give a file's row `new`, the name the file has on disk, which is its cataloged name `old`
+    /// in another Unicode normalization. Everything else in the row stays. There must be no row
+    /// at `new`.
+    pub fn respell(&self, library_id: i64, old: &str, new: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET path = ?3 WHERE library_id = ?1 AND path = ?2",
+            params![library_id, old, new],
         )?;
         Ok(())
     }
@@ -1194,10 +1206,11 @@ const MOVED_COLUMNS: &str = "size, mtime_ns, media_type, sha256, taken_at, camer
 
 /// The path from `outer` to `inner` with `/` separators and a trailing `/` if `inner` is inside
 /// `outer`, or empty if they are the same folder: by spelling, or else by file identity when
-/// both exist. On a case-insensitive file system one folder has many spellings, and on Linux
-/// `canonicalize` keeps the one the user typed (`/mnt/c/photos` for `/mnt/c/Photos`), so two
-/// spellings must not become two libraries. Found by identity, the path is spelled as it is on
-/// disk, since the catalog needs one spelling and that is the one a scan sees.
+/// both exist. On a file system that ignores letter case (or Unicode normalization, as macOS
+/// does) one folder has many spellings, and on Linux `canonicalize` keeps the one the user typed
+/// (`/mnt/c/photos` for `/mnt/c/Photos`), so two spellings must not become two libraries. Found
+/// by identity, the path is spelled as it is on disk, since the catalog needs one spelling and
+/// that is the one a scan sees.
 fn path_below(outer: &Path, inner: &Path) -> Option<String> {
     let parts = |from: &Path| -> Option<Vec<&OsStr>> {
         inner
@@ -1234,24 +1247,25 @@ fn path_below(outer: &Path, inner: &Path) -> Option<String> {
     join(on_disk)
 }
 
-/// The name in `dir` that is `name` in some letter case: `name` itself if it is there, else the
-/// one the file system reads it as (it is case-insensitive here), else `name` as given.
+/// The name in `dir` that is `name` in some letter case or Unicode normalization: `name` itself
+/// if it is there, else the one the file system reads it as (it ignores case or normalization
+/// here), else `name` as given.
 fn on_disk_name(dir: &Path, name: &OsStr) -> OsString {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return name.to_os_string();
     };
-    let wanted = name.to_string_lossy().to_lowercase();
-    let mut same_case = None;
+    let wanted = folded(&name.to_string_lossy());
+    let mut same_name = None;
     for entry in entries.flatten() {
         let found = entry.file_name();
         if found == name {
             return found;
         }
-        if same_case.is_none() && found.to_string_lossy().to_lowercase() == wanted {
-            same_case = Some(found);
+        if same_name.is_none() && folded(&found.to_string_lossy()) == wanted {
+            same_name = Some(found);
         }
     }
-    same_case.unwrap_or_else(|| name.to_os_string())
+    same_name.unwrap_or_else(|| name.to_os_string())
 }
 
 /// `path` spelled as the catalog spells the library it is in, if it is in one under another

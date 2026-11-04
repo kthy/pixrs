@@ -14,13 +14,13 @@ ffmpeg and ffprobe (https://ffmpeg.org/), and Chromaprint's fpcalc
 (https://acoustid.org/chromaprint).
 
 Licenses:
-- MIT License: 205
+- MIT License: 207
 - BSD 3-Clause "New" or "Revised" License: 30
 - ISC License: 17
 - Apache License 2.0: 5
+- Unicode License v3: 2
 - BSD Zero Clause License: 1
 - Mozilla Public License 2.0: 1
-- Unicode License v3: 1
 - zlib License: 1
 
 ================================================================================
@@ -3586,7 +3586,7 @@ THE SOFTWARE.
 ================================================================================
 MIT License
 
-Used by: heck, unicode-width
+Used by: heck, unicode-normalization, unicode-width
 
 Copyright (c) 2015 The Rust Project Developers
 
@@ -5457,6 +5457,18 @@ SOFTWARE
 ================================================================================
 MIT License
 
+Used by: tinyvec
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+================================================================================
+MIT License
+
 Used by: android_system_properties
 
 The MIT License (MIT)
@@ -6380,7 +6392,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 ================================================================================
 Unicode License v3
 
-Used by: unicode-ident
+Used by: unicode-ident, unicode-normalization
 
 UNICODE LICENSE V3
 

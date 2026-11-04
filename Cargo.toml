@@ -45,6 +45,7 @@ time = { version = "0.3", features = ["formatting", "local-offset", "macros"] } 
 tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] } # MIT
 tower = { version = "0.5", features = ["util"] }                                                     # MIT
 tower-http = { version = "0.7", features = ["fs"] }                                                  # MIT
+unicode-normalization = "0.1"                                                                        # (MIT OR Apache-2.0) AND Unicode-3.0
 urlencoding = "2"                                                                                    # MIT
 walkdir = "2"                                                                                        # Unlicense OR MIT
 

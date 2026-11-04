@@ -359,6 +359,14 @@ fn scan(opt: ScanOpt, now: Instant) {
                 s.media_hashed,
                 s.skipped
             );
+            if s.respelled > 0 {
+                println!(
+                    "{} cataloged files have their names in another Unicode normalization on \
+                     disk (accents composed or decomposed, as on macOS); the catalog now spells \
+                     them as on disk, keeping their hashes.",
+                    s.respelled
+                );
+            }
             if s.media_undecodable > 0 {
                 println!(
                     "{} files could not be decoded; they are left out of similarity matching \

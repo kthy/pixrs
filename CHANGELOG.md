@@ -43,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A file whose name has accents spelled another way than in the catalog (macOS may decompose
+  `é` into `e` and a combining accent, where Linux and Windows compose it) no longer looks like
+  a new file whose cataloged row is gone. `pixrs scan` matches names in Unicode NFC, keeps the
+  row and its hashes, and gives it the name as it is on disk; `pixrs relocate` finds such files
+  at the new place. `pixrs organize` and `pixrs dupes --quarantine` take names that differ only
+  in normalization for the same name, as they do names that differ only in letter case.
 - On an SMB share mounted in WSL, `pixrs apply` skipped the first file moved into each new
   folder ("cannot create its folder: Input/output error"), and would have stopped after a copy
   to another drive: the share answers every request to flush a folder to disk with an I/O
