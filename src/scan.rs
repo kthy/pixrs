@@ -21,6 +21,7 @@ use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
 use crate::names::nfc;
 use crate::text::{printable, shown};
+use crate::walk::{Found, MediaFile};
 use indicatif::{
     HumanBytes, HumanCount, HumanDuration, ProgressBar, ProgressState, ProgressStyle,
 };
@@ -40,7 +41,6 @@ use std::thread::{self, available_parallelism};
 use std::time::{Duration, UNIX_EPOCH};
 use time::macros::format_description;
 use time::OffsetDateTime;
-use walkdir::WalkDir;
 
 /// Commit to the catalog after this many files, so an interrupted scan keeps its progress.
 const COMMIT_EVERY: usize = 256;
@@ -57,6 +57,12 @@ const MAX_HASHERS: usize = 4;
 /// on a network share, for round trips. On WSL's `/mnt/c`, 2,000 files took 5.5 s with one reader,
 /// 1.2 s with 4 and 0.85 s with 8 to 64; a share with longer round trips gains from more.
 const MAX_READERS: usize = 16;
+
+/// Threads that list folders and stat media files at once, however many cores there are: each
+/// mostly waits for the disk or, on a network share, for round trips. On WSL's `/mnt/c`, an
+/// unchanged library of 6,000 files in 400 folders was walked in 2.9 s by one thread, 1.3 s by 4
+/// and 0.9 s by 8 to 32; one folder of 6,000 files in 2.6 s, 1.1 s and 0.8 s.
+const MAX_WALKERS: usize = 16;
 
 /// What a scan did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -312,43 +318,42 @@ impl<'c> Scan<'c> {
     ) -> Walked {
         let mut walked = Walked::default();
         let walk = spinner("[1/4] Walking", self.quiet);
-        for entry in WalkDir::new(&self.start) {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    let path = e.path().unwrap_or(&self.start).to_path_buf();
-                    walk.suspend(|| warn(&path, &e));
-                    if let Some(rel) = relative_path(&self.root, &path) {
-                        walked.unreadable.push(rel);
-                    }
-                    self.summary.skipped += 1;
-                    continue;
+        let root = &self.root;
+        let listing = |dir: &Path| {
+            walk.set_message(shown(dir.strip_prefix(root).unwrap_or(dir)).to_string());
+        };
+        let mut media = vec![];
+        let summary = &mut self.summary;
+        crate::walk::walk(&self.start, MAX_WALKERS, listing, |found| match found {
+            Found::Media(file) => {
+                walk.inc(1);
+                media.push(file);
+            }
+            Found::Unreadable { path, error } => {
+                walk.suspend(|| warn(&path, &error));
+                if let Some(rel) = relative_path(root, &path) {
+                    walked.unreadable.push(rel);
                 }
-            };
-            if entry.file_type().is_dir() {
-                let dir = entry
-                    .path()
-                    .strip_prefix(&self.root)
-                    .unwrap_or_else(|_| entry.path());
-                walk.set_message(shown(dir).to_string());
-                continue;
+                summary.skipped += 1;
             }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let Some(media_type) = MediaType::from_path(entry.path()) else {
-                continue;
-            };
-            walk.inc(1);
-            let Some(rel) = relative_path(&self.root, entry.path()) else {
-                walk.suspend(|| warn(entry.path(), "file name is not valid UTF-8"));
+        });
+        // The walk finds files in any order; taken by path, which row a respelled name takes
+        // does not depend on it.
+        media.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        for MediaFile {
+            path,
+            media_type,
+            stamp,
+        } in media
+        {
+            let Some(rel) = relative_path(&self.root, &path) else {
+                walk.suspend(|| warn(&path, "file name is not valid UTF-8"));
                 self.summary.skipped += 1;
                 continue;
             };
             let mut known_stamp = known.get(&rel).copied();
             if known_stamp.is_none() {
-                let path = entry.path();
-                let found = respelling(&rel, path, &self.root, known, respellable, &walked.seen);
+                let found = respelling(&rel, &path, &self.root, known, respellable, &walked.seen);
                 if let Some(row) = found {
                     walked.seen.insert(row.path.clone());
                     known_stamp = Some(row.stamp);
@@ -358,14 +363,10 @@ impl<'c> Scan<'c> {
                     });
                 }
             }
-            let stamp = match entry
-                .metadata()
-                .map_err(io::Error::from)
-                .and_then(|m| stamp(&m))
-            {
+            let stamp = match stamp {
                 Ok(stamp) => stamp,
                 Err(e) => {
-                    walk.suspend(|| warn(entry.path(), &e));
+                    walk.suspend(|| warn(&path, &e));
                     self.summary.skipped += 1;
                     walked.seen.insert(rel);
                     continue;
@@ -375,7 +376,7 @@ impl<'c> Scan<'c> {
                 Some(known_stamp) if known_stamp == stamp => self.summary.unchanged += 1,
                 known_stamp => walked.pending.push(Pending {
                     rel: rel.clone(),
-                    path: entry.into_path(),
+                    path,
                     stamp,
                     media_type,
                     new: known_stamp.is_none(),

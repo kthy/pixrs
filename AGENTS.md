@@ -22,7 +22,9 @@ optimize beyond that without a measured need.
 The planned shape, tracked in GitHub issues #32 to #37 (one per step):
 
 - `scan`: walk the library into a SQLite catalog (path, size, mtime, media type, EXIF fields),
-  reading metadata on 16 threads whatever the core count (`MAX_READERS`: each reader mostly
+  walking on 16 threads (`MAX_WALKERS`, `src/walk.rs`: folders are listed and media files
+  stat'ed in batches by any thread; the scan thread sorts what they find by path before using
+  it, so results do not depend on walk order), reading metadata on 16 threads whatever the core count (`MAX_READERS`: each reader mostly
   waits for round trips), then hash only files whose size matches another cataloged file, on up
   to 4 threads (`MAX_HASHERS`: a few reads at once hide a network share's round trips without
   making a spinning disk seek much), with one thread writing the catalog in both, as the

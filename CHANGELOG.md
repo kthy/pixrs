@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `pixrs scan` walks the library on 16 threads instead of one: folders are listed, and the files
+  in them stat'ed, several at a time, also within one large folder. On a network share the walk
+  no longer waits for each folder's and file's round trips in turn. On WSL's `/mnt/c` an
+  unchanged library of 6,000 files was walked in 0.9 s instead of 2.9 s. A folder that cannot be
+  read is reported as `Skipping <folder>: <reason>`, without repeating the folder in the reason.
 - `pixrs scan` reads the metadata of new and changed files on 16 threads instead of one, so
   the "Reading" step no longer waits for each file's round trips in turn on a network share. On
   WSL's `/mnt/c` it read 2,000 photos in 0.85 s instead of 5.5 s.

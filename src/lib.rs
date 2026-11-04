@@ -39,3 +39,4 @@ pub mod statics;
 pub mod structs;
 pub mod template;
 pub mod text;
+pub mod walk;
