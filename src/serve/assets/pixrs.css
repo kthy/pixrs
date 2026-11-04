@@ -188,4 +188,5 @@ h3 { font-size: 1rem; margin: 1rem 0 0.25rem; }
 
 .details dt { color: var(--muted); }
 .details dd { margin: 0; overflow-wrap: anywhere; }
+.dubious { color: var(--muted); font-weight: 600; cursor: help; }
 .hash { font-family: ui-monospace, monospace; font-size: 0.85em; }

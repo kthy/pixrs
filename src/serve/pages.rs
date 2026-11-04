@@ -8,6 +8,7 @@
 use super::thumbs::{self, ViewSource};
 use super::{AppError, AppState};
 use crate::catalog::{display_root, FileRecord, Filter, Page};
+use crate::dates::from_taken_at;
 use crate::dupes::{human_mtime, plural, DupeGroup, Tier};
 use crate::media::MediaType;
 use axum::extract::{Path as UrlPath, Query, State};
@@ -16,6 +17,7 @@ use indicatif::HumanBytes;
 use maud::{html, Markup, DOCTYPE};
 use serde::Deserialize;
 use std::sync::Arc;
+use time::OffsetDateTime;
 
 /// Files per page in listings.
 const PAGE_SIZE: usize = 200;
@@ -23,6 +25,9 @@ const PAGE_SIZE: usize = 200;
 const DUPE_PAGE_SIZE: usize = 50;
 /// Highest page number honored, so offsets cannot overflow.
 const MAX_PAGE: usize = 1_000_000;
+/// Tooltip of the mark on a date taken that is before 1980 or in the future.
+const DUBIOUS_DATE: &str = "Probably wrong: before 1980 or in the future, as broken metadata \
+     often is. pixrs organize ignores it unless --trust-dates is given.";
 
 /// Query parameters shared by the pages.
 #[derive(Debug, Default, Deserialize)]
@@ -665,6 +670,13 @@ pub async fn view(
         _ => None,
     };
 
+    let dubious_date = file
+        .meta
+        .taken_at
+        .as_deref()
+        .and_then(from_taken_at)
+        .is_some_and(|taken| !taken.is_plausible(OffsetDateTime::now_utc()));
+
     let context = Context {
         from_date,
         media_type,
@@ -711,7 +723,12 @@ pub async fn view(
         dl.details {
             @if let Some(date) = &date {
                 dt { @if file.meta.taken_at.is_some() { "Taken" } @else { "Modified" } }
-                dd { (date.replacen('T', " ", 1)) }
+                dd {
+                    (date.replacen('T', " ", 1))
+                    @if dubious_date {
+                        " " abbr.dubious title=(DUBIOUS_DATE) { "?" }
+                    }
+                }
             }
             @if let Some(camera) = file.meta.camera() { dt { "Camera" } dd { (camera) } }
             @if let (Some(w), Some(h)) = (file.meta.width, file.meta.height) {

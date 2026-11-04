@@ -477,9 +477,13 @@ mod tests {
         let catalog_path = dir.path().join("catalog.sqlite");
         let catalog = Catalog::open(&catalog_path).unwrap();
         let library_id = catalog.library_id(root.to_str().unwrap()).unwrap();
-        for (path, media_type) in [
-            ("sub dir/red é.png", MediaType::Image),
-            ("photo.heic", MediaType::Image),
+        for (path, media_type, taken_at) in [
+            ("sub dir/red é.png", MediaType::Image, None),
+            (
+                "photo.heic",
+                MediaType::Image,
+                Some("1948-05-11T18:18:27+00:00"),
+            ),
         ] {
             let size = fs::metadata(library_path(&root, path)).unwrap().len();
             catalog
@@ -490,7 +494,10 @@ mod tests {
                         stamp: Stamp { size, mtime_ns: 1 },
                         media_type,
                         sha256: None,
-                        meta: MediaMeta::default(),
+                        meta: MediaMeta {
+                            taken_at: taken_at.map(String::from),
+                            ..MediaMeta::default()
+                        },
                     },
                 )
                 .unwrap();
@@ -696,6 +703,24 @@ mod tests {
         }
         let res = get(&f.app, "/dates", "localhost:2635").await;
         assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn test_marks_dubious_dates() {
+        let f = fixture(false);
+        let page = |path: &str| {
+            let uri = format!("/view/{}/{}", f.library_id, path);
+            let app = f.app.clone();
+            async move {
+                let res = get(&app, &uri, "localhost:2635").await;
+                String::from_utf8(body(res).await).unwrap()
+            }
+        };
+        let heic = page("photo.heic").await;
+        assert!(heic.contains("1948-05-11 18:18:27 <abbr class=\"dubious\""));
+        // A modification time is what the file system says, not metadata to doubt.
+        let png = page("sub%20dir/red%20%C3%A9.png").await;
+        assert!(png.contains("Modified") && !png.contains("dubious"));
     }
 
     #[test]

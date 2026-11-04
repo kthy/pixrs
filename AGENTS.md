@@ -87,7 +87,12 @@ Decided details:
   cannot fill `{hour}`, `{minute}` or `{second}`: there the name stays. Dates before 1980 or
   more than a day in the future count as missing (broken metadata, e.g. QuickTime's 1904
   epoch); `--trust-dates` turns that check off, for scans of old photos named with their real
-  date.
+  date. The viewer shows such dates with a `?` and a tooltip. A video or audio file's QuickTime
+  header time is read as `ffmpeg` reads it (`dates::quicktime_creation`): some encoders write
+  Unix time there, which counted from 1904 comes out before 1970, so a value below the 1904 to
+  1970 offset is taken as Unix time, and 0 as no date. `nom-exif` cannot tell these from
+  QuickTime's `creationdate` key, so the rule applies to track dates before 1970 in UTC (phones
+  write the key with their local offset).
 - Duplicates: report only by default. A flag enables quarantine, which keeps the oldest file and
   moves the others to a quarantine folder. "Oldest" means earliest mtime, with path order as the
   tie-breaker. Exception: in `similar` groups the largest file is kept (most pixels, then most
@@ -261,7 +266,8 @@ on the LFS files.
   licenses (listed in `about.toml`). After changing dependencies, run `just notices` to
   regenerate `THIRD_PARTY_NOTICES.txt`; CI fails if it is out of date.
 - Catalog schema changes bump `SCHEMA_VERSION` in `src/catalog.rs` and must migrate existing
-  catalogs; users' catalogs hold hours of hashing. Schema v1 shipped in 0.2.0. Likewise, a
+  catalogs (`MIGRATIONS`, run when any `Catalog::open*` finds an older version); users'
+  catalogs hold hours of hashing. Schema v1 shipped in 0.2.0. Likewise, a
   change to the plan or journal format bumps `PLAN_VERSION` in `src/plan.rs`, and `pixrs undo`
   must still read journals written by released versions.
 - Conventional Commits: `feat`, `fix`, `chore`, `chore(deps)`, `docs`, `ci`, `test`.

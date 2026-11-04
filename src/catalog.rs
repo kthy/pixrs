@@ -17,6 +17,7 @@ use directories::ProjectDirs;
 use rusqlite::types::Value;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row, Transaction,
+    TransactionBehavior,
 };
 use same_file::is_same_file;
 use std::collections::{HashMap, HashSet};
@@ -26,7 +27,26 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
+
+/// SQL that takes a catalog from one schema version to the next: the first entry takes version 1
+/// to 2, and so on.
+const MIGRATIONS: [&str; (SCHEMA_VERSION - 1) as usize] = [
+    // Video and audio dates that `nom-exif` read from a QuickTime header holding Unix time, which
+    // come out before 1970 in UTC: read as `dates::quicktime_creation` reads them, as a scan of
+    // the file would (2082844800 is `dates::QUICKTIME_EPOCH_OFFSET`). 1904-01-01 is a header
+    // without a time.
+    "UPDATE files
+     SET taken_at = CASE
+         WHEN taken_at = '1904-01-01T00:00:00+00:00' THEN NULL
+         ELSE strftime('%Y-%m-%dT%H:%M:%S+00:00', substr(taken_at, 1, 19), '+2082844800 seconds')
+     END
+     WHERE media_type IN ('video', 'audio')
+         AND length(taken_at) = 25
+         AND taken_at LIKE '%+00:00'
+         AND taken_at >= '1904-01-01T00:00:00'
+         AND taken_at < '1970-01-01T00:00:00';",
+];
 
 /// Schema for an empty catalog.
 const SCHEMA: &str = "
@@ -151,6 +171,7 @@ impl Catalog {
                 SCHEMA, SCHEMA_VERSION
             ))?,
             SCHEMA_VERSION => {}
+            v if (1..SCHEMA_VERSION).contains(&v) => migrate(&conn)?,
             v => {
                 return Err(Error::Usage(format!(
                     "{} has catalog schema version {}, but this version of pixrs only \
@@ -164,9 +185,9 @@ impl Catalog {
         Ok(Catalog { conn })
     }
 
-    /// Open the catalog at `path` for writing. It must exist and have the current schema: unlike
-    /// `open`, nothing is created, so a path from a plan or journal file cannot make a catalog,
-    /// or put tables into another SQLite file.
+    /// Open the catalog at `path` for writing. It must exist and have the current schema, or an
+    /// older one, which is migrated: unlike `open`, nothing is created, so a path from a plan or
+    /// journal file cannot make a catalog, or put tables into another SQLite file.
     pub fn open_for_update(path: &Path) -> Result<Self, Error> {
         if !path.is_file() {
             return Err(Error::Usage(format!(
@@ -181,7 +202,9 @@ impl Catalog {
         conn.busy_timeout(Duration::from_secs(5))?;
         // Before anything is written to the file, such as the journal mode.
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
+        if (1..SCHEMA_VERSION).contains(&version) {
+            migrate(&conn)?;
+        } else if version != SCHEMA_VERSION {
             return Err(Error::Usage(format!(
                 "{} is not a catalog this version of pixrs understands (schema version {}, \
                  expected {})",
@@ -196,7 +219,8 @@ impl Catalog {
         Ok(Catalog { conn })
     }
 
-    /// Open the catalog at `path` read-only. It must exist and have the current schema.
+    /// Open the catalog at `path` read-only. It must exist and have the current schema; an older
+    /// one is migrated first.
     pub fn open_existing(path: &Path) -> Result<Self, Error> {
         if !path.is_file() {
             return Err(Error::Usage(format!(
@@ -210,7 +234,16 @@ impl Catalog {
         )?;
         conn.busy_timeout(Duration::from_secs(5))?;
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
+        if (1..SCHEMA_VERSION).contains(&version) {
+            // A catalog of an older version is brought up to date once, through a connection
+            // that may write.
+            let writer = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            writer.busy_timeout(Duration::from_secs(5))?;
+            migrate(&writer)?;
+        } else if version != SCHEMA_VERSION {
             return Err(Error::Usage(format!(
                 "{} is not a catalog this version of pixrs understands (schema version {}, \
                  expected {})",
@@ -1312,6 +1345,22 @@ pub fn one_row_per_file<'a>(
     (keep.len() < rows.len()).then_some(keep)
 }
 
+/// Bring a catalog with an older schema version up to `SCHEMA_VERSION`, in one transaction that
+/// holds the write lock, so two processes opening it at once migrate it once.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Read again under the lock: another process may have migrated it meanwhile.
+    let version: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(1..SCHEMA_VERSION).contains(&version) {
+        return Ok(());
+    }
+    for sql in &MIGRATIONS[(version - 1) as usize..] {
+        tx.execute_batch(sql)?;
+    }
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()
+}
+
 /// SQL for a file's date: the first 19 characters of `taken_at` (the camera's local time in both
 /// stored formats), or else the mtime in local time.
 const DATE_KEY: &str = "coalesce(substr(taken_at, 1, 19), \
@@ -1551,6 +1600,118 @@ mod tests {
             .pragma_update(None, "user_version", 99)
             .unwrap();
         assert!(matches!(Catalog::open(&path), Err(Error::Usage(_))));
+    }
+
+    /// A catalog at `path` with schema version 1 and one library holding `files`: path, media
+    /// type and `taken_at`.
+    fn catalog_v1(path: &Path, files: &[(&str, MediaType, Option<&str>)]) {
+        let catalog = Catalog::open(path).unwrap();
+        let id = catalog.library_id("/lib").unwrap();
+        for &(name, media_type, taken_at) in files {
+            let mut file = record(name, 1);
+            file.media_type = media_type;
+            file.meta.taken_at = taken_at.map(String::from);
+            catalog.upsert(id, &file).unwrap();
+        }
+        catalog.conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+
+    #[test]
+    fn test_migration_reads_quicktime_unix_dates() {
+        use crate::dates::quicktime_creation;
+        use time::macros::datetime;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let files = [
+            (
+                "unix.mp4",
+                MediaType::Video,
+                Some("1948-05-11T18:18:27+00:00"),
+            ),
+            (
+                "late.m4a",
+                MediaType::Audio,
+                Some("1969-12-31T23:59:59+00:00"),
+            ),
+            (
+                "unset.mov",
+                MediaType::Video,
+                Some("1904-01-01T00:00:00+00:00"),
+            ),
+            // Not from a QuickTime header: with a local offset, in an image, or after 1970.
+            (
+                "keys.mov",
+                MediaType::Video,
+                Some("1965-03-01T10:00:00+01:00"),
+            ),
+            (
+                "scan.jpg",
+                MediaType::Image,
+                Some("1948-05-11T18:18:27+00:00"),
+            ),
+            ("naive.mp4", MediaType::Video, Some("1948-05-11T18:18:27")),
+            (
+                "fine.mp4",
+                MediaType::Video,
+                Some("2019-07-14T12:34:56+00:00"),
+            ),
+            ("none.mp4", MediaType::Video, None),
+        ];
+        let migrated = [
+            ("fine.mp4", Some("2019-07-14T12:34:56+00:00")),
+            ("keys.mov", Some("1965-03-01T10:00:00+01:00")),
+            ("late.m4a", Some("2036-01-01T23:59:59+00:00")),
+            ("naive.mp4", Some("1948-05-11T18:18:27")),
+            ("none.mp4", None),
+            ("scan.jpg", Some("1948-05-11T18:18:27+00:00")),
+            ("unix.mp4", Some("2014-05-12T18:18:27+00:00")),
+            ("unset.mov", None),
+        ];
+        // The same as a scan reads them.
+        let unix = datetime!(1948-05-11 18:18:27 UTC).unix_timestamp();
+        assert_eq!(
+            quicktime_creation(unix),
+            Some(datetime!(2014-05-12 18:18:27 UTC).unix_timestamp())
+        );
+        assert_eq!(
+            quicktime_creation(-1),
+            Some(datetime!(2036-01-01 23:59:59 UTC).unix_timestamp())
+        );
+
+        let taken = |catalog: &Catalog| {
+            let id = catalog.find_library("/lib").unwrap().unwrap();
+            catalog
+                .files(id)
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.path, f.meta.taken_at))
+                .collect::<Vec<_>>()
+        };
+        let expected = migrated
+            .iter()
+            .map(|&(p, t)| (String::from(p), t.map(String::from)))
+            .collect::<Vec<_>>();
+        let version = |path: &Path| -> i32 {
+            Connection::open(path)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+
+        catalog_v1(&path, &files);
+        assert_eq!(taken(&Catalog::open_existing(&path).unwrap()), expected);
+        assert_eq!(version(&path), SCHEMA_VERSION);
+
+        let path = dir.path().join("for-update.sqlite");
+        catalog_v1(&path, &files);
+        assert_eq!(taken(&Catalog::open_for_update(&path).unwrap()), expected);
+
+        let path = dir.path().join("open.sqlite");
+        catalog_v1(&path, &files);
+        assert_eq!(taken(&Catalog::open(&path).unwrap()), expected);
+        // Migrated once: opening it again changes nothing.
+        assert_eq!(taken(&Catalog::open(&path).unwrap()), expected);
     }
 
     #[test]

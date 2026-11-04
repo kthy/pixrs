@@ -7,6 +7,22 @@
 
 use time::{Date, Month, OffsetDateTime};
 
+/// Seconds from QuickTime's epoch (1904-01-01) to the Unix epoch (1970-01-01).
+pub const QUICKTIME_EPOCH_OFFSET: i64 = 2_082_844_800;
+
+/// The Unix time a QuickTime header's creation time stands for, read as ffmpeg reads it, from
+/// `unix`: the header's value taken as seconds since 1904 and converted to Unix time, as
+/// `nom-exif` does. Some encoders write seconds since 1970 there, which reads as a date before
+/// 1970; ffmpeg takes a value below the offset as Unix time, so such a date moves forward by the
+/// offset. A value of 0 (1904-01-01) means the time is not set, and gives `None`.
+pub fn quicktime_creation(unix: i64) -> Option<i64> {
+    match unix {
+        u if u == -QUICKTIME_EPOCH_OFFSET => None,
+        u if (-QUICKTIME_EPOCH_OFFSET..0).contains(&u) => Some(u + QUICKTIME_EPOCH_OFFSET),
+        u => Some(u),
+    }
+}
+
 /// A date, with the time of day if it is known. Wall-clock time as recorded, no timezone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Taken {
@@ -258,6 +274,25 @@ mod tests {
         for (name, expected) in cases {
             assert_eq!(from_name(name), expected, "{}", name);
         }
+    }
+
+    #[test]
+    fn test_quicktime_creation() {
+        let unix = datetime!(2014-05-12 18:18:27 UTC).unix_timestamp();
+        // Unix seconds in the header, read as seconds since 1904: 1948-05-11T18:18:27.
+        assert_eq!(
+            quicktime_creation(unix - QUICKTIME_EPOCH_OFFSET),
+            Some(unix)
+        );
+        // Seconds since 1904, as the format defines them.
+        assert_eq!(quicktime_creation(unix), Some(unix));
+        assert_eq!(quicktime_creation(0), Some(0));
+        assert_eq!(quicktime_creation(-1), Some(QUICKTIME_EPOCH_OFFSET - 1));
+        assert_eq!(quicktime_creation(-QUICKTIME_EPOCH_OFFSET), None);
+        assert_eq!(
+            quicktime_creation(-QUICKTIME_EPOCH_OFFSET - 1),
+            Some(-QUICKTIME_EPOCH_OFFSET - 1)
+        );
     }
 
     #[test]
