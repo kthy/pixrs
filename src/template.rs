@@ -220,15 +220,15 @@ impl Template {
     /// Folder levels that need a date (or time) the file lacks become one `undated` folder. A
     /// file name that needs a value the file lacks becomes its original name, except that a
     /// WhatsApp file's counter stands in for a missing `{time}` (see `whatsapp_counter`).
-    pub fn render(&self, facts: &Facts, undated: &str) -> Vec<String> {
-        let mut out: Vec<String> = vec![];
+    pub fn render(&self, facts: &Facts, undated: &str) -> Rendered {
+        let mut folders: Vec<String> = vec![];
         let mut in_undated = false;
         for segment in &self.folders {
             if has(segment, facts) {
-                out.push(sanitize(&fill(segment, facts, None)));
+                folders.push(sanitize(&fill(segment, facts, None)));
                 in_undated = false;
             } else if !in_undated {
-                out.push(sanitize(undated));
+                folders.push(sanitize(undated));
                 in_undated = true;
             }
         }
@@ -239,8 +239,10 @@ impl Template {
         } else {
             format!("{}.{}", facts.name, facts.ext)
         };
-        out.push(sanitize(&file));
-        out
+        Rendered {
+            folders,
+            file: sanitize(&file),
+        }
     }
 
     /// The WhatsApp counter to put in place of `{time}` in the file name, if the file has a
@@ -258,6 +260,13 @@ impl Template {
             .then(|| whatsapp_counter(facts.name))
             .flatten()
     }
+}
+
+/// Where a template puts a file: folder names, outermost first, and the file name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rendered {
+    pub folders: Vec<String>,
+    pub file: String,
 }
 
 /// The counter at the end of a WhatsApp file name: `WA0001` in `IMG-20190501-WA0001` (also
@@ -394,6 +403,13 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    /// The folders and the file name `t` gives a file, with `undated` for missing dates.
+    fn render(t: &Template, facts: &Facts) -> Vec<String> {
+        let Rendered { mut folders, file } = t.render(facts, "undated");
+        folders.push(file);
+        folders
+    }
+
     fn facts(taken: Option<Taken>) -> Facts<'static> {
         Facts {
             taken,
@@ -415,12 +431,12 @@ mod tests {
     fn test_render() {
         let t = Template::parse("{type}/{year}/{month}/{date}_{time}.{ext}").unwrap();
         assert_eq!(
-            t.render(&facts(Some(MAY_FIRST)), "undated"),
+            render(&t, &facts(Some(MAY_FIRST))),
             ["video", "2023", "05", "2023-05-01_143205.mp4"]
         );
         // Undated: the date folders collapse into one, the file keeps its name.
         assert_eq!(
-            t.render(&facts(None), "undated"),
+            render(&t, &facts(None)),
             ["video", "undated", "DSC0047.mp4"]
         );
         // A date without a time: date folders, original name.
@@ -429,12 +445,12 @@ mod tests {
             ..MAY_FIRST
         };
         assert_eq!(
-            t.render(&facts(Some(date_only)), "undated"),
+            render(&t, &facts(Some(date_only))),
             ["video", "2023", "05", "DSC0047.mp4"]
         );
         let t = Template::parse("{camera}/{date} {name}.{ext}").unwrap();
         assert_eq!(
-            t.render(&facts(Some(date_only)), "undated"),
+            render(&t, &facts(Some(date_only))),
             ["Canon EOS 80D", "2023-05-01 DSC0047.mp4"]
         );
     }
@@ -461,23 +477,18 @@ mod tests {
             ("IMG-20230501-WAx1", "IMG-20230501-WAx1.jpg"),
             ("holiday-WAVES", "holiday-WAVES.jpg"),
         ] {
-            assert_eq!(
-                t.render(&named(name), "undated"),
-                ["2023", file],
-                "{}",
-                name
-            );
+            assert_eq!(render(&t, &named(name)), ["2023", file], "{}", name);
         }
         // Another template puts the counter where it puts the time.
         let t = Template::parse("{year}{month}{day}-{time}.{ext}").unwrap();
         assert_eq!(
-            t.render(&named("IMG-20230501-WA0001"), "undated"),
+            render(&t, &named("IMG-20230501-WA0001")),
             ["20230501-WA0001.jpg"]
         );
         // A counter cannot be an hour, minute or second.
         let t = Template::parse("{date} {hour}h{minute}.{ext}").unwrap();
         assert_eq!(
-            t.render(&named("IMG-20230501-WA0001"), "undated"),
+            render(&t, &named("IMG-20230501-WA0001")),
             ["IMG-20230501-WA0001.jpg"]
         );
         // With a time, the time is used; undated files keep their names.
@@ -486,18 +497,12 @@ mod tests {
             name: "IMG-20230501-WA0001",
             ..facts(Some(MAY_FIRST))
         };
-        assert_eq!(
-            t.render(&timed, "undated"),
-            ["2023", "2023-05-01_143205.mp4"]
-        );
+        assert_eq!(render(&t, &timed), ["2023", "2023-05-01_143205.mp4"]);
         let undated = Facts {
             name: "IMG-20230501-WA0001",
             ..facts(None)
         };
-        assert_eq!(
-            t.render(&undated, "undated"),
-            ["undated", "IMG-20230501-WA0001.mp4"]
-        );
+        assert_eq!(render(&t, &undated), ["undated", "IMG-20230501-WA0001.mp4"]);
     }
 
     #[test]

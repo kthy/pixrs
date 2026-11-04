@@ -1078,7 +1078,12 @@ impl Catalog {
                          ORDER BY {DATE_KEY} {order}, library_id {order}, path {order} LIMIT 1"
                     ),
                     params_from_iter(values),
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| {
+                        Ok(FileRef {
+                            library_id: row.get(0)?,
+                            path: row.get(1)?,
+                        })
+                    },
                 )
                 .optional()
         };
@@ -1169,8 +1174,12 @@ pub struct HashedAv {
     pub chromaprint: Option<Vec<u32>>,
 }
 
-/// A library ID and a path in that library.
-pub type FileRef = (i64, String);
+/// A catalog row's key: a library ID and a path in that library, with `/` separators.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FileRef {
+    pub library_id: i64,
+    pub path: String,
+}
 
 /// A scanned library.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1891,32 +1900,27 @@ mod tests {
             ["2024-05-03T09:00:00 x/1.jpg", "2024-05-01T10:00:00 a.jpg"]
         );
 
+        let at = |library_id, path: &str| FileRef {
+            library_id,
+            path: String::from(path),
+        };
         let neighbors = |path| catalog.date_neighbors(&mine, id, path).unwrap();
         assert_eq!(
             neighbors("a.jpg"),
-            (
-                Some((id, String::from("x/1.jpg"))),
-                Some((id, String::from("b.mp4")))
-            )
+            (Some(at(id, "x/1.jpg")), Some(at(id, "b.mp4")))
         );
         assert_eq!(neighbors("x/1.jpg").0, None);
         // Files with the same date are ordered by library, then path, both descending.
         assert_eq!(
             neighbors("x/2.jpg"),
-            (
-                Some((id, String::from("x/y/3.jpg"))),
-                Some((id, String::from("x.jpg")))
-            )
+            (Some(at(id, "x/y/3.jpg")), Some(at(id, "x.jpg")))
         );
         let everything = |path| {
             catalog
                 .date_neighbors(&Filter::default(), id, path)
                 .unwrap()
         };
-        assert_eq!(
-            everything("ø/z/5.jpg").0,
-            Some((other, String::from("elsewhere.jpg")))
-        );
+        assert_eq!(everything("ø/z/5.jpg").0, Some(at(other, "elsewhere.jpg")));
         assert_eq!(catalog.date(id, "missing.jpg").unwrap(), None);
     }
 

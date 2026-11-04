@@ -7,7 +7,7 @@
 
 use super::thumbs::{self, ViewSource};
 use super::{AppError, AppState};
-use crate::catalog::{display_root, FileRecord, Filter, Page};
+use crate::catalog::{display_root, FileRecord, FileRef, Filter, Page};
 use crate::dates::from_taken_at;
 use crate::dupes::{human_mtime, plural, DupeGroup, Tier};
 use crate::media::MediaType;
@@ -653,7 +653,8 @@ pub async fn view(
                 catalog.date_neighbors(&filter, library_id, &path)?
             } else {
                 let (prev, next) = catalog.folder_neighbors(library_id, &path, media_type)?;
-                (prev.map(|p| (library_id, p)), next.map(|n| (library_id, n)))
+                let at = |path| FileRef { library_id, path };
+                (prev.map(at), next.map(at))
             };
             let date = catalog.date(library_id, &path)?;
             let copies = match hashed {
@@ -686,12 +687,12 @@ pub async fn view(
     let media_url = file_url("media", library_id, &file.path);
     let content = html! {
         nav.pager {
-            @if let Some((lib, p)) = &prev {
-                a rel="prev" href=(context.view_url(*lib, p)) { "< Prev" }
+            @if let Some(p) = &prev {
+                a rel="prev" href=(context.view_url(p.library_id, &p.path)) { "< Prev" }
             } @else { span {} }
             span.path { (file.path) }
-            @if let Some((lib, n)) = &next {
-                a rel="next" href=(context.view_url(*lib, n)) { "Next >" }
+            @if let Some(n) = &next {
+                a rel="next" href=(context.view_url(n.library_id, &n.path)) { "Next >" }
             } @else { span {} }
         }
         div.stage {

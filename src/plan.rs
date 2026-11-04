@@ -6,13 +6,13 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::catalog::{display_root, library_path, Catalog};
-use crate::dates::{from_name, from_taken_at};
-use crate::dupes::{plural, DupeReport, Tier};
+use crate::catalog::{display_root, library_path, Catalog, FileRecord, FileRef, Library, Stamp};
+use crate::dates::{from_name, from_taken_at, Taken};
+use crate::dupes::{plural, DupeFile, DupeGroup, DupeReport, Tier};
 use crate::error::{AtPath, Error};
 use crate::media::MediaType;
 use crate::names::folded;
-use crate::template::{sanitize, Facts, Template};
+use crate::template::{sanitize, Facts, Rendered, Template};
 use crate::text::{printable, shown};
 use log::debug;
 use same_file::is_same_file;
@@ -26,8 +26,9 @@ use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
-/// Version of the plan file format. Version 2 added `destination`.
-const PLAN_VERSION: u32 = 2;
+/// Version of the plan and journal formats. Before 1.0, plans and journals of another version
+/// are refused, not converted: plan again.
+pub(crate) const PLAN_VERSION: u32 = 3;
 
 /// Extensions of files that belong to a media file with the same name, lowercase: edits
 /// (`xmp`), iPhone edit lists (`aae`), video thumbnails (`thm`), subtitles (`srt`) and Google
@@ -38,69 +39,103 @@ const SIDECAR_EXTENSIONS: &[&str] = &["aae", "json", "srt", "thm", "xmp"];
 const SUMMARY_MOVES: usize = 20;
 
 /// What a plan does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum PlanKind {
-    Organize,
+    /// Rename and move the files of a library by a template.
+    Organize {
+        /// The template, as given.
+        template: String,
+        /// Remove folders the moves leave empty.
+        prune_empty: bool,
+    },
+    /// Move copies of kept files to the quarantine folder.
     Quarantine,
+}
+
+impl PlanKind {
+    /// The name of the kind, as in plan file names.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Organize { .. } => "organize",
+            Self::Quarantine => "quarantine",
+        }
+    }
 }
 
 /// One file to move.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Move {
     /// Where the file is, as an absolute path.
-    pub from: String,
+    pub from: PathBuf,
     /// Where it goes, as an absolute path.
-    pub to: String,
+    pub to: PathBuf,
     /// Size and mtime when the plan was made. A file that no longer matches is not moved.
-    pub size: u64,
-    pub mtime_ns: i64,
-    /// The file's catalog row (library ID and path), if it is cataloged; sidecars are not.
-    pub cataloged: Option<(i64, String)>,
-    /// The row's new library ID and path, or `None` if the file leaves the library.
-    pub cataloged_to: Option<(i64, String)>,
-    /// For a sidecar file, the index of its media file's move.
-    pub sidecar_of: Option<usize>,
-    /// For a quarantined copy, the copy that is kept, which must still be there unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keeper: Option<Keeper>,
+    #[serde(flatten)]
+    pub stamp: Stamp,
+    /// What the file is, which says what else the move depends on and changes.
+    #[serde(flatten)]
+    pub kind: MoveKind,
+}
+
+/// What a moved file is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "move", rename_all = "kebab-case")]
+pub enum MoveKind {
+    /// A cataloged file that `organize` moves within its library, or out of it.
+    Organize {
+        /// Its catalog row.
+        row: FileRef,
+        /// The row's new path in the same library, or `None` if the file leaves the library.
+        new_path: Option<String>,
+    },
+    /// A cataloged copy of a kept file, moved to quarantine. Its row leaves the catalog.
+    Quarantine {
+        row: FileRef,
+        /// The kept copy, which must still be there unchanged.
+        keeper: Keeper,
+    },
+    /// A sidecar file of the media file that the move at index `of` moves. Not cataloged.
+    Sidecar { of: usize },
 }
 
 /// The kept copy of a quarantined file, as it was when the plan was made.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keeper {
-    pub path: String,
-    pub size: u64,
-    pub mtime_ns: i64,
+    pub path: PathBuf,
+    #[serde(flatten)]
+    pub stamp: Stamp,
 }
 
 /// A library a plan works in. Folders are never pruned at or above its root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanLibrary {
     pub id: i64,
-    pub root: String,
+    pub root: PathBuf,
 }
 
 /// A plan, as written to and read from a plan file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub version: u32,
+    #[serde(flatten)]
     pub kind: PlanKind,
     /// When the plan was made, RFC 3339 in UTC.
     pub created: String,
     /// The catalog the plan was made from, which `apply` updates.
-    pub catalog: String,
-    /// The template, or the quarantine folder.
-    pub description: String,
+    pub catalog: PathBuf,
     /// The folder every move goes below: the one the files are organized into (the library
-    /// root, or the `--to` folder), or the quarantine folder. Missing from version 1 plans,
-    /// which still parse so that they are refused by version, with a message.
-    #[serde(default)]
-    pub destination: String,
+    /// root, or the `--to` folder), or the quarantine folder.
+    pub destination: PathBuf,
     pub libraries: Vec<PlanLibrary>,
-    /// Remove folders the moves leave empty.
-    pub prune_empty: bool,
     pub moves: Vec<Move>,
+}
+
+/// The version of a plan file, read before the rest so that a plan of another version is
+/// refused by its version, not by the first field that changed.
+#[derive(Deserialize)]
+struct Versioned {
+    version: u32,
 }
 
 /// Why a plan cannot be made, read or carried out.
@@ -124,13 +159,13 @@ pub enum PlanError {
     Version { path: PathBuf, found: u32 },
     /// The plan's quarantine folder and one of its libraries overlap.
     QuarantineOverlap {
-        destination: String,
-        library: String,
+        destination: PathBuf,
+        library: PathBuf,
     },
     /// Move `number` (counted from 1), of the file `from`, is not one pixrs would plan.
     BadMove {
         number: usize,
-        from: String,
+        from: PathBuf,
         problem: MoveProblem,
     },
 }
@@ -141,13 +176,15 @@ pub enum MoveProblem {
     /// Its source is not in a library of the plan.
     OutsideLibraries,
     /// Its target is not below the plan's destination.
-    OutsideDestination(String),
+    OutsideDestination(PathBuf),
     /// It is a sidecar of a move that is not an earlier media move.
     BadSidecar,
     /// It refers to a library that is not in the plan.
     UnknownLibrary,
     /// Its kept copy is not in a library of the plan.
     KeeperOutside,
+    /// It is a kind of move another kind of plan makes.
+    WrongKind,
 }
 
 impl PlanError {
@@ -193,8 +230,8 @@ impl fmt::Display for PlanError {
                 f,
                 "The plan cannot be carried out: the quarantine folder {} and the library {} \
                  overlap",
-                destination,
-                display_root(library)
+                destination.display(),
+                display_root(&library.to_string_lossy())
             ),
             Self::BadMove {
                 number,
@@ -202,7 +239,10 @@ impl fmt::Display for PlanError {
                 problem,
             } => write!(
                 f,
-                "The plan cannot be carried out: move {number} ({from}) {problem}"
+                "The plan cannot be carried out: move {} ({}) {}",
+                number,
+                from.display(),
+                problem
             ),
         }
     }
@@ -212,7 +252,9 @@ impl fmt::Display for MoveProblem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OutsideLibraries => write!(f, "is not in a library of the plan"),
-            Self::OutsideDestination(destination) => write!(f, "goes outside {destination}"),
+            Self::OutsideDestination(destination) => {
+                write!(f, "goes outside {}", destination.display())
+            }
             Self::BadSidecar => {
                 write!(
                     f,
@@ -223,6 +265,7 @@ impl fmt::Display for MoveProblem {
             Self::KeeperOutside => {
                 write!(f, "has a kept copy that is not in a library of the plan")
             }
+            Self::WrongKind => write!(f, "is not a move this kind of plan makes"),
         }
     }
 }
@@ -236,33 +279,29 @@ impl std::error::Error for PlanError {
     }
 }
 
+/// Whether `path` is inside `folder`, and not `folder` itself.
+pub(crate) fn below(path: &Path, folder: &Path) -> bool {
+    path.starts_with(folder) && path != folder
+}
+
 impl Plan {
     /// Why the plan must not be carried out, if it must not: a plan file is input like any
     /// other file, so before anything is moved every source must be in one of the plan's
-    /// libraries, every target below its destination, and the moves must refer to each other
-    /// and to the libraries consistently.
+    /// libraries, every target below its destination, and the moves must be of the plan's kind
+    /// and refer to each other and to the libraries consistently.
     pub fn check(&self) -> Result<(), PlanError> {
-        let below = |path: &str, folder: &str| {
-            let (path, folder) = (Path::new(path), Path::new(folder));
-            path.starts_with(folder) && path != folder
-        };
-        let in_a_library = |path: &str| {
-            self.libraries
-                .iter()
-                .any(|library| below(path, &library.root))
-        };
-        let known = |library_id: i64| self.libraries.iter().any(|l| l.id == library_id);
-        if self.kind == PlanKind::Quarantine {
-            for library in &self.libraries {
-                if below(&self.destination, &library.root)
-                    || below(&library.root, &self.destination)
-                    || library.root == self.destination
-                {
-                    return Err(PlanError::QuarantineOverlap {
-                        destination: self.destination.clone(),
-                        library: library.root.clone(),
-                    });
-                }
+        let in_a_library = |path: &Path| self.libraries.iter().any(|l| below(path, &l.root));
+        let known = |row: &FileRef| self.libraries.iter().any(|l| l.id == row.library_id);
+        let quarantine = self.kind == PlanKind::Quarantine;
+        if quarantine {
+            let overlapping = self.libraries.iter().find(|l| {
+                self.destination.starts_with(&l.root) || l.root.starts_with(&self.destination)
+            });
+            if let Some(library) = overlapping {
+                return Err(PlanError::QuarantineOverlap {
+                    destination: self.destination.clone(),
+                    library: library.root.clone(),
+                });
             }
         }
         for (index, m) in self.moves.iter().enumerate() {
@@ -279,25 +318,45 @@ impl Plan {
                     self.destination.clone(),
                 )));
             }
-            if let Some(media) = m.sidecar_of {
-                let earlier_media = media < index && self.moves[media].sidecar_of.is_none();
-                if !earlier_media {
-                    return Err(fault(MoveProblem::BadSidecar));
+            let problem = match &m.kind {
+                MoveKind::Organize { row, .. } if !quarantine => {
+                    (!known(row)).then_some(MoveProblem::UnknownLibrary)
                 }
-            }
-            for (library_id, _) in m.cataloged.iter().chain(&m.cataloged_to) {
-                if !known(*library_id) {
-                    return Err(fault(MoveProblem::UnknownLibrary));
+                MoveKind::Quarantine { row, keeper } if quarantine => {
+                    if !known(row) {
+                        Some(MoveProblem::UnknownLibrary)
+                    } else if !in_a_library(&keeper.path) {
+                        Some(MoveProblem::KeeperOutside)
+                    } else {
+                        None
+                    }
                 }
-            }
-            if let Some(keeper) = &m.keeper {
-                if !in_a_library(&keeper.path) {
-                    return Err(fault(MoveProblem::KeeperOutside));
+                MoveKind::Sidecar { of } => {
+                    let earlier_media = *of < index
+                        && self
+                            .moves
+                            .get(*of)
+                            .is_some_and(|media| !matches!(media.kind, MoveKind::Sidecar { .. }));
+                    (!earlier_media).then_some(MoveProblem::BadSidecar)
                 }
+                MoveKind::Organize { .. } | MoveKind::Quarantine { .. } => {
+                    Some(MoveProblem::WrongKind)
+                }
+            };
+            if let Some(problem) = problem {
+                return Err(fault(problem));
             }
         }
         Ok(())
     }
+}
+
+/// A target the plan gave another name than the template or layout wanted, since something
+/// had that name already.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Collision {
+    pub wanted: PathBuf,
+    pub got: PathBuf,
 }
 
 /// What planning found, besides the moves.
@@ -308,7 +367,7 @@ pub struct PlanNotes {
     /// Files with no usable date, put in the undated folder.
     pub undated: usize,
     /// Files whose target was taken and that got a suffix.
-    pub collisions: Vec<(String, String)>,
+    pub collisions: Vec<Collision>,
     /// Warnings to show, e.g. sidecars that cannot follow their media file.
     pub warnings: Vec<String>,
 }
@@ -354,7 +413,7 @@ type Listings = HashMap<PathBuf, Option<Vec<String>>>;
 /// Unicode normalization on every OS, since Windows and macOS file systems ignore case and macOS
 /// ignores normalization, so a plan comes out the same everywhere.
 #[derive(Default)]
-struct Taken {
+struct Claims {
     claimed: HashSet<String>,
     on_disk: Listings,
     /// Folders by their `folded` path, as spelled on disk or first in the plan. A target folder
@@ -363,7 +422,7 @@ struct Taken {
     folders: HashMap<String, PathBuf>,
 }
 
-impl Taken {
+impl Claims {
     fn key(path: &Path) -> String {
         folded(&path.to_string_lossy())
     }
@@ -381,28 +440,17 @@ impl Taken {
                 continue;
             }
             let folded_name = folded(name);
-            let same_name: Vec<String> = listing(&mut self.on_disk, &dir)
-                .unwrap_or_default()
-                .iter()
-                .filter(|n| folded(n) == folded_name)
-                .cloned()
-                .collect();
-            let kind = |n: &String| {
-                fs::symlink_metadata(dir.join(n))
-                    .ok()
-                    .map(|m| m.file_type())
-            };
-            if let Some(link) = same_name
-                .iter()
-                .find(|n| kind(n).is_some_and(|t| t.is_symlink()))
-            {
-                return Err(dir.join(link));
+            let mut existing = None;
+            let names = listing(&mut self.on_disk, &dir).unwrap_or_default();
+            for same_name in names.iter().filter(|n| folded(n) == folded_name) {
+                let path = dir.join(same_name);
+                match fs::symlink_metadata(&path).map(|m| m.file_type()) {
+                    Ok(kind) if kind.is_symlink() => return Err(path),
+                    Ok(kind) if kind.is_dir() && existing.is_none() => existing = Some(path),
+                    _ => {}
+                }
             }
-            let existing = same_name
-                .iter()
-                .find(|n| kind(n).is_some_and(|t| t.is_dir()))
-                .cloned();
-            dir = existing.map_or(wanted, |n| dir.join(n));
+            dir = existing.unwrap_or(wanted);
             self.folders.insert(key, dir.clone());
         }
         Ok(dir)
@@ -479,19 +527,25 @@ impl Links {
     }
 }
 
+/// A file name split before its last extension, the dot going with the extension: `photo.jpg`
+/// as `photo` and `.jpg`. A name without one, or with only a leading dot, has none.
+pub(crate) fn split_name(name: &str) -> (&str, &str) {
+    name.rfind('.')
+        .filter(|&dot| dot > 0)
+        .and_then(|dot| name.split_at_checked(dot))
+        .unwrap_or((name, ""))
+}
+
 /// `dir/stem.ext` as `dir/stem<suffix>.ext`.
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
-        _ => (name.to_string(), String::new()),
-    };
+    let (stem, ext) = split_name(&name);
     path.with_file_name(sanitize(&format!("{stem}{suffix}{ext}")))
 }
 
-/// `path` as UTF-8, or an error naming `what` it is.
-fn utf8(path: &Path, what: &'static str) -> Result<String, Error> {
-    crate::error::utf8(path, what).map(String::from)
+/// `path`, if it is UTF-8 (as plan files need it), or an error naming `what` it is.
+fn utf8(path: &Path, what: &'static str) -> Result<PathBuf, Error> {
+    crate::error::utf8(path, what).map(PathBuf::from)
 }
 
 /// `target` relative to `root` with `/` separators, if it is inside it.
@@ -548,28 +602,24 @@ fn sidecars(dir: &Path, name: &str, new_name: &str, cache: &mut Listings) -> Vec
 
 /// Plan sidecar moves for `moves` (media moves only, all from cataloged files). A sidecar that
 /// another media file in its folder shares, and that file stays, stays too.
-fn add_sidecars(moves: &mut Vec<Move>, taken: &mut Taken, notes: &mut PlanNotes) {
+fn add_sidecars(moves: &mut Vec<Move>, claims: &mut Claims, notes: &mut PlanNotes) {
     let mut cache = Listings::new();
-    let moving: HashSet<String> = moves
-        .iter()
-        .map(|m| Taken::key(Path::new(&m.from)))
-        .collect();
+    let moving: HashSet<String> = moves.iter().map(|m| Claims::key(&m.from)).collect();
     let mut moved: HashSet<String> = HashSet::new();
-    let media_moves = moves.len();
-    for i in 0..media_moves {
-        let (from, to) = (PathBuf::from(&moves[i].from), PathBuf::from(&moves[i].to));
+    let mut sidecar_moves = vec![];
+    for (media, m) in moves.iter().enumerate() {
         let (Some(dir), Some(name), Some(to_dir), Some(new_name)) = (
-            from.parent(),
-            from.file_name().and_then(|n| n.to_str()),
-            to.parent(),
-            to.file_name().and_then(|n| n.to_str()),
+            m.from.parent(),
+            m.from.file_name().and_then(|n| n.to_str()),
+            m.to.parent(),
+            m.to.file_name().and_then(|n| n.to_str()),
         ) else {
             continue;
         };
         for sidecar in sidecars(dir, name, new_name, &mut cache) {
             let source = dir.join(&sidecar.name);
             // A sidecar shared by several media files (RAW and JPEG) follows the first.
-            if moved.contains(&Taken::key(&source)) {
+            if !moved.insert(Claims::key(&source)) {
                 continue;
             }
             if sidecar.by_stem {
@@ -580,7 +630,7 @@ fn add_sidecars(moves: &mut Vec<Move>, taken: &mut Taken, notes: &mut PlanNotes)
                     .find(|other| {
                         stem(other).eq_ignore_ascii_case(sidecar_stem)
                             && MediaType::from_path(Path::new(other.as_str())).is_some()
-                            && !moving.contains(&Taken::key(&dir.join(other.as_str())))
+                            && !moving.contains(&Claims::key(&dir.join(other.as_str())))
                     });
                 if let Some(staying) = staying {
                     notes.warnings.push(format!(
@@ -588,13 +638,11 @@ fn add_sidecars(moves: &mut Vec<Move>, taken: &mut Taken, notes: &mut PlanNotes)
                         source.display(),
                         staying
                     ));
-                    moved.insert(Taken::key(&source));
                     continue;
                 }
             }
-            moved.insert(Taken::key(&source));
             let target = to_dir.join(&sidecar.new_name);
-            if !taken.is_free(&target, &source) {
+            if !claims.is_free(&target, &source) {
                 notes.warnings.push(format!(
                     "{} stays: {} is taken",
                     source.display(),
@@ -602,67 +650,76 @@ fn add_sidecars(moves: &mut Vec<Move>, taken: &mut Taken, notes: &mut PlanNotes)
                 ));
                 continue;
             }
-            taken.claim(&target);
+            claims.claim(&target);
             let Ok(stamp) = fs::metadata(&source).and_then(|m| crate::scan::stamp(&m)) else {
                 continue;
             };
-            let (Ok(from), Ok(to)) = (utf8(&source, "Sidecar"), utf8(&target, "Target")) else {
-                continue;
-            };
-            if from == to {
+            // Both are UTF-8: the folders are those of UTF-8 moves, the names from listings,
+            // which hold UTF-8 names only.
+            if source == target {
                 continue;
             }
-            moves.push(Move {
-                from,
-                to,
-                size: stamp.size,
-                mtime_ns: stamp.mtime_ns,
-                cataloged: None,
-                cataloged_to: None,
-                sidecar_of: Some(i),
-                keeper: None,
+            sidecar_moves.push(Move {
+                from: source,
+                to: target,
+                stamp,
+                kind: MoveKind::Sidecar { of: media },
             });
         }
     }
+    moves.extend(sidecar_moves);
 }
 
-/// Plan how to organize one library by a template.
-#[allow(clippy::too_many_lines, reason = "to be split by phase")]
-pub fn plan_organize(
-    catalog: &Catalog,
-    catalog_path: &Path,
-    library_id: i64,
-    root: &Path,
+/// A cataloged file and where the template wants it.
+struct Wanted {
+    source: PathBuf,
+    target: PathBuf,
+    file: FileRecord,
+}
+
+/// When a file was taken, from its metadata or else from its name, and which it was. Dates
+/// before 1980 or in the future count as missing unless dates are trusted.
+fn date_taken(
+    file: &FileRecord,
+    name: &str,
     opts: &OrganizeOptions,
-) -> Result<(Plan, PlanNotes), Error> {
-    let base = opts.to.clone().unwrap_or_else(|| root.to_path_buf());
-    if !opts.suffix.contains("{n}") {
-        return Err(PlanError::SuffixWithoutN.into());
+) -> (Option<Taken>, &'static str) {
+    let plausible = |t: &Taken| opts.trust_dates || t.is_plausible(opts.now);
+    let from_meta = file.meta.taken_at.as_deref().and_then(from_taken_at);
+    if let (Some(raw), Some(false)) = (&file.meta.taken_at, from_meta.map(|t| plausible(&t))) {
+        debug!(
+            "{}: metadata date {} is before 1980 or in the future; ignored",
+            printable(&file.path),
+            printable(raw)
+        );
     }
-    let mut notes = PlanNotes::default();
-    let mut claims = Taken::default();
+    match from_meta.filter(plausible) {
+        Some(taken) => (Some(taken), "date from metadata"),
+        None => match from_name(name).filter(plausible) {
+            Some(taken) => (Some(taken), "date from the file name"),
+            None => (None, "no date"),
+        },
+    }
+}
+
+/// Where the template wants each file of the library, below `base`, in a deterministic order:
+/// by target, then by where the file is now. Files that would go through a symbolic link stay,
+/// with a warning.
+fn wanted_targets(
+    files: Vec<FileRecord>,
+    root: &Path,
+    base: &Path,
+    opts: &OrganizeOptions,
+    claims: &mut Claims,
+    notes: &mut PlanNotes,
+) -> Vec<Wanted> {
     let mut links = Links::default();
-    let mut targets: Vec<(PathBuf, PathBuf, crate::catalog::FileRecord)> = vec![];
-    for file in catalog.files(library_id)? {
+    let mut wanted: Vec<Wanted> = vec![];
+    for file in files {
         let source = library_path(root, &file.path);
         let name = file.path.rsplit('/').next().unwrap_or(&file.path);
         let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
-        let plausible = |t: &crate::dates::Taken| opts.trust_dates || t.is_plausible(opts.now);
-        let from_meta = file.meta.taken_at.as_deref().and_then(from_taken_at);
-        let (taken, date_from) = match from_meta.filter(plausible) {
-            Some(taken) => (Some(taken), "date from metadata"),
-            None => match from_name(name).filter(plausible) {
-                Some(taken) => (Some(taken), "date from the file name"),
-                None => (None, "no date"),
-            },
-        };
-        if let (Some(raw), Some(false)) = (&file.meta.taken_at, from_meta.map(|t| plausible(&t))) {
-            debug!(
-                "{}: metadata date {} is before 1980 or in the future; ignored",
-                printable(&file.path),
-                printable(raw)
-            );
-        }
+        let (taken, date_from) = date_taken(&file, name, opts);
         if taken.is_none() {
             notes.undated += 1;
         }
@@ -675,9 +732,11 @@ pub fn plan_organize(
             name: stem,
             ext: &ext,
         };
-        let mut segments = opts.template.render(&facts, opts.undated);
-        let file_name = segments.pop().expect("a template renders a file name");
-        let target = match claims.folder(&base, &segments) {
+        let Rendered {
+            folders,
+            file: file_name,
+        } = opts.template.render(&facts, opts.undated);
+        let target = match claims.folder(base, &folders) {
             Ok(folder) => folder.join(file_name),
             Err(link) => {
                 debug!(
@@ -693,17 +752,38 @@ pub fn plan_organize(
             "{}: {}, wants {}",
             printable(&file.path),
             date_from,
-            shown(target.strip_prefix(&base).unwrap_or(&target))
+            shown(target.strip_prefix(base).unwrap_or(&target))
         );
-        targets.push((source, target, file));
+        wanted.push(Wanted {
+            source,
+            target,
+            file,
+        });
     }
-    links.warn(&mut notes);
-    // Deterministic: by target, then by where the file is now.
-    targets.sort_by(|a, b| (Taken::key(&a.1), &a.0).cmp(&(Taken::key(&b.1), &b.0)));
+    links.warn(notes);
+    wanted.sort_by(|a, b| {
+        (Claims::key(&a.target), &a.source).cmp(&(Claims::key(&b.target), &b.source))
+    });
+    wanted
+}
 
-    let mut moves: Vec<Move> = vec![];
-    for (source, target, file) in targets {
-        let Some(assigned) = claims.claim_free(&target, &source, opts.suffix) else {
+/// The moves that put each file where it is wanted, or at a free variant of that name.
+fn organize_moves(
+    wanted: Vec<Wanted>,
+    library_id: i64,
+    root: &Path,
+    suffix: &str,
+    claims: &mut Claims,
+    notes: &mut PlanNotes,
+) -> Result<Vec<Move>, Error> {
+    let mut moves = vec![];
+    for Wanted {
+        source,
+        target,
+        file,
+    } in wanted
+    {
+        let Some(assigned) = claims.claim_free(&target, &source, suffix) else {
             notes.warnings.push(format!(
                 "{} stays: the folder {} cannot be read",
                 source.display(),
@@ -716,61 +796,79 @@ pub fn plan_organize(
             notes.unchanged += 1;
             continue;
         }
+        let new_path = relative_to(root, &assigned);
         if assigned != target {
-            notes
-                .collisions
-                .push((target.display().to_string(), assigned.display().to_string()));
+            notes.collisions.push(Collision {
+                wanted: target,
+                got: assigned.clone(),
+            });
         }
         moves.push(Move {
             from: utf8(&source, "File")?,
             to: utf8(&assigned, "Target")?,
-            size: file.stamp.size,
-            mtime_ns: file.stamp.mtime_ns,
-            cataloged_to: relative_to(root, &assigned).map(|rel| (library_id, rel)),
-            cataloged: Some((library_id, file.path)),
-            sidecar_of: None,
-            keeper: None,
+            stamp: file.stamp,
+            kind: MoveKind::Organize {
+                row: FileRef {
+                    library_id,
+                    path: file.path,
+                },
+                new_path,
+            },
         });
     }
+    Ok(moves)
+}
+
+/// Plan how to organize one library by a template.
+pub fn plan_organize(
+    catalog: &Catalog,
+    catalog_path: &Path,
+    library_id: i64,
+    root: &Path,
+    opts: &OrganizeOptions,
+) -> Result<(Plan, PlanNotes), Error> {
+    if !opts.suffix.contains("{n}") {
+        return Err(PlanError::SuffixWithoutN.into());
+    }
+    let base = opts.to.clone().unwrap_or_else(|| root.to_path_buf());
+    let mut notes = PlanNotes::default();
+    let mut claims = Claims::default();
+    let files = catalog.files(library_id)?;
+    let wanted = wanted_targets(files, root, &base, opts, &mut claims, &mut notes);
+    let mut moves = organize_moves(
+        wanted,
+        library_id,
+        root,
+        opts.suffix,
+        &mut claims,
+        &mut notes,
+    )?;
     add_sidecars(&mut moves, &mut claims, &mut notes);
 
     let plan = Plan {
         version: PLAN_VERSION,
-        kind: PlanKind::Organize,
+        kind: PlanKind::Organize {
+            template: String::from(opts.template.source()),
+            prune_empty: opts.prune_empty,
+        },
         created: timestamp(opts.now),
         catalog: utf8(catalog_path, "Catalog")?,
-        description: String::from(opts.template.source()),
         destination: utf8(&base, "Target folder")?,
         libraries: vec![PlanLibrary {
             id: library_id,
             root: utf8(root, "Library")?,
         }],
-        prune_empty: opts.prune_empty,
         moves,
     };
     Ok((plan, notes))
 }
 
-/// Plan moving every copy that has the same bytes or pixels as its group's keeper to `dir`, as
-/// `dir/<library name>/<path in the library>`. With `only` libraries, only copies in them move.
-/// Similar files are left alone: similar images are mostly burst shots, not copies, and a
-/// re-encoded video may be the better copy. Exact copies in a similar group still move. Each
-/// move requires its group's kept copy to still be there, unchanged, when the plan is applied.
-#[allow(clippy::too_many_lines, reason = "to be split by phase")]
-pub fn plan_quarantine(
-    catalog: &Catalog,
-    catalog_path: &Path,
-    report: &DupeReport,
-    only: &[i64],
-    dir: &Path,
-    now: OffsetDateTime,
-) -> Result<(Plan, PlanNotes), Error> {
-    let mut libraries = catalog.libraries()?;
-    libraries.sort_by(|a, b| a.root.cmp(&b.root));
-    // One folder per library, named after its last folder; a number tells same names apart.
-    let mut folder_of: HashMap<i64, String> = HashMap::new();
+/// One folder name per library in the quarantine folder: the last folder of its root, with a
+/// number to tell same names apart.
+fn quarantine_folders(libraries: &[Library]) -> HashMap<i64, String> {
+    let mut folder_of = HashMap::new();
     let mut used: HashSet<String> = HashSet::new();
-    for library in &libraries {
+    for library in libraries {
         let shown = display_root(&library.root);
         let last = Path::new(&shown).file_name().map_or_else(
             || String::from("library"),
@@ -784,132 +882,202 @@ pub fn plan_quarantine(
         }
         folder_of.insert(library.id, name);
     }
-    let roots: HashMap<i64, String> = libraries.iter().map(|l| (l.id, l.root.clone())).collect();
+    folder_of
+}
 
-    let mut notes = PlanNotes::default();
-    let mut taken = Taken::default();
-    let mut links = Links::default();
-    let mut moves = vec![];
-    let mut involved: Vec<i64> = vec![];
-    for group in &report.groups {
-        if group
+/// A quarantine plan being made.
+struct Quarantine<'a> {
+    /// The quarantine folder.
+    dir: &'a Path,
+    /// Libraries to quarantine copies from; all if empty.
+    only: &'a [i64],
+    roots: HashMap<i64, &'a Path>,
+    folder_of: HashMap<i64, String>,
+    claims: Claims,
+    links: Links,
+    notes: PlanNotes,
+    moves: Vec<Move>,
+    /// Libraries copies are quarantined from, in the order first seen.
+    involved: Vec<i64>,
+}
+
+impl Quarantine<'_> {
+    /// Plan moving the exact and same-pixel copies of the group's kept file, the group's first.
+    fn group(&mut self, group: &DupeGroup) -> Result<(), Error> {
+        let nothing_to_move = group
             .files
             .iter()
-            .all(|f| f.matches == Some(Tier::Similar) || f.keep)
-        {
-            continue;
+            .all(|f| f.matches == Some(Tier::Similar) || f.keep);
+        if nothing_to_move {
+            return Ok(());
         }
-        let keeper = &group.files[0];
-        let Some(keeper_root) = roots.get(&keeper.library_id) else {
-            continue;
+        let Some((kept, copies)) = group.files.split_first() else {
+            return Ok(());
         };
+        let Some(kept_root) = self.roots.get(&kept.library_id) else {
+            return Ok(());
+        };
+        let kept_path = library_path(kept_root, &kept.path);
         debug!(
             "{} group of {} files keeps {}",
             group.tier.as_str(),
             group.files.len(),
-            shown(&library_path(Path::new(keeper_root), &keeper.path))
+            shown(&kept_path)
         );
         let keeper = Keeper {
-            path: utf8(
-                &library_path(Path::new(keeper_root), &keeper.path),
-                "Kept file",
-            )?,
-            size: keeper.size,
-            mtime_ns: keeper.mtime_ns,
+            path: utf8(&kept_path, "Kept file")?,
+            stamp: Stamp {
+                size: kept.size,
+                mtime_ns: kept.mtime_ns,
+            },
         };
-        for file in group.files.iter().skip(1) {
-            if !matches!(file.matches, Some(Tier::Exact | Tier::SamePixels)) {
+        for file in copies {
+            self.copy(file, &keeper)?;
+        }
+        Ok(())
+    }
+
+    /// Plan moving one copy of `keeper`, if it is one that moves.
+    fn copy(&mut self, file: &DupeFile, keeper: &Keeper) -> Result<(), Error> {
+        if !matches!(file.matches, Some(Tier::Exact | Tier::SamePixels)) {
+            debug!(
+                "{} stays: only similar to the kept file",
+                printable(&file.path)
+            );
+            return Ok(());
+        }
+        if !self.only.is_empty() && !self.only.contains(&file.library_id) {
+            debug!(
+                "{} stays: not in the libraries given",
+                printable(&file.path)
+            );
+            return Ok(());
+        }
+        let (Some(root), Some(folder)) = (
+            self.roots.get(&file.library_id),
+            self.folder_of.get(&file.library_id),
+        ) else {
+            return Ok(());
+        };
+        let source = library_path(root, &file.path);
+        // One file under two names (a hard link, or one folder cataloged under two spellings)
+        // is no copy: moving it would leave nothing behind.
+        if is_same_file(&source, &keeper.path).unwrap_or(false) {
+            self.notes.warnings.push(format!(
+                "{} stays: it is the same file as the kept copy {}",
+                source.display(),
+                keeper.path.display()
+            ));
+            return Ok(());
+        }
+        let mut folders: Vec<String> = std::iter::once(folder.clone())
+            .chain(file.path.split('/').map(String::from))
+            .collect();
+        let name = folders.pop().unwrap_or_default();
+        let target = match self.claims.folder(self.dir, &folders) {
+            Ok(folder) => folder.join(name),
+            Err(link) => {
                 debug!(
-                    "{} stays: only similar to the kept file",
-                    printable(&file.path)
+                    "{} stays: {} is a symbolic link",
+                    shown(&source),
+                    shown(&link)
                 );
-                continue;
+                self.links.note(link);
+                return Ok(());
             }
-            if !only.is_empty() && !only.contains(&file.library_id) {
-                debug!(
-                    "{} stays: not in the libraries given",
-                    printable(&file.path)
-                );
-                continue;
-            }
-            let (Some(root), Some(folder)) =
-                (roots.get(&file.library_id), folder_of.get(&file.library_id))
-            else {
-                continue;
-            };
-            let source = library_path(Path::new(root), &file.path);
-            // One file under two names (a hard link, or one folder cataloged under two
-            // spellings) is no copy: moving it would leave nothing behind.
-            if is_same_file(&source, &keeper.path).unwrap_or(false) {
-                notes.warnings.push(format!(
-                    "{} stays: it is the same file as the kept copy {}",
-                    source.display(),
-                    keeper.path
-                ));
-                continue;
-            }
-            let mut segments: Vec<String> = std::iter::once(folder.clone())
-                .chain(file.path.split('/').map(String::from))
-                .collect();
-            let name = segments.pop().unwrap_or_default();
-            let target = match taken.folder(dir, &segments) {
-                Ok(folder) => folder.join(name),
-                Err(link) => {
-                    debug!(
-                        "{} stays: {} is a symbolic link",
-                        shown(&source),
-                        shown(&link)
-                    );
-                    links.note(link);
-                    continue;
-                }
-            };
-            let Some(assigned) = taken.claim_free(&target, &source, "_{n}") else {
-                notes.warnings.push(format!(
-                    "{} stays: the folder {} cannot be read",
-                    source.display(),
-                    target.parent().unwrap_or(&target).display()
-                ));
-                continue;
-            };
-            if assigned != target {
-                notes
-                    .collisions
-                    .push((target.display().to_string(), assigned.display().to_string()));
-            }
-            if !involved.contains(&file.library_id) {
-                involved.push(file.library_id);
-            }
-            moves.push(Move {
-                from: utf8(&source, "File")?,
-                to: utf8(&assigned, "Target")?,
-                size: file.size,
-                mtime_ns: file.mtime_ns,
-                cataloged: Some((file.library_id, file.path.clone())),
-                cataloged_to: None,
-                sidecar_of: None,
-                keeper: Some(keeper.clone()),
+        };
+        let Some(assigned) = self.claims.claim_free(&target, &source, "_{n}") else {
+            self.notes.warnings.push(format!(
+                "{} stays: the folder {} cannot be read",
+                source.display(),
+                target.parent().unwrap_or(&target).display()
+            ));
+            return Ok(());
+        };
+        if assigned != target {
+            self.notes.collisions.push(Collision {
+                wanted: target,
+                got: assigned.clone(),
             });
         }
+        if !self.involved.contains(&file.library_id) {
+            self.involved.push(file.library_id);
+        }
+        self.moves.push(Move {
+            from: utf8(&source, "File")?,
+            to: utf8(&assigned, "Target")?,
+            stamp: Stamp {
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+            },
+            kind: MoveKind::Quarantine {
+                row: FileRef {
+                    library_id: file.library_id,
+                    path: file.path.clone(),
+                },
+                keeper: keeper.clone(),
+            },
+        });
+        Ok(())
     }
-    add_sidecars(&mut moves, &mut taken, &mut notes);
+}
+
+/// Plan moving every copy that has the same bytes or pixels as its group's keeper to `dir`, as
+/// `dir/<library name>/<path in the library>`. With `only` libraries, only copies in them move.
+/// Similar files are left alone: similar images are mostly burst shots, not copies, and a
+/// re-encoded video may be the better copy. Exact copies in a similar group still move. Each
+/// move requires its group's kept copy to still be there, unchanged, when the plan is applied.
+pub fn plan_quarantine(
+    catalog: &Catalog,
+    catalog_path: &Path,
+    report: &DupeReport,
+    only: &[i64],
+    dir: &Path,
+    now: OffsetDateTime,
+) -> Result<(Plan, PlanNotes), Error> {
+    let mut libraries = catalog.libraries()?;
+    libraries.sort_by(|a, b| a.root.cmp(&b.root));
+    let mut quarantine = Quarantine {
+        dir,
+        only,
+        roots: libraries
+            .iter()
+            .map(|l| (l.id, Path::new(l.root.as_str())))
+            .collect(),
+        folder_of: quarantine_folders(&libraries),
+        claims: Claims::default(),
+        links: Links::default(),
+        notes: PlanNotes::default(),
+        moves: vec![],
+        involved: vec![],
+    };
+    for group in &report.groups {
+        quarantine.group(group)?;
+    }
+    let Quarantine {
+        mut claims,
+        links,
+        mut notes,
+        mut moves,
+        involved,
+        ..
+    } = quarantine;
+    add_sidecars(&mut moves, &mut claims, &mut notes);
     links.warn(&mut notes);
     let plan = Plan {
         version: PLAN_VERSION,
         kind: PlanKind::Quarantine,
         created: timestamp(now),
         catalog: utf8(catalog_path, "Catalog")?,
-        description: utf8(dir, "Quarantine folder")?,
         destination: utf8(dir, "Quarantine folder")?,
         libraries: libraries
             .iter()
             .filter(|l| involved.contains(&l.id))
             .map(|l| PlanLibrary {
                 id: l.id,
-                root: l.root.clone(),
+                root: PathBuf::from(&l.root),
             })
             .collect(),
-        prune_empty: false,
         moves,
     };
     Ok((plan, notes))
@@ -951,17 +1119,14 @@ pub fn state_dir(catalog_path: &Path, what: &str) -> PathBuf {
 
 /// Write the plan to `<catalog folder>/plans/<kind>-<time>.json` and return the path.
 pub fn write_plan(plan: &Plan, now: OffsetDateTime) -> Result<PathBuf, Error> {
-    let dir = state_dir(Path::new(&plan.catalog), "plans");
+    let dir = state_dir(&plan.catalog, "plans");
     fs::create_dir_all(&dir)?;
     let stamp = now
         .format(format_description!(
             "[year][month][day]T[hour][minute][second]Z"
         ))
         .unwrap_or_default();
-    let kind = match plan.kind {
-        PlanKind::Organize => "organize",
-        PlanKind::Quarantine => "quarantine",
-    };
+    let kind = plan.kind.as_str();
     let mut path = dir.join(format!("{kind}-{stamp}.json"));
     let mut n = 2;
     while path.exists() {
@@ -974,20 +1139,22 @@ pub fn write_plan(plan: &Plan, now: OffsetDateTime) -> Result<PathBuf, Error> {
     Ok(path)
 }
 
-/// Read a plan file.
+/// Read a plan file of this version, and check it.
 pub fn read_plan(path: &Path) -> Result<Plan, Error> {
     let text = fs::read_to_string(path).at(path)?;
-    let plan: Plan = serde_json::from_str(&text).map_err(|source| PlanError::NotAPlan {
+    let not_a_plan = |source| PlanError::NotAPlan {
         path: path.to_path_buf(),
         source,
-    })?;
-    if plan.version != PLAN_VERSION {
+    };
+    let Versioned { version } = serde_json::from_str(&text).map_err(not_a_plan)?;
+    if version != PLAN_VERSION {
         return Err(PlanError::Version {
             path: path.to_path_buf(),
-            found: plan.version,
+            found: version,
         }
         .into());
     }
+    let plan: Plan = serde_json::from_str(&text).map_err(not_a_plan)?;
     plan.check()?;
     Ok(plan)
 }
@@ -999,10 +1166,14 @@ pub fn write_summary(
     path: &Path,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    let sidecars = plan.moves.iter().filter(|m| m.sidecar_of.is_some()).count();
+    let sidecars = plan
+        .moves
+        .iter()
+        .filter(|m| matches!(m.kind, MoveKind::Sidecar { .. }))
+        .count();
     // Names from the library, and warnings that quote them.
     for m in plan.moves.iter().take(SUMMARY_MOVES) {
-        writeln!(out, "{}\n  -> {}", printable(&m.from), printable(&m.to))?;
+        writeln!(out, "{}\n  -> {}", shown(&m.from), shown(&m.to))?;
     }
     if plan.moves.len() > SUMMARY_MOVES {
         writeln!(
@@ -1011,12 +1182,12 @@ pub fn write_summary(
             plan.moves.len() - SUMMARY_MOVES
         )?;
     }
-    for (wanted, got) in &notes.collisions {
+    for Collision { wanted, got } in &notes.collisions {
         writeln!(
             out,
             "Warning: {} is taken, using {}",
-            printable(wanted),
-            printable(got)
+            shown(wanted),
+            shown(got)
         )?;
     }
     for warning in &notes.warnings {
@@ -1031,20 +1202,20 @@ pub fn write_summary(
         notes.unchanged,
         notes.collisions.len(),
         plural(notes.collisions.len(), "collision", "collisions"),
-        if plan.kind == PlanKind::Organize {
+        if matches!(plan.kind, PlanKind::Organize { .. }) {
             format!(", {} undated", notes.undated)
         } else {
             String::new()
         }
     )?;
-    writeln!(out, "Plan: {}", path.display())?;
+    writeln!(out, "Plan: {}", shown(path))?;
     if plan.moves.is_empty() {
         writeln!(out, "Nothing to do.")
     } else {
         writeln!(
             out,
             "Nothing has been moved. To carry out the plan, run:\n  pixrs apply \"{}\"",
-            path.display()
+            shown(path)
         )
     }
 }
@@ -1053,7 +1224,7 @@ pub fn write_summary(
 mod tests {
     use super::*;
 
-    use crate::catalog::{FileRecord, MediaMeta, Stamp};
+    use crate::catalog::{MediaMeta, Stamp};
     use crate::media::MediaType;
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
@@ -1125,7 +1296,7 @@ mod tests {
 
     /// Moves as `from -> to`, relative to the library root.
     fn moves(f: &Fixture, plan: &Plan) -> Vec<String> {
-        let rel = |p: &str| relative_to(&f.root, Path::new(p)).unwrap();
+        let rel = |p: &Path| relative_to(&f.root, p).unwrap();
         plan.moves
             .iter()
             .map(|m| format!("{} -> {}", rel(&m.from), rel(&m.to)))
@@ -1230,7 +1401,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            plan.moves.iter().filter(|m| m.sidecar_of.is_some()).count(),
+            plan.moves
+                .iter()
+                .filter(|m| matches!(m.kind, MoveKind::Sidecar { .. }))
+                .count(),
             2
         );
     }
@@ -1253,10 +1427,11 @@ mod tests {
     fn test_summary_escapes_control_characters_in_names() {
         let f = fixture(&[("a.jpg", None)]);
         let (mut plan, mut notes) = organize(&f, "image/{name}.{ext}", false);
-        plan.moves[0].from = String::from("/lib/a\u{1b}[2J.jpg");
-        notes
-            .collisions
-            .push((String::from("x\u{7}.jpg"), String::from("x\u{7}_2.jpg")));
+        plan.moves[0].from = PathBuf::from("/lib/a\u{1b}[2J.jpg");
+        notes.collisions.push(Collision {
+            wanted: PathBuf::from("x\u{7}.jpg"),
+            got: PathBuf::from("x\u{7}_2.jpg"),
+        });
         notes.warnings.push(String::from("b.jpg\rDone. stays"));
         let mut out = vec![];
         write_summary(&plan, &notes, Path::new("plan.json"), &mut out).unwrap();
@@ -1294,37 +1469,71 @@ mod tests {
         assert!(outside_libraries(&f.catalog, &parent.join("q"), "Quarantine").is_ok());
     }
 
-    #[test]
-    fn test_plans_are_checked() {
-        type Fault<'a> = Box<dyn Fn(&mut Plan) + 'a>;
+    /// A plan of a media move (`a/1.jpg`) and its sidecar move, which passes the checks.
+    fn checked_plan() -> (Fixture, Plan) {
         let f = fixture(&[("a/1.jpg", None)]);
         fs::write(f.root.join("a/1.xmp"), b"edits").unwrap();
         let (plan, _) = organize(&f, "{name}.{ext}", false);
         assert_eq!(plan.moves.len(), 2);
-        assert_eq!(plan.moves[1].sidecar_of, Some(0));
+        assert_eq!(plan.moves[1].kind, MoveKind::Sidecar { of: 0 });
         plan.check().unwrap();
-        let outside = f.root.parent().unwrap().join("elsewhere.jpg");
-        let outside = outside.to_str().unwrap();
+        (f, plan)
+    }
+
+    /// A quarantine move of `a/1.jpg`, whose kept copy is at `keeper`.
+    fn quarantine_move(f: &Fixture, keeper: &Path) -> MoveKind {
+        MoveKind::Quarantine {
+            row: FileRef {
+                library_id: f.id,
+                path: String::from("a/1.jpg"),
+            },
+            keeper: Keeper {
+                path: keeper.to_path_buf(),
+                stamp: Stamp {
+                    size: 1,
+                    mtime_ns: 0,
+                },
+            },
+        }
+    }
+
+    /// `p` as a quarantine plan into a folder next to the library, with the media move's kind.
+    fn as_quarantine(p: &mut Plan, kind: MoveKind) {
+        let q = p.libraries[0].root.parent().unwrap().join("q");
+        p.kind = PlanKind::Quarantine;
+        for m in &mut p.moves {
+            m.to = q.join(m.to.file_name().unwrap());
+        }
+        p.destination = q;
+        p.moves[0].kind = kind;
+    }
+
+    #[test]
+    fn test_plans_are_checked() {
+        type Fault<'a> = Box<dyn Fn(&mut Plan) + 'a>;
+        let (f, plan) = checked_plan();
+        let parent = f.root.parent().unwrap().to_path_buf();
+        let outside = parent.join("elsewhere.jpg");
         let faults: Vec<(&str, Fault)> = vec![
             (
                 "sidecar of a later move",
-                Box::new(|p| p.moves[1].sidecar_of = Some(5)),
+                Box::new(|p| p.moves[1].kind = MoveKind::Sidecar { of: 5 }),
             ),
             (
                 "sidecar of itself",
-                Box::new(|p| p.moves[1].sidecar_of = Some(1)),
+                Box::new(|p| p.moves[1].kind = MoveKind::Sidecar { of: 1 }),
             ),
             (
                 "sidecar of a sidecar",
-                Box::new(|p| p.moves[0].sidecar_of = Some(1)),
+                Box::new(|p| p.moves[0].kind = MoveKind::Sidecar { of: 1 }),
             ),
             (
                 "source outside",
-                Box::new(|p| p.moves[0].from = String::from(outside)),
+                Box::new(|p| p.moves[0].from.clone_from(&outside)),
             ),
             (
                 "target outside",
-                Box::new(|p| p.moves[0].to = String::from(outside)),
+                Box::new(|p| p.moves[0].to.clone_from(&outside)),
             ),
             (
                 "target is the destination",
@@ -1332,21 +1541,27 @@ mod tests {
             ),
             (
                 "unknown library",
-                Box::new(|p| p.moves[0].cataloged = Some((99, String::from("1.jpg")))),
+                Box::new(|p| {
+                    p.moves[0].kind = MoveKind::Organize {
+                        row: FileRef {
+                            library_id: 99,
+                            path: String::from("1.jpg"),
+                        },
+                        new_path: None,
+                    };
+                }),
             ),
             (
-                "unknown library at the target",
-                Box::new(|p| p.moves[0].cataloged_to = Some((99, String::from("1.jpg")))),
+                "quarantine move in an organize plan",
+                Box::new(|p| p.moves[0].kind = quarantine_move(&f, &f.root.join("b.jpg"))),
+            ),
+            (
+                "organize move in a quarantine plan",
+                Box::new(|p| as_quarantine(p, p.moves[0].kind.clone())),
             ),
             (
                 "kept copy outside",
-                Box::new(|p| {
-                    p.moves[0].keeper = Some(Keeper {
-                        path: String::from(outside),
-                        size: 1,
-                        mtime_ns: 0,
-                    });
-                }),
+                Box::new(|p| as_quarantine(p, quarantine_move(&f, &outside))),
             ),
             (
                 "quarantine folder is the library",
@@ -1359,9 +1574,9 @@ mod tests {
                 "quarantine folder contains the library",
                 Box::new(|p| {
                     p.kind = PlanKind::Quarantine;
-                    p.destination = String::from(f.root.parent().unwrap().to_str().unwrap());
+                    p.destination.clone_from(&parent);
                     for m in &mut p.moves {
-                        m.to = m.to.replace("lib", "lib_2");
+                        m.to = PathBuf::from(m.to.to_str().unwrap().replace("lib", "lib_2"));
                     }
                 }),
             ),
@@ -1378,23 +1593,39 @@ mod tests {
                 "{what}: {err}"
             );
         }
-        // Moving the files into a folder outside the library, or another library's copies into
-        // quarantine, is fine.
-        let mut moved_out = plan.clone();
-        moved_out.destination = String::from(f.root.parent().unwrap().to_str().unwrap());
+    }
+
+    #[test]
+    fn test_plans_that_pass_the_checks() {
+        let (f, plan) = checked_plan();
+        // A quarantine move into a folder outside the library.
+        let mut quarantine = plan.clone();
+        as_quarantine(&mut quarantine, quarantine_move(&f, &f.root.join("b.jpg")));
+        quarantine.check().unwrap();
+        // Moving the files into a folder outside the library.
+        let mut moved_out = plan;
+        moved_out.destination = f.root.parent().unwrap().to_path_buf();
         for m in &mut moved_out.moves {
-            m.to = m.to.replace("lib", "sorted");
+            m.to = PathBuf::from(m.to.to_str().unwrap().replace("lib", "sorted"));
         }
         moved_out.check().unwrap();
+    }
 
-        // A plan from before the target folder was recorded is refused by its version.
+    #[test]
+    fn test_plans_of_another_version_are_refused() {
+        let (_f, plan) = checked_plan();
+        // Refused by its version, whatever else it holds.
         let path = write_plan(&plan, datetime!(2026-10-20 12:00 UTC)).unwrap();
         let old = fs::read_to_string(&path)
             .unwrap()
-            .replace("\"version\": 2", "\"version\": 1");
+            .replace(&format!("\"version\": {PLAN_VERSION}"), "\"version\": 2");
         fs::write(&path, old).unwrap();
         let err = read_plan(&path).unwrap_err();
+        assert!(err.to_string().contains("plan version 2"), "{}", err);
+        fs::write(&path, r#"{"version": 1, "description": "old"}"#).unwrap();
+        let err = read_plan(&path).unwrap_err();
         assert!(err.to_string().contains("plan version 1"), "{}", err);
+        assert_eq!(err.exit_code(), exitcode::DATAERR);
     }
 
     #[cfg(unix)]

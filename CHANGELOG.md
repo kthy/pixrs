@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that cannot be listed), 75 while another `apply`, `undo` or `relocate` holds the lock, and 70
   for a catalog database error.
 - Ctrl-C exits with 130, as shells report an interrupted program, instead of 0.
+- New plan and journal format (version 3). Plans made and journals written by earlier versions
+  are refused with a message: plan again, and undo an earlier `apply` with the version that
+  carried it out. `apply` also refuses a plan whose moves are not of the plan's kind, such as a
+  quarantine move without its kept copy.
 - Errors about a library that has not been scanned, or is part of another library, start with
   the command that failed (`Dupes failed: ...`), like every other error. An I/O error on a plan
   or journal file names the file.
