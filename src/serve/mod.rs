@@ -56,14 +56,21 @@ pub(crate) struct AppState {
     catalog: Mutex<Catalog>,
     libraries: Vec<LibraryId>,
     thumbs: Thumbnailer,
-    /// `ffprobe`, if it is on `PATH`.
-    ffprobe: Option<PathBuf>,
     /// The `Host` header values the viewer answers to.
     hosts: Vec<String>,
     pub(crate) similarity: Similarity,
     /// The last duplicate report, so paging through it does not compare every pair of images
     /// again. An async lock, held while a report is made, so concurrent requests share it.
     dupes: tokio::sync::Mutex<Option<CachedDupes>>,
+}
+
+/// Which duplicate report a page shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Report {
+    /// One that reflects the catalog, made again if it changed (the first page).
+    Recent,
+    /// The one shown so far, so paging through it cannot skip or repeat groups.
+    Shown,
 }
 
 /// How often the duplicate report is made again at most while the catalog keeps changing.
@@ -167,10 +174,13 @@ impl AppState {
         clippy::significant_drop_tightening,
         reason = "the lock is held while the report is made, so one is made at a time"
     )]
-    pub(crate) async fn dupes(self: &Arc<Self>, fresh: bool) -> Result<Arc<DupeReport>, AppError> {
+    pub(crate) async fn dupes(
+        self: &Arc<Self>,
+        wanted: Report,
+    ) -> Result<Arc<DupeReport>, AppError> {
         let mut cached = self.dupes.lock().await;
         if let Some(c) = cached.as_ref() {
-            if !fresh || c.made.elapsed() < DUPES_REFRESH {
+            if wanted == Report::Shown || c.made.elapsed() < DUPES_REFRESH {
                 return Ok(Arc::clone(&c.report));
             }
         }
@@ -259,8 +269,7 @@ impl AppState {
         Self {
             catalog: Mutex::new(config.catalog),
             libraries: config.libraries,
-            thumbs: Thumbnailer::new(config.cache_dir, ffmpeg),
-            ffprobe,
+            thumbs: Thumbnailer::new(config.cache_dir, ffmpeg, ffprobe),
             hosts: allowed_hosts(port),
             similarity: config.similarity,
             dupes: tokio::sync::Mutex::new(None),

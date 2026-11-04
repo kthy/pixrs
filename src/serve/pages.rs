@@ -6,9 +6,9 @@
  *************************************************************************************************/
 
 use super::thumbs::{self, ViewSource};
-use super::{AppError, AppState, Located};
+use super::{AppError, AppState, Located, Report};
 use crate::catalog::{FileRecord, Filter, HashedFile, Neighbors, Page, Tally};
-use crate::dupes::{human_mtime, plural, DupeGroup, Role, Tier};
+use crate::dupes::{human_mtime, oldest_first, plural, DupeGroup, Role, Tier};
 use crate::library::{LibraryId, Root};
 use crate::media::MediaType;
 use axum::extract::{Path as UrlPath, Query, State};
@@ -239,10 +239,15 @@ fn more(next: Option<String>) -> Markup {
 /// Answer either the whole page or, for HTMX, only the items and the next-page link.
 fn respond(query: &ListQuery, items: Markup, page: impl FnOnce(Markup) -> Markup) -> Response {
     if query.partial {
-        Html(items.into_string()).into_response()
+        html_response(items)
     } else {
-        Html(page(items).into_string()).into_response()
+        html_response(page(items))
     }
+}
+
+/// `markup` as an HTML response.
+fn html_response(markup: Markup) -> Response {
+    Html(markup.into_string()).into_response()
 }
 
 /// The offset and one extra row, to find out whether there is a next page. `page` is at most
@@ -259,9 +264,7 @@ pub async fn libraries(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
-    let libraries = state
-        .query(super::super::catalog::Catalog::libraries)
-        .await?;
+    let libraries = state.query(crate::catalog::Catalog::libraries).await?;
     let media_type = query.media_type;
     let content = html! {
         h1 { "Libraries" }
@@ -283,7 +286,12 @@ pub async fn libraries(
             }
         }
     };
-    Ok(Html(layout("Libraries", Some("/"), media_type, &content).into_string()).into_response())
+    Ok(html_response(layout(
+        "Libraries",
+        Some("/"),
+        media_type,
+        &content,
+    )))
 }
 
 /// `/folders/{lib}`: the root folder of a library.
@@ -305,6 +313,14 @@ pub async fn folder(
     folder_page(state, library_id, dir, query).await
 }
 
+/// What a folder page shows, from the catalog.
+struct Folder {
+    /// The library's root, if it is in the catalog.
+    root: Option<Root>,
+    subfolders: Vec<Tally>,
+    files: Vec<FileRecord>,
+}
+
 async fn folder_page(
     state: Arc<AppState>,
     library_id: LibraryId,
@@ -317,7 +333,11 @@ async fn folder_page(
     let media_type = query.media_type;
     let page = query.page();
     let queried_dir = dir.clone();
-    let (root, subfolders, mut files) = state
+    let Folder {
+        root,
+        subfolders,
+        mut files,
+    } = state
         .query(move |catalog| {
             let root = catalog.library_root(library_id)?;
             let subfolders = if page == 1 {
@@ -327,7 +347,11 @@ async fn folder_page(
             };
             let slice = page_slice(page, PAGE_SIZE);
             let files = catalog.folder_files(library_id, &queried_dir, media_type, slice)?;
-            Ok((root, subfolders, files))
+            Ok(Folder {
+                root,
+                subfolders,
+                files,
+            })
         })
         .await?;
     let root = root.ok_or(AppError::NotFound)?;
@@ -428,10 +452,12 @@ pub async fn dates_latest(
         Ok(Redirect::to(&url).into_response())
     } else {
         let content = html! { h1 { "Dates" } p { "No files." } };
-        Ok(
-            Html(layout("Dates", Some("/dates"), media_type, &content).into_string())
-                .into_response(),
-        )
+        Ok(html_response(layout(
+            "Dates",
+            Some("/dates"),
+            media_type,
+            &content,
+        )))
     }
 }
 
@@ -633,7 +659,13 @@ pub async fn dupes(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
     let page = query.page();
-    let report = state.dupes(page == 1).await?;
+    let report = state
+        .dupes(if page == 1 {
+            Report::Recent
+        } else {
+            Report::Shown
+        })
+        .await?;
     let start = (page - 1) * DUPE_PAGE_SIZE;
     let groups = report.groups.get(start..).unwrap_or_default();
     let next = (groups.len() > DUPE_PAGE_SIZE)
@@ -680,12 +712,35 @@ pub async fn dupes(
     }))
 }
 
+/// A file's date as the viewer shows it, as `YYYY-MM-DDTHH:MM:SS`.
+enum ShownDate {
+    /// When it was taken; `dubious` if before 1980 or in the future.
+    Taken { at: String, dubious: bool },
+    /// Its modification time, as it has no date taken.
+    Modified(String),
+}
+
+impl ShownDate {
+    /// The date of `file`, from `date`, which is when it was taken or else modified.
+    fn of(file: &FileRecord, date: String) -> Self {
+        if file.meta.taken_at.is_some() {
+            let dubious = file
+                .meta
+                .taken()
+                .is_some_and(|taken| !taken.is_plausible(OffsetDateTime::now_utc()));
+            Self::Taken { at: date, dubious }
+        } else {
+            Self::Modified(date)
+        }
+    }
+}
+
 /// What the viewer shows around a file.
 struct Surroundings {
     /// The files before and after it in the listing it was opened from.
     neighbors: Neighbors,
-    /// When it was taken, or its mtime, as `YYYY-MM-DDTHH:MM:SS`.
-    date: Option<String>,
+    /// When it was taken, or else modified.
+    date: Option<ShownDate>,
     /// Every file with its contents, itself included, oldest first.
     copies: Vec<HashedFile>,
 }
@@ -703,7 +758,7 @@ impl Surroundings {
         };
         let path = file.path.clone();
         let (size, sha256) = (file.stamp.size, file.sha256.clone());
-        let mut found = state
+        let (neighbors, date, mut copies) = state
             .query(move |catalog| {
                 let neighbors = match context.listing {
                     Listing::Date => catalog.date_neighbors(&filter, library_id, &path)?,
@@ -715,17 +770,15 @@ impl Surroundings {
                     Some(sha256) => catalog.copies(size, &sha256)?,
                     None => vec![],
                 };
-                Ok(Self {
-                    neighbors,
-                    date: catalog.date(library_id, &path)?,
-                    copies,
-                })
+                Ok((neighbors, catalog.date(library_id, &path)?, copies))
             })
             .await?;
-        found.copies.sort_by(|a, b| {
-            (a.stamp.mtime_ns, &a.root, &a.path).cmp(&(b.stamp.mtime_ns, &b.root, &b.path))
-        });
-        Ok(found)
+        copies.sort_by(oldest_first);
+        Ok(Self {
+            neighbors,
+            date: date.map(|date| ShownDate::of(file, date)),
+            copies,
+        })
     }
 }
 
@@ -745,19 +798,24 @@ pub async fn view(
         media_type: query.media_type,
     };
     let around = Surroundings::of(&state, library_id, &file, context).await?;
-    let codec = match (&state.ffprobe, file.media_type) {
-        (Some(ffprobe), MediaType::Video) => state.thumbs.video_codec(ffprobe, &full_path).await,
-        _ => None,
+    let codec = match file.media_type {
+        MediaType::Video => state.thumbs.video_codec(&full_path).await,
+        MediaType::Image | MediaType::Audio => None,
     };
     let codec = codec.as_deref();
     let content = html! {
         (pager(&file.path, &around.neighbors, context))
         (stage(library_id, &file, codec))
-        (details(&file, &root, around.date.as_deref(), codec))
+        (details(&file, &root, around.date.as_ref(), codec))
         (copies_list(library_id, &file.path, &around.copies, context))
         p { a href=(file_url("media", library_id, &file.path)) { "Open original" } }
     };
-    Ok(Html(layout(file_name(&file.path), None, None, &content).into_string()).into_response())
+    Ok(html_response(layout(
+        file_name(&file.path),
+        None,
+        None,
+        &content,
+    )))
 }
 
 /// The links to the previous and next file, around the file's path.
@@ -815,21 +873,29 @@ fn image_source(library_id: LibraryId, file: &FileRecord) -> String {
 }
 
 /// What the catalog knows about the file in the library at `root`.
-fn details(file: &FileRecord, root: &Root, date: Option<&str>, codec: Option<&str>) -> Markup {
-    let dubious_date = file
-        .meta
-        .taken()
-        .is_some_and(|taken| !taken.is_plausible(OffsetDateTime::now_utc()));
+fn details(
+    file: &FileRecord,
+    root: &Root,
+    date: Option<&ShownDate>,
+    codec: Option<&str>,
+) -> Markup {
     html! {
         dl.details {
-            @if let Some(date) = date {
-                dt { @if file.meta.taken_at.is_some() { "Taken" } @else { "Modified" } }
-                dd {
-                    (date.replacen('T', " ", 1))
-                    @if dubious_date {
-                        " " abbr.dubious title=(DUBIOUS_DATE) { "?" }
+            @match date {
+                Some(ShownDate::Taken { at, dubious }) => {
+                    dt { "Taken" }
+                    dd {
+                        (at.replacen('T', " ", 1))
+                        @if *dubious {
+                            " " abbr.dubious title=(DUBIOUS_DATE) { "?" }
+                        }
                     }
                 }
+                Some(ShownDate::Modified(at)) => {
+                    dt { "Modified" }
+                    dd { (at.replacen('T', " ", 1)) }
+                }
+                None => {}
             }
             @if let Some(camera) = file.meta.camera() { dt { "Camera" } dd { (camera) } }
             @if let (Some(w), Some(h)) = (file.meta.width, file.meta.height) {
