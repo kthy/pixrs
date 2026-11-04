@@ -469,7 +469,8 @@ pub(crate) mod tests {
     /// frames all differ, with `extra` arguments to `ffmpeg` before the output.
     pub fn zoom(path: &Path, from: u32, seconds: u32, extra: &[&str]) -> Option<()> {
         let source = format!(
-            "mandelbrot=size=640x360:rate=25,trim=start={from}:duration={seconds},setpts=PTS-STARTPTS"
+            "mandelbrot=size=640x360:rate=25,trim=start={from}:duration={seconds},\
+             setpts=PTS-STARTPTS"
         );
         let mut args = vec!["-f", "lavfi", "-i", &source];
         args.extend(extra);

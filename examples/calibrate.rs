@@ -68,27 +68,158 @@ struct Opt {
 }
 
 /// Transformations that should still count as the same picture.
-const VARIANTS: &[&str] = &[
-    "half size",
-    "1024 px",
-    "JPEG q85",
-    "JPEG q60",
-    "half + q60",
-    "640 px + q50",
-];
+#[derive(Clone, Copy, Debug)]
+enum Variant {
+    Half,
+    Fit1024,
+    Jpeg85,
+    Jpeg60,
+    HalfJpeg60,
+    Fit640Jpeg50,
+}
+
+impl Variant {
+    const ALL: [Self; 6] = [
+        Self::Half,
+        Self::Fit1024,
+        Self::Jpeg85,
+        Self::Jpeg60,
+        Self::HalfJpeg60,
+        Self::Fit640Jpeg50,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Half => "half size",
+            Self::Fit1024 => "1024 px",
+            Self::Jpeg85 => "JPEG q85",
+            Self::Jpeg60 => "JPEG q60",
+            Self::HalfJpeg60 => "half + q60",
+            Self::Fit640Jpeg50 => "640 px + q50",
+        }
+    }
+
+    fn apply(self, img: &DynamicImage) -> DynamicImage {
+        let half = |img: &DynamicImage| {
+            img.resize_exact(
+                (img.width() / 2).max(1),
+                (img.height() / 2).max(1),
+                FilterType::Triangle,
+            )
+        };
+        match self {
+            Self::Half => half(img),
+            Self::Fit1024 => fit(img, 1024),
+            Self::Jpeg85 => recompress(img, 85),
+            Self::Jpeg60 => recompress(img, 60),
+            Self::HalfJpeg60 => recompress(&half(img), 60),
+            Self::Fit640Jpeg50 => recompress(&fit(img, 640), 50),
+        }
+    }
+}
 
 /// Ways of summing up fingerprint differences into one number.
-const METRICS: &[&str] = &["mean", "p90", "p95", "p99", "max"];
+#[derive(Clone, Copy, Debug)]
+enum Metric {
+    Mean,
+    P90,
+    P95,
+    P99,
+    Max,
+}
+
+impl Metric {
+    const ALL: [Self; 5] = [Self::Mean, Self::P90, Self::P95, Self::P99, Self::Max];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Mean => "mean",
+            Self::P90 => "p90",
+            Self::P95 => "p95",
+            Self::P99 => "p99",
+            Self::Max => "max",
+        }
+    }
+}
 
 /// The metric the review page spreads its pairs over.
-const REVIEW_METRIC: usize = 3;
+const REVIEW_METRIC: Metric = Metric::P99;
+
+/// The fingerprint differences of two images, summed up in each way.
+#[derive(Clone, Copy, Debug)]
+struct Metrics {
+    mean: f64,
+    p90: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+}
+
+impl Metrics {
+    /// For images that cannot be compared: as far apart as fingerprints can be.
+    const APART: Self = Self {
+        mean: 255.0,
+        p90: 255.0,
+        p95: 255.0,
+        p99: 255.0,
+        max: 255.0,
+    };
+
+    /// Mean, 90th, 95th and 99th percentile, and largest of sorted differences.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "statistics over counts far below 2^52"
+    )]
+    fn of(diffs: &[u8]) -> Self {
+        let Some(&largest) = diffs.last() else {
+            return Self::APART;
+        };
+        let at = |p: usize| f64::from(diffs[(diffs.len() * p / 100).min(diffs.len() - 1)]);
+        Self {
+            mean: diffs.iter().map(|&d| f64::from(d)).sum::<f64>() / diffs.len() as f64,
+            p90: at(90),
+            p95: at(95),
+            p99: at(99),
+            max: f64::from(largest),
+        }
+    }
+
+    /// Of the fingerprints of two images.
+    fn between(a: &[u8], b: &[u8]) -> Self {
+        Self::of(&fingerprint_differences(a, b))
+    }
+
+    const fn get(self, metric: Metric) -> f64 {
+        match metric {
+            Metric::Mean => self.mean,
+            Metric::P90 => self.p90,
+            Metric::P95 => self.p95,
+            Metric::P99 => self.p99,
+            Metric::Max => self.max,
+        }
+    }
+}
 
 /// A candidate pair and how it differs.
 struct Candidate {
     a: usize,
     b: usize,
     hash_distance: u32,
-    metrics: [f64; 5],
+    metrics: Metrics,
+}
+
+/// How far a variant of an image is from the image.
+#[derive(Clone, Copy)]
+struct Measured {
+    hash_distance: u32,
+    metrics: Metrics,
+}
+
+/// The measurements of one variant over the sample.
+#[derive(Clone)]
+struct VariantResults {
+    variant: Variant,
+    measured: Vec<Measured>,
 }
 
 /// One answer from the review page.
@@ -129,21 +260,23 @@ fn main() {
 
     let candidates = find_candidates(&images, opt.candidates);
     println!(
-        "{} candidate pairs: different pixels, perceptual hashes at most {} bits apart, same shape",
+        "{} candidate pairs: different pixels, perceptual hashes at most {} bits apart, \
+         same shape",
         candidates.len(),
         opt.candidates
     );
-    let variants = sample_variants(&opt, &images, &roots, ffmpeg.as_deref());
+    let variants = sample_variants(&opt, &images, ffmpeg.as_deref());
 
     print_variants(&variants);
     print_spread("Library candidates", candidates.iter().map(|c| c.metrics));
     if let Some(path) = &opt.labels {
-        print_labels(path, &images, &candidates, &variants);
+        let labels = read_labels(path);
+        print_labels(&labels, &images, &candidates, &variants);
         if !opt.sizes.is_empty() {
-            compare_sizes(&opt, path, &images, &roots, ffmpeg.as_deref());
+            compare_sizes(&opt, &labels, &images, ffmpeg.as_deref());
         }
     }
-    write_review(&opt, &images, &roots, ffmpeg.as_deref(), &candidates);
+    write_review(&opt, &images, ffmpeg.as_deref(), &candidates);
 }
 
 /// Exit with a message.
@@ -162,6 +295,12 @@ fn check_outside(out: &Path, roots: &[String]) {
     }
 }
 
+/// The answers saved from the review page.
+fn read_labels(path: &Path) -> Vec<Label> {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| die(&e.to_string()));
+    serde_json::from_str(&text).unwrap_or_else(|e| die(&e.to_string()))
+}
+
 /// A stable ID for an image, used in file names and the review answers.
 fn image_id(image: &HashedImage) -> String {
     let f = &image.file;
@@ -170,31 +309,10 @@ fn image_id(image: &HashedImage) -> String {
     data_encoding::HEXLOWER.encode(&digest.as_ref()[..12])
 }
 
-/// Mean, 90th, 95th and 99th percentile, and largest of sorted differences.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "statistics over counts far below 2^52"
-)]
-fn metrics(diffs: &[u8]) -> [f64; 5] {
-    if diffs.is_empty() {
-        return [255.0; 5];
-    }
-    let at = |p: usize| f64::from(diffs[(diffs.len() * p / 100).min(diffs.len() - 1)]);
-    let mean = diffs.iter().map(|&d| f64::from(d)).sum::<f64>() / diffs.len() as f64;
-    [
-        mean,
-        at(90),
-        at(95),
-        at(99),
-        f64::from(diffs[diffs.len() - 1]),
-    ]
-}
-
 fn find_candidates(images: &[HashedImage], max_distance: u32) -> Vec<Candidate> {
     let mut candidates = vec![];
-    for a in 0..images.len() {
-        for b in a + 1..images.len() {
-            let (x, y) = (&images[a], &images[b]);
+    for (a, x) in images.iter().enumerate() {
+        for (b, y) in images.iter().enumerate().skip(a + 1) {
             if x.pixel_hash == y.pixel_hash || !aspects_match(x.dimensions, y.dimensions) {
                 continue;
             }
@@ -203,12 +321,11 @@ fn find_candidates(images: &[HashedImage], max_distance: u32) -> Vec<Candidate> 
             };
             let hash_distance = distance(xv.phash, yv.phash);
             if hash_distance <= max_distance {
-                let diffs = fingerprint_differences(&xv.fingerprint, &yv.fingerprint);
                 candidates.push(Candidate {
                     a,
                     b,
                     hash_distance,
-                    metrics: metrics(&diffs),
+                    metrics: Metrics::between(&xv.fingerprint, &yv.fingerprint),
                 });
             }
         }
@@ -216,18 +333,9 @@ fn find_candidates(images: &[HashedImage], max_distance: u32) -> Vec<Candidate> 
     candidates
 }
 
-/// Where an image is on disk.
-fn full_path(image: &HashedImage, roots: &[String]) -> PathBuf {
-    let root = roots
-        .iter()
-        .find(|r| **r == image.file.root)
-        .expect("image roots are cataloged libraries");
-    library_path(Path::new(root), &image.file.path)
-}
-
 /// Decode an image upright, as the scan does for its perceptual hash.
-fn decode(image: &HashedImage, roots: &[String], ffmpeg: Option<&Path>) -> Option<DynamicImage> {
-    let path = full_path(image, roots);
+fn decode(image: &HashedImage, ffmpeg: Option<&Path>) -> Option<DynamicImage> {
+    let path = library_path(Path::new(&image.file.root), &image.file.path);
     match image_decoder(&image.file.path)? {
         Decoder::InProcess(_) => {
             let (mut img, orientation) = decode_in_process(&path).ok()?;
@@ -256,87 +364,77 @@ fn recompress(img: &DynamicImage, quality: u8) -> DynamicImage {
     image::load_from_memory(&jpeg).expect("decoding our own JPEG")
 }
 
-fn make_variant(img: &DynamicImage, name: &str) -> DynamicImage {
-    let half = |img: &DynamicImage| {
-        img.resize_exact(
-            (img.width() / 2).max(1),
-            (img.height() / 2).max(1),
-            FilterType::Triangle,
-        )
-    };
-    match name {
-        "half size" => half(img),
-        "1024 px" => fit(img, 1024),
-        "JPEG q85" => recompress(img, 85),
-        "JPEG q60" => recompress(img, 60),
-        "half + q60" => recompress(&half(img), 60),
-        "640 px + q50" => recompress(&fit(img, 640), 50),
-        _ => unreachable!("unknown variant {}", name),
-    }
+/// Threads to decode on: decoding full-size photos is slow.
+fn workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(8)
 }
 
 /// For each variant: the perceptual hash distance and fingerprint metrics of each sampled
-/// image's variant to the image. Split across threads; decoding full-size photos is slow.
+/// image's variant to the image. Split across threads.
 fn sample_variants(
     opt: &Opt,
     images: &[HashedImage],
-    roots: &[String],
     ffmpeg: Option<&Path>,
-) -> Vec<Vec<(u32, [f64; 5])>> {
+) -> Vec<VariantResults> {
     let step = (images.len() / opt.sample.max(1)).max(1);
     let sample: Vec<&HashedImage> = images.iter().step_by(step).take(opt.sample).collect();
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(8);
-    let chunk = sample.len().div_ceil(workers).max(1);
+    let empty = || {
+        Variant::ALL
+            .map(|variant| VariantResults {
+                variant,
+                measured: vec![],
+            })
+            .to_vec()
+    };
+    let chunk = sample.len().div_ceil(workers()).max(1);
     let results = std::thread::scope(|scope| {
         let handles: Vec<_> = sample
             .chunks(chunk)
             .map(|part| {
                 scope.spawn(move || {
-                    let mut results = vec![vec![]; VARIANTS.len()];
+                    let mut results = empty();
                     for image in part {
-                        let Some(upright) = decode(image, roots, ffmpeg) else {
+                        let (Some(upright), Some(visual)) = (decode(image, ffmpeg), &image.visual)
+                        else {
                             continue;
                         };
-                        let Some(visual) = &image.visual else {
-                            continue;
-                        };
-                        let (original, fingerprint) =
-                            (visual.phash, visual.fingerprint.as_slice());
-                        for (v, name) in VARIANTS.iter().enumerate() {
+                        for result in &mut results {
                             // A variant without detail counts as missed.
-                            let measured = match perceptual_hash(&make_variant(&upright, name)) {
-                                Some(variant) => (
-                                    distance(original, variant.phash),
-                                    metrics(&fingerprint_differences(
-                                        fingerprint,
+                            let measured = match perceptual_hash(&result.variant.apply(&upright)) {
+                                Some(variant) => Measured {
+                                    hash_distance: distance(visual.phash, variant.phash),
+                                    metrics: Metrics::between(
+                                        &visual.fingerprint,
                                         &variant.fingerprint,
-                                    )),
-                                ),
-                                None => (64, [255.0; 5]),
+                                    ),
+                                },
+                                None => Measured {
+                                    hash_distance: 64,
+                                    metrics: Metrics::APART,
+                                },
                             };
-                            results[v].push(measured);
+                            result.measured.push(measured);
                         }
                     }
                     results
                 })
             })
             .collect();
-        let mut all = vec![vec![]; VARIANTS.len()];
+        let mut all = empty();
         for handle in handles {
-            for (v, part) in handle
-                .join()
-                .expect("sampling thread")
-                .into_iter()
-                .enumerate()
-            {
-                all[v].extend(part);
+            let part = handle.join().expect("sampling thread");
+            for (result, part) in all.iter_mut().zip(part) {
+                result.measured.extend(part.measured);
             }
         }
         all
     });
-    eprintln!("{} images sampled for variants", results[0].len());
+    eprintln!(
+        "{} images sampled for variants",
+        results.first().map_or(0, |r| r.measured.len())
+    );
     results
 }
 
@@ -349,7 +447,7 @@ fn percentile(values: &mut [f64], p: usize) -> f64 {
     values[(values.len() * p / 100).min(values.len() - 1)]
 }
 
-fn print_variants(variants: &[Vec<(u32, [f64; 5])>]) {
+fn print_variants(variants: &[VariantResults]) {
     println!();
     println!(
         "Resized and recompressed copies of the sample (these should all match). Columns: \
@@ -357,25 +455,33 @@ fn print_variants(variants: &[Vec<(u32, [f64; 5])>]) {
          the 99th percentile and worst of the sample."
     );
     let mut header = format!("{:<14} {:>9} {:>9}", "variant", "hash p99", "hash max");
-    for m in METRICS {
+    for m in Metric::ALL {
         let _ = write!(
             header,
             " {:>9} {:>9}",
-            format!("{} p99", m),
-            format!("{} max", m)
+            format!("{} p99", m.name()),
+            format!("{} max", m.name())
         );
     }
     println!("{header}");
-    for (v, name) in VARIANTS.iter().enumerate() {
-        let mut hashes: Vec<f64> = variants[v].iter().map(|(d, _)| f64::from(*d)).collect();
+    for result in variants {
+        let mut hashes: Vec<f64> = result
+            .measured
+            .iter()
+            .map(|m| f64::from(m.hash_distance))
+            .collect();
         let mut line = format!(
             "{:<14} {:>9.0} {:>9.0}",
-            name,
+            result.variant.name(),
             percentile(&mut hashes, 99),
             percentile(&mut hashes, 100)
         );
-        for m in 0..METRICS.len() {
-            let mut values: Vec<f64> = variants[v].iter().map(|(_, ms)| ms[m]).collect();
+        for metric in Metric::ALL {
+            let mut values: Vec<f64> = result
+                .measured
+                .iter()
+                .map(|m| m.metrics.get(metric))
+                .collect();
             let _ = write!(
                 line,
                 " {:>9.1} {:>9.1}",
@@ -388,8 +494,8 @@ fn print_variants(variants: &[Vec<(u32, [f64; 5])>]) {
 }
 
 /// Print how a set of measurements is spread, per metric.
-fn print_spread(title: &str, all: impl Iterator<Item = [f64; 5]>) {
-    let all: Vec<[f64; 5]> = all.collect();
+fn print_spread(title: &str, all: impl Iterator<Item = Metrics>) {
+    let all: Vec<Metrics> = all.collect();
     println!();
     println!(
         "{} ({}), fingerprint metrics by percentile:",
@@ -400,9 +506,9 @@ fn print_spread(title: &str, all: impl Iterator<Item = [f64; 5]>) {
         "{:<6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
         "metric", "p1", "p5", "p10", "p25", "p50", "p75", "p90"
     );
-    for (m, name) in METRICS.iter().enumerate() {
-        let mut values: Vec<f64> = all.iter().map(|ms| ms[m]).collect();
-        let mut line = format!("{name:<6}");
+    for metric in Metric::ALL {
+        let mut values: Vec<f64> = all.iter().map(|ms| ms.get(metric)).collect();
+        let mut line = format!("{:<6}", metric.name());
         for p in [1, 5, 10, 25, 50, 75, 90] {
             let _ = write!(line, " {:>7.1}", percentile(&mut values, p));
         }
@@ -417,13 +523,11 @@ fn print_spread(title: &str, all: impl Iterator<Item = [f64; 5]>) {
     reason = "statistics over counts far below 2^52"
 )]
 fn print_labels(
-    path: &Path,
+    labels: &[Label],
     images: &[HashedImage],
     candidates: &[Candidate],
-    variants: &[Vec<(u32, [f64; 5])>],
+    variants: &[VariantResults],
 ) {
-    let text = fs::read_to_string(path).unwrap_or_else(|e| die(&e.to_string()));
-    let labels: Vec<Label> = serde_json::from_str(&text).unwrap_or_else(|e| die(&e.to_string()));
     let ids: Vec<String> = images.iter().map(image_id).collect();
     let by_pair: HashMap<(&str, &str), &Candidate> = candidates
         .iter()
@@ -454,32 +558,30 @@ fn print_labels(
         "{:<6} {:>6} {:>12} {:>10} {:>16}",
         "metric", "limit", "copies kept", "same kept", "different let in"
     );
-    for (m, name) in METRICS.iter().enumerate() {
+    for metric in Metric::ALL {
         for limit in [
             2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 32.0, 48.0,
         ] {
             let copies: Vec<bool> = variants
                 .iter()
-                .flatten()
-                .map(|(_, ms)| ms[m] <= limit)
+                .flat_map(|r| &r.measured)
+                .map(|m| m.metrics.get(metric) <= limit)
                 .collect();
             let kept = copies.iter().filter(|&&k| k).count() as f64 / copies.len().max(1) as f64;
-            let same_kept = answered
-                .iter()
-                .filter(|(c, d)| !d && c.metrics[m] <= limit)
-                .count();
-            let let_in = answered
-                .iter()
-                .filter(|(c, d)| *d && c.metrics[m] <= limit)
-                .count();
+            let within = |different: bool| {
+                answered
+                    .iter()
+                    .filter(|(c, d)| *d == different && c.metrics.get(metric) <= limit)
+                    .count()
+            };
             println!(
                 "{:<6} {:>6.0} {:>11.1}% {:>6} of {:<3} {:>8} of {:<3}",
-                name,
+                metric.name(),
                 limit,
                 100.0 * kept,
-                same_kept,
+                within(false),
                 same,
-                let_in,
+                within(true),
                 answered.len() - same
             );
         }
@@ -503,28 +605,48 @@ fn fingerprint_at(upright: &DynamicImage, side: u32) -> Vec<u8> {
         .into_raw()
 }
 
+/// The images at the indices in `list`, decoded upright and shrunk to 1024 px (enough for the
+/// largest fingerprint size), split across threads.
+fn decode_all(
+    images: &[HashedImage],
+    list: &[usize],
+    ffmpeg: Option<&Path>,
+) -> HashMap<usize, DynamicImage> {
+    let chunk = list.len().div_ceil(workers()).max(1);
+    std::thread::scope(|scope| {
+        #[allow(
+            clippy::needless_collect,
+            reason = "every thread must start before any is joined"
+        )]
+        let handles: Vec<_> = list
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .filter_map(|&i| {
+                            let img = decode(images.get(i)?, ffmpeg)?;
+                            Some((i, fit(&img, 1024)))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("decoding thread"))
+            .collect()
+    })
+}
+
 /// For each fingerprint size: how well each metric separates the answered pairs, with synthetic
 /// copies standing in for "same picture" answers (there are few of those).
-#[allow(
-    clippy::too_many_lines,
-    reason = "a calibration run, read top to bottom"
-)]
-fn compare_sizes(
-    opt: &Opt,
-    path: &Path,
-    images: &[HashedImage],
-    roots: &[String],
-    ffmpeg: Option<&Path>,
-) {
-    let text = fs::read_to_string(path).unwrap_or_else(|e| die(&e.to_string()));
-    let labels: Vec<Label> = serde_json::from_str(&text).unwrap_or_else(|e| die(&e.to_string()));
+fn compare_sizes(opt: &Opt, labels: &[Label], images: &[HashedImage], ffmpeg: Option<&Path>) {
     let index: HashMap<String, usize> = images
         .iter()
         .enumerate()
         .map(|(i, image)| (image_id(image), i))
         .collect();
-    let sizes = &opt.sizes;
-    // Fingerprints at every size of every image in an answered pair, decoded once.
+    // Every image in an answered pair, decoded once.
     let mut wanted: Vec<usize> = labels
         .iter()
         .flat_map(|l| [index.get(&l.a), index.get(&l.b)])
@@ -533,40 +655,11 @@ fn compare_sizes(
         .collect();
     wanted.sort_unstable();
     wanted.dedup();
-    let decode_all = |list: &[usize]| -> HashMap<usize, DynamicImage> {
-        std::thread::scope(|scope| {
-            let workers = std::thread::available_parallelism()
-                .map_or(1, std::num::NonZero::get)
-                .min(8);
-            let chunk = list.len().div_ceil(workers).max(1);
-            #[allow(
-                clippy::needless_collect,
-                reason = "every thread must start before any is joined"
-            )]
-            let handles: Vec<_> = list
-                .chunks(chunk)
-                .map(|part| {
-                    scope.spawn(move || {
-                        part.iter()
-                            .filter_map(|&i| {
-                                // Shrunk once; the largest fingerprint size is enough.
-                                decode(&images[i], roots, ffmpeg).map(|img| (i, fit(&img, 1024)))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().expect("decoding thread"))
-                .collect()
-        })
-    };
-    let decoded = decode_all(&wanted);
+    let decoded = decode_all(images, &wanted, ffmpeg);
     eprintln!("{} answered images decoded", decoded.len());
     let step = (images.len() / opt.sample.max(1)).max(1);
     let sample: Vec<usize> = (0..images.len()).step_by(step).take(opt.sample).collect();
-    let originals = decode_all(&sample);
+    let originals = decode_all(images, &sample, ffmpeg);
     eprintln!("{} sample images decoded", originals.len());
 
     println!();
@@ -578,55 +671,55 @@ fn compare_sizes(
         "{:>5} {:<6} {:>7} {:>12} {:>16}",
         "side", "metric", "limit", "same kept", "different let in"
     );
-    for &side in sizes {
+    for &side in &opt.sizes {
         // Synthetic copies at this size.
-        let mut copies: Vec<[f64; 5]> = vec![];
+        let mut copies: Vec<Metrics> = vec![];
         for upright in originals.values() {
             let original = fingerprint_at(upright, side);
-            for name in VARIANTS {
-                let variant = fingerprint_at(&make_variant(upright, name), side);
-                copies.push(metrics(&fingerprint_differences(&original, &variant)));
+            for variant in Variant::ALL {
+                let copy = fingerprint_at(&variant.apply(upright), side);
+                copies.push(Metrics::between(&original, &copy));
             }
         }
-        let answered: Vec<([f64; 5], bool)> = labels
+        let answered: Vec<(Metrics, bool)> = labels
             .iter()
             .filter_map(|l| {
-                let (a, b) = (
-                    decoded.get(index.get(&l.a)?)?,
-                    decoded.get(index.get(&l.b)?)?,
-                );
-                let diffs =
-                    fingerprint_differences(&fingerprint_at(a, side), &fingerprint_at(b, side));
-                Some((metrics(&diffs), l.different))
+                let a = decoded.get(index.get(&l.a)?)?;
+                let b = decoded.get(index.get(&l.b)?)?;
+                let metrics = Metrics::between(&fingerprint_at(a, side), &fingerprint_at(b, side));
+                Some((metrics, l.different))
             })
             .collect();
-        let same = answered.iter().filter(|(_, d)| !d).count();
-        for (m, name) in METRICS.iter().enumerate() {
-            let mut values: Vec<f64> = copies.iter().map(|ms| ms[m]).collect();
-            if values.is_empty() {
-                die("No sample image could be decoded.");
-            }
-            values.sort_by(f64::total_cmp);
-            let limit = values[(values.len() * 995 / 1000).min(values.len() - 1)];
-            let same_kept = answered
-                .iter()
-                .filter(|(ms, d)| !d && ms[m] <= limit)
-                .count();
-            let let_in = answered
-                .iter()
-                .filter(|(ms, d)| *d && ms[m] <= limit)
-                .count();
-            println!(
-                "{:>5} {:<6} {:>7.1} {:>7} of {:<3} {:>8} of {:<3}",
-                side,
-                name,
-                limit,
-                same_kept,
-                same,
-                let_in,
-                answered.len() - same
-            );
+        print_size(side, &copies, &answered);
+    }
+}
+
+/// One fingerprint size's rows of the size experiment.
+fn print_size(side: u32, copies: &[Metrics], answered: &[(Metrics, bool)]) {
+    let same = answered.iter().filter(|(_, d)| !d).count();
+    for metric in Metric::ALL {
+        let mut values: Vec<f64> = copies.iter().map(|ms| ms.get(metric)).collect();
+        if values.is_empty() {
+            die("No sample image could be decoded.");
         }
+        values.sort_by(f64::total_cmp);
+        let limit = values[(values.len() * 995 / 1000).min(values.len() - 1)];
+        let within = |different: bool| {
+            answered
+                .iter()
+                .filter(|(ms, d)| *d == different && ms.get(metric) <= limit)
+                .count()
+        };
+        println!(
+            "{:>5} {:<6} {:>7.1} {:>7} of {:<3} {:>8} of {:<3}",
+            side,
+            metric.name(),
+            limit,
+            within(false),
+            same,
+            within(true),
+            answered.len() - same
+        );
     }
 }
 
@@ -634,12 +727,11 @@ fn compare_sizes(
 /// review metric so the page covers its whole range.
 #[allow(
     clippy::cast_possible_truncation,
-    reason = "statistics over counts far below 2^52"
+    reason = "the shuffle picks an index below a bucket's length"
 )]
 fn write_review(
     opt: &Opt,
     images: &[HashedImage],
-    roots: &[String],
     ffmpeg: Option<&Path>,
     candidates: &[Candidate],
 ) {
@@ -648,11 +740,11 @@ fn write_review(
         fs::create_dir_all(dir).unwrap_or_else(|e| die(&e.to_string()));
     }
     // A 320 px thumbnail and a 1600 px version to compare side by side.
-    let renditions = |i: usize| -> (String, String) {
-        let name = format!("{}.jpg", image_id(&images[i]));
+    let renditions = |image: &HashedImage| -> (String, String) {
+        let name = format!("{}.jpg", image_id(image));
         let (small_path, large_path) = (thumbs.join(&name), large.join(&name));
         if !small_path.exists() || !large_path.exists() {
-            if let Some(img) = decode(&images[i], roots, ffmpeg) {
+            if let Some(img) = decode(image, ffmpeg) {
                 for (path, size, quality) in [(&small_path, 320, 80), (&large_path, 1600, 90)] {
                     let mut jpeg = vec![];
                     if JpegEncoder::new_with_quality(&mut jpeg, quality)
@@ -667,41 +759,42 @@ fn write_review(
         (format!("thumbs/{name}"), format!("large/{name}"))
     };
 
+    let review = |c: &Candidate| c.metrics.get(REVIEW_METRIC);
     let mut order: Vec<&Candidate> = candidates.iter().collect();
-    order.sort_by(|x, y| x.metrics[REVIEW_METRIC].total_cmp(&y.metrics[REVIEW_METRIC]));
+    order.sort_by(|x, y| review(x).total_cmp(&review(y)));
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut html = String::from(REVIEW_HEAD);
     let bucket = order.len().div_ceil(opt.buckets.max(1)).max(1);
     for (n, part) in order.chunks(bucket).enumerate() {
+        // The bucket's range, before it is shuffled.
+        let (Some(first), Some(last)) = (part.first(), part.last()) else {
+            continue;
+        };
+        let (low, high) = (review(first), review(last));
         // A random sample of the bucket, in a repeatable order.
         let mut part: Vec<&Candidate> = part.to_vec();
         for k in (1..part.len()).rev() {
             part.swap(k, rng.below(k as u64 + 1) as usize);
         }
         part.truncate(opt.pairs);
-        let (low, high) = (
-            order[n * bucket].metrics[REVIEW_METRIC],
-            order[((n + 1) * bucket).min(order.len()) - 1].metrics[REVIEW_METRIC],
-        );
         let _ = write!(
             html,
             "<section><h2>Group {n}: {metric} {low:.0} to {high:.0}</h2>",
             n = n + 1,
-            metric = METRICS[REVIEW_METRIC],
-            low = low,
-            high = high
+            metric = REVIEW_METRIC.name(),
         );
         for c in part {
+            let (a, b) = (&images[c.a], &images[c.b]);
             let _ = write!(
                 html,
                 "<div class=\"pair\" data-a=\"{}\" data-b=\"{}\">",
-                image_id(&images[c.a]),
-                image_id(&images[c.b])
+                image_id(a),
+                image_id(b)
             );
-            for k in [c.a, c.b] {
-                let f = &images[k].file;
-                let (small, big) = renditions(k);
-                let (width, height) = images[k].dimensions.map_or((0, 0), |d| (d.width, d.height));
+            for image in [a, b] {
+                let f = &image.file;
+                let (small, big) = renditions(image);
+                let (width, height) = image.dimensions.map_or((0, 0), |d| (d.width, d.height));
                 let _ = write!(
                     html,
                     "<figure><img loading=\"lazy\" src=\"{}\" data-large=\"{}\">\

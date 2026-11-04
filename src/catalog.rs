@@ -759,8 +759,8 @@ impl Catalog {
             .conn
             .query_row(
                 &format!(
-                    "SELECT {FILE_COLUMNS}, hash_version, pixel_hash, phash, fingerprint, duration_ms, frames,
-                            chromaprint
+                    "SELECT {FILE_COLUMNS}, hash_version, pixel_hash, phash, fingerprint,
+                            duration_ms, frames, chromaprint
                      FROM files WHERE library_id = ?1 AND path = ?2"
                 ),
                 params![library_id, path],
@@ -855,7 +855,7 @@ impl Catalog {
         library_id: i64,
         dir: &str,
         media_type: Option<MediaType>,
-    ) -> rusqlite::Result<Vec<(String, usize)>> {
+    ) -> rusqlite::Result<Vec<Tally>> {
         let (cond, values) = below(library_id, dir, media_type);
         let mut stmt = self.conn.prepare(&format!(
             "SELECT substr(rest, 1, instr(rest, '/') - 1) AS name, count(*)
@@ -864,9 +864,7 @@ impl Catalog {
              GROUP BY name ORDER BY name",
             dir_prefix_len(dir) + 1
         ))?;
-        let rows = stmt.query_map(params_from_iter(values), |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let rows = stmt.query_map(params_from_iter(values), tally)?;
         rows.collect()
     }
 
@@ -887,42 +885,49 @@ impl Catalog {
         rows.collect()
     }
 
-    /// The paths before and after `path` among the files in its folder, in folder order.
+    /// The files before and after `path` among the files in its folder, in folder order.
     pub fn folder_neighbors(
         &self,
         library_id: i64,
         path: &str,
         media_type: Option<MediaType>,
-    ) -> rusqlite::Result<(Option<String>, Option<String>)> {
+    ) -> rusqlite::Result<Neighbors> {
         let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
         let (cond, values) = in_folder(library_id, dir, media_type);
-        let neighbor = |op: &str, order: &str| -> rusqlite::Result<Option<String>> {
+        let neighbor = |op: &str, order: &str| -> rusqlite::Result<Option<FileRef>> {
             let mut values = values.clone();
             values.push(Value::from(String::from(path)));
             self.conn
                 .query_row(
                     &format!(
-                        "SELECT path FROM files WHERE {cond} AND path {op} ? ORDER BY path {order} LIMIT 1"
+                        "SELECT path FROM files WHERE {cond} AND path {op} ? \
+                         ORDER BY path {order} LIMIT 1"
                     ),
                     params_from_iter(values),
-                    |row| row.get(0),
+                    |row| {
+                        Ok(FileRef {
+                            library_id,
+                            path: row.get(0)?,
+                        })
+                    },
                 )
                 .optional()
         };
-        Ok((neighbor("<", "DESC")?, neighbor(">", "ASC")?))
+        Ok(Neighbors {
+            prev: neighbor("<", "DESC")?,
+            next: neighbor(">", "ASC")?,
+        })
     }
 
     /// Months (`YYYY-MM`) that have files, newest first, with the number of files in each.
     /// A file's date is when it was taken, or its mtime in local time if that is unknown.
-    pub fn months(&self, filter: &Filter) -> rusqlite::Result<Vec<(String, usize)>> {
+    pub fn months(&self, filter: &Filter) -> rusqlite::Result<Vec<Tally>> {
         let (cond, values) = filter.condition();
         let mut stmt = self.conn.prepare(&format!(
             "SELECT substr({DATE_KEY}, 1, 7) AS month, count(*) FROM files WHERE {cond}
              GROUP BY month ORDER BY month DESC"
         ))?;
-        let rows = stmt.query_map(params_from_iter(values), |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let rows = stmt.query_map(params_from_iter(values), tally)?;
         rows.collect()
     }
 
@@ -962,9 +967,9 @@ impl Catalog {
         filter: &Filter,
         library_id: i64,
         path: &str,
-    ) -> rusqlite::Result<(Option<FileRef>, Option<FileRef>)> {
+    ) -> rusqlite::Result<Neighbors> {
         let Some(date) = self.date(library_id, path)? else {
-            return Ok((None, None));
+            return Ok(Neighbors::default());
         };
         let (cond, values) = filter.condition();
         let neighbor = |op: &str, order: &str| -> rusqlite::Result<Option<FileRef>> {
@@ -991,7 +996,10 @@ impl Catalog {
                 )
                 .optional()
         };
-        Ok((neighbor(">", "ASC")?, neighbor("<", "DESC")?))
+        Ok(Neighbors {
+            prev: neighbor(">", "ASC")?,
+            next: neighbor("<", "DESC")?,
+        })
     }
 
     /// Every file, in any library, with the given size and hash.
@@ -1105,6 +1113,28 @@ impl FileRef {
             path: String::from(path),
         }
     }
+}
+
+/// The files before and after one in a listing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Neighbors {
+    pub prev: Option<FileRef>,
+    pub next: Option<FileRef>,
+}
+
+/// A name in a listing and how many files it holds: a subfolder, or a month (`YYYY-MM`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tally {
+    pub name: String,
+    pub files: usize,
+}
+
+/// A `Tally` from a row of name and count.
+fn tally(row: &rusqlite::Row) -> rusqlite::Result<Tally> {
+    Ok(Tally {
+        name: row.get(0)?,
+        files: row.get(1)?,
+    })
 }
 
 /// A library's ID and root.
@@ -1840,6 +1870,13 @@ mod tests {
         files.into_iter().map(|f| f.path).collect()
     }
 
+    fn tally(name: &str, files: usize) -> Tally {
+        Tally {
+            name: String::from(name),
+            files,
+        }
+    }
+
     fn all() -> Page {
         Page {
             limit: 100,
@@ -1851,12 +1888,9 @@ mod tests {
     fn test_folders() {
         let (_dir, catalog, id, _) = browse_fixture();
         let names = |dir| catalog.subfolders(id, dir, None).unwrap();
-        assert_eq!(
-            names(""),
-            vec![(String::from("x"), 3), (String::from("ø"), 2)]
-        );
-        assert_eq!(names("x"), vec![(String::from("y"), 1)]);
-        assert_eq!(names("ø"), vec![(String::from("z"), 1)]);
+        assert_eq!(names(""), vec![tally("x", 3), tally("ø", 2)]);
+        assert_eq!(names("x"), vec![tally("y", 1)]);
+        assert_eq!(names("ø"), vec![tally("z", 1)]);
         assert_eq!(names("ø/z"), vec![]);
         assert_eq!(
             catalog.subfolders(id, "", Some(MediaType::Video)).unwrap(),
@@ -1880,10 +1914,23 @@ mod tests {
         assert_eq!(files("", None, page), ["b.mp4", "x.jpg"]);
 
         let neighbors = |path| catalog.folder_neighbors(id, path, None).unwrap();
-        assert_eq!(neighbors("x/1.jpg"), (None, Some(String::from("x/2.jpg"))));
+        let at = |path: &str| FileRef {
+            library_id: id,
+            path: String::from(path),
+        };
+        assert_eq!(
+            neighbors("x/1.jpg"),
+            Neighbors {
+                prev: None,
+                next: Some(at("x/2.jpg"))
+            }
+        );
         assert_eq!(
             neighbors("b.mp4"),
-            (Some(String::from("a.jpg")), Some(String::from("x.jpg")))
+            Neighbors {
+                prev: Some(at("a.jpg")),
+                next: Some(at("x.jpg"))
+            }
         );
     }
 
@@ -1897,20 +1944,17 @@ mod tests {
         assert_eq!(
             catalog.months(&mine).unwrap(),
             vec![
-                (String::from("2024-05"), 2),
-                (String::from("2023-01"), 1),
-                (String::from("2020-06"), 6),
+                tally("2024-05", 2),
+                tally("2023-01", 1),
+                tally("2020-06", 6)
             ]
         );
-        assert_eq!(catalog.months(&Filter::default()).unwrap()[2].1, 7);
+        assert_eq!(catalog.months(&Filter::default()).unwrap()[2].files, 7);
         let videos = Filter {
             libraries: vec![],
             media_type: Some(MediaType::Video),
         };
-        assert_eq!(
-            catalog.months(&videos).unwrap(),
-            vec![(String::from("2023-01"), 1)]
-        );
+        assert_eq!(catalog.months(&videos).unwrap(), vec![tally("2023-01", 1)]);
 
         let may: Vec<String> = catalog
             .month_files(&mine, "2024-05", all())
@@ -1930,20 +1974,29 @@ mod tests {
         let neighbors = |path| catalog.date_neighbors(&mine, id, path).unwrap();
         assert_eq!(
             neighbors("a.jpg"),
-            (Some(at(id, "x/1.jpg")), Some(at(id, "b.mp4")))
+            Neighbors {
+                prev: Some(at(id, "x/1.jpg")),
+                next: Some(at(id, "b.mp4"))
+            }
         );
-        assert_eq!(neighbors("x/1.jpg").0, None);
+        assert_eq!(neighbors("x/1.jpg").prev, None);
         // Files with the same date are ordered by library, then path, both descending.
         assert_eq!(
             neighbors("x/2.jpg"),
-            (Some(at(id, "x/y/3.jpg")), Some(at(id, "x.jpg")))
+            Neighbors {
+                prev: Some(at(id, "x/y/3.jpg")),
+                next: Some(at(id, "x.jpg"))
+            }
         );
         let everything = |path| {
             catalog
                 .date_neighbors(&Filter::default(), id, path)
                 .unwrap()
         };
-        assert_eq!(everything("ø/z/5.jpg").0, Some(at(other, "elsewhere.jpg")));
+        assert_eq!(
+            everything("ø/z/5.jpg").prev,
+            Some(at(other, "elsewhere.jpg"))
+        );
         assert_eq!(catalog.date(id, "missing.jpg").unwrap(), None);
     }
 

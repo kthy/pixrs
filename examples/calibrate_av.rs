@@ -47,11 +47,21 @@ struct Opt {
     audio: Option<PathBuf>,
 }
 
-/// Re-encodings that should still count as the same video: name and `ffmpeg` output options.
-const VIDEO_VARIANTS: &[(&str, &[&str])] = &[
-    (
-        "half, mpeg4",
-        &[
+/// A re-encoding that should still count as the same video or audio.
+struct Variant {
+    name: &'static str,
+    /// The extension of the re-encoded file.
+    extension: &'static str,
+    /// `ffmpeg` output options.
+    options: &'static [&'static str],
+}
+
+/// Re-encodings that should still count as the same video.
+const VIDEO_VARIANTS: &[Variant] = &[
+    Variant {
+        name: "half, mpeg4",
+        extension: "mp4",
+        options: &[
             "-vf",
             "scale=trunc(iw/4)*2:-2",
             "-c:v",
@@ -59,10 +69,11 @@ const VIDEO_VARIANTS: &[(&str, &[&str])] = &[
             "-q:v",
             "8",
         ],
-    ),
-    (
-        "720p h264 crf 28",
-        &[
+    },
+    Variant {
+        name: "720p h264 crf 28",
+        extension: "mp4",
+        options: &[
             "-vf",
             "scale=-2:'min(720,ih)'",
             "-c:v",
@@ -72,10 +83,11 @@ const VIDEO_VARIANTS: &[(&str, &[&str])] = &[
             "-crf",
             "28",
         ],
-    ),
-    (
-        "480p h264 crf 33",
-        &[
+    },
+    Variant {
+        name: "480p h264 crf 33",
+        extension: "mp4",
+        options: &[
             "-vf",
             "scale=-2:'min(480,ih)'",
             "-c:v",
@@ -85,19 +97,31 @@ const VIDEO_VARIANTS: &[(&str, &[&str])] = &[
             "-crf",
             "33",
         ],
-    ),
+    },
 ];
 
 /// Re-encodings that should still count as the same audio.
-const AUDIO_VARIANTS: &[(&str, &str, &[&str])] = &[
-    ("aac 96k", "m4a", &["-c:a", "aac", "-b:a", "96k"]),
-    ("mp3 128k", "mp3", &["-c:a", "libmp3lame", "-b:a", "128k"]),
-    ("opus 48k", "opus", &["-c:a", "libopus", "-b:a", "48k"]),
-    (
-        "mp2 64k mono",
-        "mp2",
-        &["-c:a", "mp2", "-b:a", "64k", "-ac", "1"],
-    ),
+const AUDIO_VARIANTS: &[Variant] = &[
+    Variant {
+        name: "aac 96k",
+        extension: "m4a",
+        options: &["-c:a", "aac", "-b:a", "96k"],
+    },
+    Variant {
+        name: "mp3 128k",
+        extension: "mp3",
+        options: &["-c:a", "libmp3lame", "-b:a", "128k"],
+    },
+    Variant {
+        name: "opus 48k",
+        extension: "opus",
+        options: &["-c:a", "libopus", "-b:a", "48k"],
+    },
+    Variant {
+        name: "mp2 64k mono",
+        extension: "mp2",
+        options: &["-c:a", "mp2", "-b:a", "64k", "-ac", "1"],
+    },
 ];
 
 fn die(msg: &str) -> ! {
@@ -118,26 +142,45 @@ fn encode(ffmpeg: &Path, input: &Path, options: &[&str], output: &Path) -> bool 
         .is_ok_and(|s| s.success())
 }
 
-/// How many frame pairs have hashes at most `threshold` bits apart, and of how many have a
-/// hash in both.
-fn frame_counts(a: &[Frame], b: &[Frame], threshold: u32) -> (usize, usize) {
-    let mut both = 0;
-    let mut matching = 0;
-    for (x, y) in a.iter().zip(b) {
-        if let (Some(hx), Some(hy)) = (x, y) {
-            both += 1;
-            if distance(*hx, *hy) <= threshold {
-                matching += 1;
-            }
-        }
-    }
-    (matching, both)
+/// Frame pairs of two videos: how many have a hash in both, and how many of those are at most
+/// the threshold apart.
+struct FrameCounts {
+    matching: usize,
+    both: usize,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "a calibration run, read top to bottom"
-)]
+impl FrameCounts {
+    fn of(a: &[Frame], b: &[Frame], threshold: u32) -> Self {
+        let mut counts = Self {
+            matching: 0,
+            both: 0,
+        };
+        for (x, y) in a.iter().zip(b) {
+            if let (Some(hx), Some(hy)) = (x, y) {
+                counts.both += 1;
+                if distance(*hx, *hy) <= threshold {
+                    counts.matching += 1;
+                }
+            }
+        }
+        counts
+    }
+}
+
+/// How a re-encoded copy of a video compares to it.
+struct CopyResult {
+    frames: FrameCounts,
+    /// Whether the copy matches by the rule `pixrs dupes` uses.
+    matched: bool,
+}
+
+/// How the fingerprints of two unrelated audio files compare.
+struct Unrelated {
+    bit_error_rate: f64,
+    /// Whether their durations are close enough for `pixrs dupes` to compare them.
+    close_durations: bool,
+}
+
 fn main() {
     let opt = Opt::parse();
     let tools = Tools::find();
@@ -181,47 +224,60 @@ fn main() {
         FRAMES
     );
 
-    // Copies that should match.
+    print_video_copies(&videos, &opt, ffmpeg, ffprobe, &out);
+    print_different_videos(&videos);
+    if let Some(folder) = &opt.audio {
+        calibrate_audio(&tools, folder, &out);
+    }
+}
+
+/// Copies that should match: re-encode a sample of the videos each way, and compare.
+fn print_video_copies(videos: &[HashedAv], opt: &Opt, ffmpeg: &Path, ffprobe: &Path, out: &Path) {
     println!();
     println!("Re-encoded copies: matching frames (of frames with a hash in both), per copy:");
     let step = (videos.len() / opt.sample.max(1)).max(1);
-    for (name, options) in VIDEO_VARIANTS {
+    for variant in VIDEO_VARIANTS {
         let mut results = vec![];
         for (n, video) in videos.iter().step_by(step).take(opt.sample).enumerate() {
             let source = library_path(Path::new(&video.file.root), &video.file.path);
-            let copy = out.join(format!("variant-{n}.mp4"));
-            if !encode(ffmpeg, &source, options, &copy) {
+            let copy = out.join(format!("variant-{n}.{}", variant.extension));
+            if !encode(ffmpeg, &source, variant.options, &copy) {
                 continue;
             }
             if let Ok(sig) = video_signature(ffmpeg, ffprobe, &copy) {
                 let original = video.signature.frames().unwrap_or_default();
-                let (matching, both) = frame_counts(original, &sig.frames, DEFAULT_THRESHOLD);
-                let matched =
-                    video_durations_match(video.signature.duration_ms(), sig.duration_ms)
-                        && frames_match(original, &sig.frames, DEFAULT_THRESHOLD);
-                results.push((matching, both, matched));
+                results.push(CopyResult {
+                    frames: FrameCounts::of(original, &sig.frames, DEFAULT_THRESHOLD),
+                    matched: video_durations_match(video.signature.duration_ms(), sig.duration_ms)
+                        && frames_match(original, &sig.frames, DEFAULT_THRESHOLD),
+                });
             }
             let _ = fs::remove_file(&copy);
         }
-        let matched = results.iter().filter(|r| r.2).count();
-        let pairs: Vec<String> = results.iter().map(|(m, b, _)| format!("{m}/{b}")).collect();
+        let matched = results.iter().filter(|r| r.matched).count();
+        let pairs: Vec<String> = results
+            .iter()
+            .map(|r| format!("{}/{}", r.frames.matching, r.frames.both))
+            .collect();
         println!(
             "  {:<18} {} of {} match by the rule; {}",
-            name,
+            variant.name,
             matched,
             results.len(),
             pairs.join(" ")
         );
     }
+}
 
-    // Pairs of different videos in the catalog.
+/// Pairs of different videos in the catalog, which should not match.
+fn print_different_videos(videos: &[HashedAv]) {
     let mut close = 0;
     let mut by_matching = vec![0usize; FRAMES + 1];
     let mut close_matched = 0;
     let mut all_pairs = 0;
     let mut any_matched = 0;
     for (i, a) in videos.iter().enumerate() {
-        for b in &videos[i + 1..] {
+        for b in videos.iter().skip(i + 1) {
             let (fa, fb) = (
                 a.signature.frames().unwrap_or_default(),
                 b.signature.frames().unwrap_or_default(),
@@ -235,7 +291,7 @@ fn main() {
                 continue;
             }
             close += 1;
-            by_matching[frame_counts(fa, fb, DEFAULT_THRESHOLD).0] += 1;
+            by_matching[FrameCounts::of(fa, fb, DEFAULT_THRESHOLD).matching] += 1;
             close_matched += usize::from(matched);
         }
     }
@@ -246,12 +302,9 @@ fn main() {
     );
     // All pairs, whatever their durations: how often would the frames alone match?
     println!(
-        "All {all_pairs} pairs of different videos, ignoring durations: {any_matched} match by frames"
+        "All {all_pairs} pairs of different videos, ignoring durations: {any_matched} match by \
+         frames"
     );
-
-    if let Some(folder) = &opt.audio {
-        calibrate_audio(&tools, folder, &out);
-    }
 }
 
 /// Counts of `values` from 0 to `max`.
@@ -282,11 +335,11 @@ fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
         .collect();
     println!();
     println!("{} audio files fingerprinted", prints.len());
-    for (name, ext, options) in AUDIO_VARIANTS {
+    for variant in AUDIO_VARIANTS {
         let mut rates = vec![];
         for (n, file) in files.iter().enumerate() {
-            let copy = out.join(format!("audio-{n}.{ext}"));
-            if !encode(ffmpeg, file, options, &copy) {
+            let copy = out.join(format!("audio-{n}.{}", variant.extension));
+            if !encode(ffmpeg, file, variant.options, &copy) {
                 continue;
             }
             if let (Ok(a), Ok(b)) = (
@@ -300,7 +353,7 @@ fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
         rates.sort_by(f64::total_cmp);
         println!(
             "  {:<14} bit error rate of copies: min {:.3}, median {:.3}, max {:.3} ({} files)",
-            name,
+            variant.name,
             rates.first().copied().unwrap_or(f64::NAN),
             rates.get(rates.len() / 2).copied().unwrap_or(f64::NAN),
             rates.last().copied().unwrap_or(f64::NAN),
@@ -309,20 +362,22 @@ fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
     }
     let mut unrelated = vec![];
     for (i, a) in prints.iter().enumerate() {
-        for b in &prints[i + 1..] {
-            unrelated.push((
-                bit_error_rate(&a.values, &b.values),
-                audio_durations_match(a.duration_ms, b.duration_ms),
-            ));
+        for b in prints.iter().skip(i + 1) {
+            unrelated.push(Unrelated {
+                bit_error_rate: bit_error_rate(&a.values, &b.values),
+                close_durations: audio_durations_match(a.duration_ms, b.duration_ms),
+            });
         }
     }
-    unrelated.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let close = unrelated.iter().filter(|u| u.1).count();
+    unrelated.sort_by(|a, b| a.bit_error_rate.total_cmp(&b.bit_error_rate));
+    let close = unrelated.iter().filter(|u| u.close_durations).count();
     println!(
         "  unrelated pairs: {} ({} with close durations); bit error rate min {:.3}, median {:.3}",
         unrelated.len(),
         close,
-        unrelated.first().map_or(f64::NAN, |u| u.0),
-        unrelated.get(unrelated.len() / 2).map_or(f64::NAN, |u| u.0)
+        unrelated.first().map_or(f64::NAN, |u| u.bit_error_rate),
+        unrelated
+            .get(unrelated.len() / 2)
+            .map_or(f64::NAN, |u| u.bit_error_rate)
     );
 }
