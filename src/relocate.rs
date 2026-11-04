@@ -60,7 +60,7 @@ pub fn relocate(
         return Err(Error::NoCatalog(catalog_path));
     }
     let _lock = Lock::take(&catalog_path)?;
-    let catalog = Catalog::open(&catalog_path)?;
+    let catalog = Catalog::open_for_update(&catalog_path)?;
     let libraries = catalog.libraries()?;
     let library = find(&libraries, old)?;
 
@@ -118,13 +118,17 @@ pub fn relocate(
         });
     }
 
-    let (root, folded) = catalog.relocate(library.id, new_str)?;
+    let relocated = catalog.relocate(library.id, new_str)?;
     Ok(RelocateSummary {
         files: files.len(),
         compared: sample.len(),
         matching,
-        library: display_root(&root),
-        folded: folded.iter().map(|root| display_root(root)).collect(),
+        library: display_root(&relocated.root),
+        folded: relocated
+            .folded
+            .iter()
+            .map(|root| display_root(root))
+            .collect(),
     })
 }
 

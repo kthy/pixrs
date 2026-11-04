@@ -135,10 +135,10 @@ fn library_ids(catalog: &Catalog, libraries: &[PathBuf]) -> Result<Vec<i64>, Err
             let containing = path
                 .as_deref()
                 .and_then(|path| catalog.containing_library(path).ok().flatten());
-            if let Some((_, root)) = containing {
+            if let Some(containing) = containing {
                 return Err(Error::PartOfLibrary {
                     path: library.clone(),
-                    root,
+                    root: containing.root,
                 });
             }
             return Err(Error::NotScanned(library.clone()));

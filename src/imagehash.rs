@@ -8,6 +8,7 @@
 use crate::decode::{
     decode_in_process, decode_with_ffmpeg, extension, image_decoder, DecodeError, Decoder,
 };
+use crate::media::Dimensions;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::DynamicImage;
@@ -21,17 +22,23 @@ pub struct ImageHashes {
     /// SHA-256 of the decoded pixels as lowercase hex. Equal for copies that differ only in
     /// metadata.
     pub pixels: String,
+    /// `None` for images with almost no detail (blank, black, a single color): their hashes are
+    /// all alike, so they would all look similar to each other.
+    pub visual: Option<Visual>,
+    /// Size of the upright image.
+    pub dimensions: Dimensions,
+}
+
+/// What similar images are found by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Visual {
     /// 64-bit gradient hash of the upright image. Close (in Hamming distance) for resized and
-    /// recompressed copies. `None` for images with almost no detail (blank, black, a single
-    /// color): their hashes are all alike, so they would all look similar to each other.
-    pub perceptual: Option<u64>,
+    /// recompressed copies.
+    pub phash: u64,
     /// The upright image as `FINGERPRINT_SIDE` x `FINGERPRINT_SIDE` grayscale pixels, to tell
     /// resized copies (nearly the same everywhere) from burst shots (different where something
-    /// moved) among images with close perceptual hashes. `None` when `perceptual` is.
-    pub fingerprint: Option<Vec<u8>>,
-    /// Size of the upright image.
-    pub width: u32,
-    pub height: u32,
+    /// moved) among images with close perceptual hashes.
+    pub fingerprint: Vec<u8>,
 }
 
 /// Version of the hash definitions. Bump it when `pixel_hash`, `perceptual_hash` or the
@@ -110,16 +117,10 @@ pub fn hash_image(
             (pixel_hash(&img), shrink(&img), img.width(), img.height())
         }
     };
-    let (perceptual, fingerprint) = match hash_small(&small) {
-        Some((hash, fingerprint)) => (Some(hash), Some(fingerprint)),
-        None => (None, None),
-    };
     Ok(Some(ImageHashes {
         pixels,
-        perceptual,
-        fingerprint,
-        width,
-        height,
+        visual: hash_small(&small),
+        dimensions: Dimensions { width, height },
     }))
 }
 
@@ -130,7 +131,7 @@ pub const fn distance(a: u64, b: u64) -> u32 {
 
 /// The perceptual hash and fingerprint of an upright image, as `hash_image` computes them;
 /// `None` if the image has almost no detail.
-pub fn perceptual_hash(upright: &DynamicImage) -> Option<(u64, Vec<u8>)> {
+pub fn perceptual_hash(upright: &DynamicImage) -> Option<Visual> {
     hash_small(&shrink(upright))
 }
 
@@ -222,7 +223,7 @@ fn shrink(img: &DynamicImage) -> DynamicImage {
     clippy::cast_precision_loss,
     reason = "images have far fewer than 2^52 pixels"
 )]
-fn hash_small(small: &DynamicImage) -> Option<(u64, Vec<u8>)> {
+fn hash_small(small: &DynamicImage) -> Option<Visual> {
     let luma = small.to_luma8();
     let n = luma.len().max(1) as f64;
     let mean = luma.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
@@ -245,7 +246,10 @@ fn hash_small(small: &DynamicImage) -> Option<(u64, Vec<u8>)> {
         .resize_exact(FINGERPRINT_SIDE, FINGERPRINT_SIDE, FilterType::Triangle)
         .to_luma8()
         .into_raw();
-    Some((u64::from_be_bytes(bytes), fingerprint))
+    Some(Visual {
+        phash: u64::from_be_bytes(bytes),
+        fingerprint,
+    })
 }
 
 /// SHA-256 of the width, height and RGBA pixels, so the same picture hashes the same whatever
@@ -348,12 +352,12 @@ pub(crate) mod tests {
         let other = hashes(dir.path(), "d.jpg", &jpeg(&picture(7, 800, 600), 90));
 
         assert_eq!(a.pixels, stripped.pixels);
-        assert_eq!(a.perceptual, stripped.perceptual);
+        assert_eq!(a.visual, stripped.visual);
         assert_ne!(a.pixels, resized.pixels);
         let (a, resized, other) = (
-            a.perceptual.unwrap(),
-            resized.perceptual.unwrap(),
-            other.perceptual.unwrap(),
+            a.visual.unwrap().phash,
+            resized.visual.unwrap().phash,
+            other.visual.unwrap().phash,
         );
         assert!(distance(a, resized) <= 4);
         assert!(distance(a, other) > 16);
@@ -379,9 +383,9 @@ pub(crate) mod tests {
         let black = RgbImage::from_pixel(640, 480, Rgb([0, 0, 0]));
         let navy = RgbImage::from_pixel(800, 600, Rgb([20, 20, 90]));
         let black = hashes(dir.path(), "black.jpg", &jpeg(&black, 90));
-        assert_eq!((black.perceptual, black.fingerprint), (None, None));
+        assert_eq!(black.visual, None);
         assert_eq!(
-            hashes(dir.path(), "navy.jpg", &jpeg(&navy, 90)).perceptual,
+            hashes(dir.path(), "navy.jpg", &jpeg(&navy, 90)).visual,
             None
         );
     }
@@ -400,7 +404,13 @@ pub(crate) mod tests {
         tagged.extend(&tiff);
         tagged.extend(&photo[2..]);
         let h = hashes(dir.path(), "turned.jpg", &tagged);
-        assert_eq!((h.width, h.height), (300, 400));
+        assert_eq!(
+            h.dimensions,
+            Dimensions {
+                width: 300,
+                height: 400
+            }
+        );
         assert_eq!(h.pixels, hashes(dir.path(), "plain.jpg", &photo).pixels);
     }
 

@@ -235,7 +235,7 @@ fn frame_at(ffmpeg: &Path, source: &Path, seconds: f64) -> Result<Frame, DecodeE
         return Ok(None);
     }
     let img = image::load_from_memory(&png).map_err(DecodeError::Image)?;
-    Ok(perceptual_hash(&img).map(|(hash, _)| hash))
+    Ok(perceptual_hash(&img).map(|visual| visual.phash))
 }
 
 /// The signature of a video: its picture's duration and its frames at 5%, 15%, ... 85% of it.

@@ -10,7 +10,8 @@ use crate::avhash::{
     VideoSignature,
 };
 use crate::catalog::{
-    cataloged_spelling, display_root, library_path, Catalog, FileRecord, MediaMeta, Stamp,
+    cataloged_spelling, display_root, library_path, Catalog, FileRecord, HashVersion, MediaMeta,
+    Stamp,
 };
 use crate::dates::quicktime_creation;
 use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, Tools};
@@ -179,7 +180,7 @@ pub fn scan_with(
     // `start` may be part of a library; `root` is the library's root, and paths are relative to
     // it. `part` is the scanned folder relative to `root`, empty for the whole library.
     let (library_id, root) = match catalog.containing_library(&start)? {
-        Some((id, root)) => (id, PathBuf::from(root)),
+        Some(library) => (library.id, PathBuf::from(library.root)),
         None => (catalog.library_id(start_str)?, start.clone()),
     };
     outside(&root)?;
@@ -423,7 +424,12 @@ pub fn scan_with(
     let heic_ok = ffmpeg_version.is_some_and(ffmpeg_handles_heic);
     let mut warned_heic = false;
     let mut to_decode: Vec<(String, MediaType, String)> = vec![];
-    for (rel, media_type, stored) in catalog.hash_versions(library_id)? {
+    for HashVersion {
+        path: rel,
+        media_type,
+        version: stored,
+    } in catalog.hash_versions(library_id)?
+    {
         if !is_within(&rel, &part) {
             continue;
         }
@@ -1134,8 +1140,8 @@ mod tests {
             .hash_versions(id)
             .unwrap()
             .into_iter()
-            .filter(|(_, _, version)| version.is_none())
-            .map(|(path, _, _)| path)
+            .filter(|file| file.version.is_none())
+            .map(|file| file.path)
             .collect();
         // Without tools, the video has no decoder either.
         assert_eq!(unhashed, ["clip.mp4", "raw.nef"]);

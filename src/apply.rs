@@ -1157,7 +1157,7 @@ fn update_catalog(
         } => {
             // A row at the target is stale: the file there was gone, or the move would not
             // have happened.
-            catalog.rename_row(row.library_id, &row.path, row.library_id, new_path, true)?;
+            catalog.rename_row(row, &row.with_path(new_path), true)?;
         }
         MoveKind::Organize {
             row,
@@ -1658,13 +1658,8 @@ impl Undo {
                 row,
                 new_path: Some(new_path),
             } => {
-                self.catalog.rename_row(
-                    row.library_id,
-                    new_path,
-                    row.library_id,
-                    &row.path,
-                    false,
-                )?;
+                self.catalog
+                    .rename_row(&row.with_path(new_path), row, false)?;
             }
             MoveKind::Organize {
                 row,

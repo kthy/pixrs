@@ -163,13 +163,17 @@ fn main() {
         .hashed_av()
         .unwrap_or_else(|e| die(&e.to_string()))
         .into_iter()
-        .filter(|v| v.frames.is_some())
+        .filter(|v| v.signature.frames().is_some())
         .collect();
     videos.sort_by(|a, b| (&a.file.root, &a.file.path).cmp(&(&b.file.root, &b.file.path)));
     println!("{} videos with signatures", videos.len());
     let with_detail: Vec<usize> = videos
         .iter()
-        .map(|v| v.frames.as_ref().map_or(0, |f| f.iter().flatten().count()))
+        .map(|v| {
+            v.signature
+                .frames()
+                .map_or(0, |f| f.iter().flatten().count())
+        })
         .collect();
     println!(
         "Frames with detail per video: {:?} (of {})",
@@ -190,10 +194,11 @@ fn main() {
                 continue;
             }
             if let Ok(sig) = video_signature(ffmpeg, ffprobe, &copy) {
-                let original = video.frames.as_deref().unwrap_or_default();
+                let original = video.signature.frames().unwrap_or_default();
                 let (matching, both) = frame_counts(original, &sig.frames, DEFAULT_THRESHOLD);
-                let matched = video_durations_match(video.duration_ms, sig.duration_ms)
-                    && frames_match(original, &sig.frames, DEFAULT_THRESHOLD);
+                let matched =
+                    video_durations_match(video.signature.duration_ms(), sig.duration_ms)
+                        && frames_match(original, &sig.frames, DEFAULT_THRESHOLD);
                 results.push((matching, both, matched));
             }
             let _ = fs::remove_file(&copy);
@@ -218,14 +223,14 @@ fn main() {
     for (i, a) in videos.iter().enumerate() {
         for b in &videos[i + 1..] {
             let (fa, fb) = (
-                a.frames.as_deref().unwrap_or_default(),
-                b.frames.as_deref().unwrap_or_default(),
+                a.signature.frames().unwrap_or_default(),
+                b.signature.frames().unwrap_or_default(),
             );
             let matched = frames_match(fa, fb, DEFAULT_THRESHOLD);
             all_pairs += 1;
             any_matched += usize::from(matched);
-            if !video_durations_match(a.duration_ms, b.duration_ms)
-                || !aspects_match(aspect(a.width, a.height), aspect(b.width, b.height))
+            if !video_durations_match(a.signature.duration_ms(), b.signature.duration_ms())
+                || !aspects_match(aspect(a.dimensions), aspect(b.dimensions))
             {
                 continue;
             }
