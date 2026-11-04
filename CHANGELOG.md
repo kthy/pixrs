@@ -79,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside a library also when spelled in another letter case on a file system that ignores it
   (WSL's `/mnt/c`, SMB, exFAT): `--cache /mnt/c/photos/thumbs` no longer passes for the library
   `/mnt/c/Photos` and writes thumbnails into it.
+- `pixrs apply` refused a quarantine plan whose kept copy is in a library none of the moved
+  copies are in ("has a kept copy that is not in a library of the plan"), as with originals in
+  one library and their copies in another. Plans now list the kept copies' libraries too.
 - `pixrs scan` reported files it failed to hash as hashed in "Hashed N files".
 - The viewer showed an empty page for a month like `/dates/2024-+5`; it is now not found.
 - A move that fails halfway in `pixrs apply` names the file and its target in the error, and
