@@ -29,7 +29,7 @@ use time::OffsetDateTime;
 
 /// Version of the plan and journal formats. Before 1.0, plans and journals of another version
 /// are refused, not converted: plan again.
-pub(crate) const PLAN_VERSION: u32 = 3;
+pub(crate) const PLAN_VERSION: u32 = 4;
 
 /// Extensions of files that belong to a media file with the same name, lowercase: edits
 /// (`xmp`), iPhone edit lists (`aae`), video thumbnails (`thm`), subtitles (`srt`) and Google
@@ -409,6 +409,23 @@ fn listing<'a>(cache: &'a mut Listings, dir: &Path) -> Option<&'a [String]> {
 /// Folder listings read so far.
 type Listings = HashMap<PathBuf, Option<Vec<String>>>;
 
+/// Whether a target name can be had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Free,
+    Taken,
+    /// Its folder cannot be read, so anything could be there.
+    Unreadable,
+}
+
+/// A target folder, as `Claims::folder` finds it.
+enum Folder {
+    /// The folder, spelled as it is on disk or first in the plan.
+    At(PathBuf),
+    /// A symbolic link on the way, which files are never moved through.
+    ThroughLink(PathBuf),
+}
+
 /// Targets taken so far: by the plan, or by files on disk. Compared ignoring letter case and
 /// Unicode normalization on every OS, since Windows and macOS file systems ignore case and macOS
 /// ignores normalization, so a plan comes out the same everywhere.
@@ -427,12 +444,13 @@ impl Claims {
         folded(&path.to_string_lossy())
     }
 
-    /// `base` joined with `folders`, each spelled as it already is on disk or in the plan. If a
-    /// folder on the way is a symbolic link (in any letter case), `Err` with the link: files are
-    /// never moved through links, which could lead anywhere.
-    fn folder(&mut self, base: &Path, folders: &[String]) -> Result<PathBuf, PathBuf> {
+    /// `base` joined with `folders`, each spelled as it already is on disk or in the plan, or
+    /// the symbolic link on the way if a folder is one (in any letter case): files are never
+    /// moved through links, which could lead anywhere.
+    fn folder(&mut self, base: &Path, folders: &[impl AsRef<str>]) -> Folder {
         let mut dir = base.to_path_buf();
         for name in folders {
+            let name = name.as_ref();
             let wanted = dir.join(name);
             let key = Self::key(&wanted);
             if let Some(known) = self.folders.get(&key) {
@@ -445,7 +463,7 @@ impl Claims {
             for same_name in names.iter().filter(|n| folded(n) == folded_name) {
                 let path = dir.join(same_name);
                 match fs::symlink_metadata(&path).map(|m| m.file_type()) {
-                    Ok(kind) if kind.is_symlink() => return Err(path),
+                    Ok(kind) if kind.is_symlink() => return Folder::ThroughLink(path),
                     Ok(kind) if kind.is_dir() && existing.is_none() => existing = Some(path),
                     _ => {}
                 }
@@ -453,7 +471,7 @@ impl Claims {
             dir = existing.unwrap_or(wanted);
             self.folders.insert(key, dir.clone());
         }
-        Ok(dir)
+        Folder::At(dir)
     }
 
     /// Whether `target` is free for the file now at `own`. Anything on disk with that name in
@@ -461,30 +479,36 @@ impl Claims {
     /// changes letter case or normalization is allowed unless another file has exactly the new
     /// name. A folder that cannot be read might hold anything: not free.
     fn is_free(&mut self, target: &Path, own: &Path) -> bool {
-        self.check(target, own) == Some(true)
+        self.check(target, own) == Target::Free
     }
 
-    /// `is_free`, with `None` for a folder that cannot be read.
-    fn check(&mut self, target: &Path, own: &Path) -> Option<bool> {
+    /// `is_free`, telling a taken target from one in a folder that cannot be read.
+    fn check(&mut self, target: &Path, own: &Path) -> Target {
         if self.claimed.contains(&Self::key(target)) {
-            return Some(false);
+            return Target::Taken;
         }
         if target == own {
-            return Some(true);
+            return Target::Free;
         }
         let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
-            return Some(false);
+            return Target::Taken;
         };
         let folded_name = folded(&name.to_string_lossy());
         let own_name = (own.parent() == Some(dir))
             .then(|| own.file_name())
             .flatten()
             .and_then(|n| n.to_str());
-        listing(&mut self.on_disk, dir).map(|names| {
-            !names
-                .iter()
-                .any(|n| folded(n) == folded_name && Some(n.as_str()) != own_name)
-        })
+        match listing(&mut self.on_disk, dir) {
+            None => Target::Unreadable,
+            Some(names)
+                if names
+                    .iter()
+                    .any(|n| folded(n) == folded_name && Some(n.as_str()) != own_name) =>
+            {
+                Target::Taken
+            }
+            Some(_) => Target::Free,
+        }
     }
 
     fn claim(&mut self, target: &Path) {
@@ -496,7 +520,12 @@ impl Claims {
     fn claim_free(&mut self, target: &Path, own: &Path, suffix: &str) -> Option<PathBuf> {
         let mut candidate = target.to_path_buf();
         let mut n = 2;
-        while !self.check(&candidate, own)? {
+        loop {
+            match self.check(&candidate, own) {
+                Target::Free => break,
+                Target::Taken => {}
+                Target::Unreadable => return None,
+            }
             candidate = with_suffix(target, &suffix.replace("{n}", &n.to_string()));
             n += 1;
         }
@@ -566,7 +595,7 @@ struct Sidecar {
 
 /// The file name without its last extension.
 fn stem(name: &str) -> &str {
-    name.rsplit_once('.').map_or(name, |(s, _)| s)
+    split_name(name).0
 }
 
 /// The sidecar files of a media file `dir/name`: files in `dir` named `stem.<sidecar ext>` or
@@ -575,7 +604,8 @@ fn sidecars(dir: &Path, name: &str, new_name: &str, cache: &mut Listings) -> Vec
     let (old_stem, new_stem) = (stem(name), stem(new_name));
     let mut found = vec![];
     for candidate in listing(cache, dir).unwrap_or_default() {
-        let Some((base, ext)) = candidate.rsplit_once('.') else {
+        let (base, ext) = split_name(candidate);
+        let Some(ext) = ext.strip_prefix('.') else {
             continue;
         };
         let ext = ext.to_ascii_lowercase();
@@ -650,7 +680,6 @@ fn add_sidecars(moves: &mut Vec<Move>, claims: &mut Claims, notes: &mut PlanNote
                 ));
                 continue;
             }
-            claims.claim(&target);
             let Ok(stamp) = fs::metadata(&source).and_then(|m| crate::scan::stamp(&m)) else {
                 continue;
             };
@@ -659,6 +688,7 @@ fn add_sidecars(moves: &mut Vec<Move>, claims: &mut Claims, notes: &mut PlanNote
             if source == target {
                 continue;
             }
+            claims.claim(&target);
             sidecar_moves.push(Move {
                 from: source,
                 to: target,
@@ -677,13 +707,36 @@ struct Wanted {
     file: FileRecord,
 }
 
-/// When a file was taken, from its metadata or else from its name, and which it was. Dates
-/// before 1980 or in the future count as missing unless dates are trusted.
-fn date_taken(
-    file: &FileRecord,
-    name: &str,
-    opts: &OrganizeOptions,
-) -> (Option<Taken>, &'static str) {
+/// Where a file's date comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DateSource {
+    Metadata(Taken),
+    FileName(Taken),
+    None,
+}
+
+impl DateSource {
+    const fn taken(self) -> Option<Taken> {
+        match self {
+            Self::Metadata(taken) | Self::FileName(taken) => Some(taken),
+            Self::None => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DateSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Metadata(_) => "date from metadata",
+            Self::FileName(_) => "date from the file name",
+            Self::None => "no date",
+        })
+    }
+}
+
+/// When a file was taken, from its metadata or else from its name. Dates before 1980 or in the
+/// future count as missing unless dates are trusted.
+fn date_taken(file: &FileRecord, name: &str, opts: &OrganizeOptions) -> DateSource {
     let plausible = |t: &Taken| opts.trust_dates || t.is_plausible(opts.now);
     let from_meta = file.meta.taken();
     if let (Some(raw), Some(false)) = (&file.meta.taken_at, from_meta.map(|t| plausible(&t))) {
@@ -693,12 +746,12 @@ fn date_taken(
             printable(raw)
         );
     }
-    match from_meta.filter(plausible) {
-        Some(taken) => (Some(taken), "date from metadata"),
-        None => match from_name(name).filter(plausible) {
-            Some(taken) => (Some(taken), "date from the file name"),
-            None => (None, "no date"),
-        },
+    if let Some(taken) = from_meta.filter(plausible) {
+        DateSource::Metadata(taken)
+    } else if let Some(taken) = from_name(name).filter(plausible) {
+        DateSource::FileName(taken)
+    } else {
+        DateSource::None
     }
 }
 
@@ -718,8 +771,10 @@ fn wanted_targets(
     for file in files {
         let source = library_path(root, &file.path);
         let name = file.path.rsplit('/').next().unwrap_or(&file.path);
-        let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
-        let (taken, date_from) = date_taken(&file, name, opts);
+        let (stem, ext) = split_name(name);
+        let ext = ext.strip_prefix('.').unwrap_or(ext);
+        let date_from = date_taken(&file, name, opts);
+        let taken = date_from.taken();
         if taken.is_none() {
             notes.undated += 1;
         }
@@ -737,8 +792,8 @@ fn wanted_targets(
             file: file_name,
         } = opts.template.render(&facts, opts.undated);
         let target = match claims.folder(base, &folders) {
-            Ok(folder) => folder.join(file_name),
-            Err(link) => {
+            Folder::At(folder) => folder.join(file_name),
+            Folder::ThroughLink(link) => {
                 debug!(
                     "{} stays: {} is a symbolic link",
                     printable(&file.path),
@@ -761,9 +816,7 @@ fn wanted_targets(
         });
     }
     links.warn(notes);
-    wanted.sort_by(|a, b| {
-        (Claims::key(&a.target), &a.source).cmp(&(Claims::key(&b.target), &b.source))
-    });
+    wanted.sort_by_cached_key(|w| (Claims::key(&w.target), w.source.clone()));
     wanted
 }
 
@@ -923,7 +976,7 @@ impl Quarantine<'_> {
         let kept_path = library_path(kept_root, &kept.path);
         debug!(
             "{} group of {} files keeps {}",
-            group.tier.as_str(),
+            group.tier().as_str(),
             group.files.len(),
             shown(&kept_path)
         );
@@ -973,13 +1026,13 @@ impl Quarantine<'_> {
             ));
             return Ok(());
         }
-        let mut folders: Vec<String> = std::iter::once(folder.clone())
-            .chain(file.path.split('/').map(String::from))
+        let mut folders: Vec<&str> = std::iter::once(folder.as_str())
+            .chain(file.path.split('/'))
             .collect();
         let name = folders.pop().unwrap_or_default();
         let target = match self.claims.folder(self.dir, &folders) {
-            Ok(folder) => folder.join(name),
-            Err(link) => {
+            Folder::At(folder) => folder.join(name),
+            Folder::ThroughLink(link) => {
                 debug!(
                     "{} stays: {} is a symbolic link",
                     shown(&source),
