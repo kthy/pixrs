@@ -12,6 +12,7 @@ use crate::avhash::{
 use crate::dates::{from_taken_at, Taken};
 use crate::error::{AtPath, Error};
 use crate::imagehash::{ImageHashes, Visual};
+use crate::library::{LibraryId, Root};
 use crate::media::{Dimensions, MediaType};
 use crate::names::folded;
 use directories::ProjectDirs;
@@ -88,7 +89,7 @@ CREATE INDEX files_sha256 ON files (sha256);
 ";
 
 /// What a scan compares to decide whether a file changed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Stamp {
     pub size: u64,
     /// Modification time in nanoseconds since the Unix epoch.
@@ -140,11 +141,10 @@ pub struct FileRecord {
 /// A hashed file, with the root of the library it is in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HashedFile {
-    pub library_id: i64,
-    pub root: String,
+    pub library_id: LibraryId,
+    pub root: Root,
     pub path: String,
-    pub size: u64,
-    pub mtime_ns: i64,
+    pub stamp: Stamp,
     /// `None` if the file has no content hash: its size is not shared with another file.
     pub sha256: Option<String>,
 }
@@ -213,7 +213,7 @@ impl Catalog {
     }
 
     /// The ID of the library at `root`, registering it if it is new.
-    pub fn library_id(&self, root: &str) -> rusqlite::Result<i64> {
+    pub fn library_id(&self, root: &str) -> rusqlite::Result<LibraryId> {
         self.conn.execute(
             "INSERT INTO libraries (root) VALUES (?1) ON CONFLICT (root) DO NOTHING",
             [root],
@@ -226,20 +226,15 @@ impl Catalog {
 
     /// The outermost library whose root is `path` or contains it, if any.
     pub fn containing_library(&self, path: &Path) -> rusqlite::Result<Option<LibraryRoot>> {
-        let mut outermost: Option<LibraryRoot> = None;
-        for library in self.roots(None)? {
-            let shorter = outermost
-                .as_ref()
-                .is_none_or(|o| library.root.len() < o.root.len());
-            if path.starts_with(&library.root) && shorter {
-                outermost = Some(library);
-            }
-        }
-        Ok(outermost)
+        Ok(self
+            .roots(None)?
+            .into_iter()
+            .filter(|library| path.starts_with(&library.root))
+            .min_by_key(|library| library.root.len()))
     }
 
     /// Every library but `except`, ordered by root.
-    fn roots(&self, except: Option<i64>) -> rusqlite::Result<Vec<LibraryRoot>> {
+    fn roots(&self, except: Option<LibraryId>) -> rusqlite::Result<Vec<LibraryRoot>> {
         let mut stmt = self
             .conn
             .prepare("SELECT id, root FROM libraries WHERE id IS NOT ?1 ORDER BY root")?;
@@ -257,7 +252,7 @@ impl Catalog {
     /// and the library is dropped. Where both have a row for a file with the same size and mtime,
     /// hashes the outer row lacks are taken from the inner one; otherwise the outer row stays.
     /// Returns the roots of the folded libraries.
-    pub fn fold_nested(&self, library_id: i64, root: &Path) -> rusqlite::Result<Vec<String>> {
+    pub fn fold_nested(&self, library_id: LibraryId, root: &Path) -> rusqlite::Result<Vec<Root>> {
         let inner = self.nested(library_id, root)?;
         if inner.is_empty() {
             return Ok(vec![]);
@@ -277,19 +272,18 @@ impl Catalog {
     /// and their hashes. If `new_root` is another library's root or inside it, the rows move
     /// into that library instead, as `fold_nested` moves them; libraries inside `new_root` are
     /// folded in.
-    pub fn relocate(&self, library_id: i64, new_root: &str) -> rusqlite::Result<Relocated> {
+    pub fn relocate(&self, library_id: LibraryId, new_root: &str) -> rusqlite::Result<Relocated> {
         let new = Path::new(new_root);
         let tx = self.conn.unchecked_transaction()?;
         // The outermost other library that `new_root` is in, with the path to `new_root` in it.
-        let mut outer: Option<Nested> = None;
-        for library in self.roots(Some(library_id))? {
-            let shorter = outer
-                .as_ref()
-                .is_none_or(|o| library.root.len() < o.library.root.len());
-            if let Some(prefix) = path_below(Path::new(&library.root), new).filter(|_| shorter) {
-                outer = Some(Nested { library, prefix });
-            }
-        }
+        let outer = self
+            .roots(Some(library_id))?
+            .into_iter()
+            .filter_map(|library| {
+                let prefix = path_below(library.root.as_path(), new)?;
+                Some(Nested { library, prefix })
+            })
+            .min_by_key(|nested| nested.library.root.len());
         let library = if let Some(Nested { library, prefix }) = outer {
             self.merge_library(library_id, library.id, &prefix)?;
             library
@@ -300,10 +294,10 @@ impl Catalog {
             )?;
             LibraryRoot {
                 id: library_id,
-                root: String::from(new_root),
+                root: Root::from(new_root),
             }
         };
-        let inner = self.nested(library.id, Path::new(&library.root))?;
+        let inner = self.nested(library.id, library.root.as_path())?;
         for nested in &inner {
             self.merge_library(nested.library.id, library.id, &nested.prefix)?;
         }
@@ -318,12 +312,12 @@ impl Catalog {
     }
 
     /// Every library other than `library_id` inside `root`.
-    fn nested(&self, library_id: i64, root: &Path) -> rusqlite::Result<Vec<Nested>> {
+    fn nested(&self, library_id: LibraryId, root: &Path) -> rusqlite::Result<Vec<Nested>> {
         Ok(self
             .roots(Some(library_id))?
             .into_iter()
             .filter_map(|library| {
-                let prefix = path_below(root, Path::new(&library.root))?;
+                let prefix = path_below(root, library.root.as_path())?;
                 Some(Nested { library, prefix })
             })
             .collect())
@@ -332,7 +326,12 @@ impl Catalog {
     /// Move the rows of library `from` into library `into`, with `prefix` in front of their
     /// paths, and drop `from`. Where `into` has a row for a file with the same size and mtime,
     /// it takes the hashes it lacks; otherwise it stays. Run it in a transaction.
-    fn merge_library(&self, from: i64, into: i64, prefix: &str) -> rusqlite::Result<()> {
+    fn merge_library(
+        &self,
+        from: LibraryId,
+        into: LibraryId,
+        prefix: &str,
+    ) -> rusqlite::Result<()> {
         let hash_columns = HASH_COLUMNS
             .iter()
             .map(|c| format!("{c} = CASE WHEN o.hash_version IS NULL THEN i.{c} ELSE o.{c} END"))
@@ -362,7 +361,7 @@ impl Catalog {
     }
 
     /// The ID of the library at `root`, if it has been scanned.
-    pub fn find_library(&self, root: &str) -> rusqlite::Result<Option<i64>> {
+    pub fn find_library(&self, root: &str) -> rusqlite::Result<Option<LibraryId>> {
         self.conn
             .query_row("SELECT id FROM libraries WHERE root = ?1", [root], |row| {
                 row.get(0)
@@ -371,7 +370,7 @@ impl Catalog {
     }
 
     /// Record that the library was just scanned.
-    pub fn mark_scanned(&self, library_id: i64) -> rusqlite::Result<()> {
+    pub fn mark_scanned(&self, library_id: LibraryId) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE libraries SET scanned_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
              WHERE id = ?1",
@@ -381,7 +380,7 @@ impl Catalog {
     }
 
     /// Size and mtime of every cataloged file in the library, keyed by relative path.
-    pub fn stamps(&self, library_id: i64) -> rusqlite::Result<HashMap<String, Stamp>> {
+    pub fn stamps(&self, library_id: LibraryId) -> rusqlite::Result<HashMap<String, Stamp>> {
         let mut stmt = self
             .conn
             .prepare("SELECT path, size, mtime_ns FROM files WHERE library_id = ?1")?;
@@ -398,7 +397,7 @@ impl Catalog {
     }
 
     /// Insert or replace a file. A replaced file loses its image hashes until it is hashed again.
-    pub fn upsert(&self, library_id: i64, file: &FileRecord) -> rusqlite::Result<()> {
+    pub fn upsert(&self, library_id: LibraryId, file: &FileRecord) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO files (library_id, path, size, mtime_ns, media_type, sha256, taken_at,
                                 camera_make, camera_model, width, height)
@@ -440,7 +439,7 @@ impl Catalog {
     /// Give a file's row `new`, the name the file has on disk, which is its cataloged name `old`
     /// in another Unicode normalization. Everything else in the row stays. There must be no row
     /// at `new`.
-    pub fn respell(&self, library_id: i64, old: &str, new: &str) -> rusqlite::Result<()> {
+    pub fn respell(&self, library_id: LibraryId, old: &str, new: &str) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE files SET path = ?3 WHERE library_id = ?1 AND path = ?2",
             params![library_id, old, new],
@@ -449,7 +448,12 @@ impl Catalog {
     }
 
     /// Set the hash of a file.
-    pub fn set_sha256(&self, library_id: i64, path: &str, sha256: &str) -> rusqlite::Result<()> {
+    pub fn set_sha256(
+        &self,
+        library_id: LibraryId,
+        path: &str,
+        sha256: &str,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE files SET sha256 = ?3 WHERE library_id = ?1 AND path = ?2",
             params![library_id, path, sha256],
@@ -461,7 +465,7 @@ impl Catalog {
     /// another cataloged file in any library, ordered by path.
     pub fn unhashed_with_shared_size(
         &self,
-        library_id: i64,
+        library_id: LibraryId,
     ) -> rusqlite::Result<Vec<UnhashedFile>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, size FROM files
@@ -481,7 +485,10 @@ impl Catalog {
     /// Number of files in the given libraries (all if empty) that share their size with another
     /// file but have no hash yet, because their library has not been scanned since the size
     /// became shared.
-    pub fn count_unhashed_with_shared_size(&self, libraries: &[i64]) -> rusqlite::Result<usize> {
+    pub fn count_unhashed_with_shared_size(
+        &self,
+        libraries: &[LibraryId],
+    ) -> rusqlite::Result<usize> {
         self.conn.query_row(
             &format!(
                 "SELECT count(*) FROM files
@@ -510,7 +517,7 @@ impl Catalog {
     }
 
     /// Remove a file from the catalog.
-    pub fn remove(&self, library_id: i64, path: &str) -> rusqlite::Result<()> {
+    pub fn remove(&self, library_id: LibraryId, path: &str) -> rusqlite::Result<()> {
         self.conn.execute(
             "DELETE FROM files WHERE library_id = ?1 AND path = ?2",
             params![library_id, path],
@@ -519,7 +526,7 @@ impl Catalog {
     }
 
     /// Every cataloged file in the library, ordered by path.
-    pub fn files(&self, library_id: i64) -> rusqlite::Result<Vec<FileRecord>> {
+    pub fn files(&self, library_id: LibraryId) -> rusqlite::Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {FILE_COLUMNS} FROM files WHERE library_id = ?1 ORDER BY path"
         ))?;
@@ -529,7 +536,7 @@ impl Catalog {
 
     /// Every media file in the library with its type and the versions the hash pass decoded
     /// it with, if it has, ordered by path.
-    pub fn hash_versions(&self, library_id: i64) -> rusqlite::Result<Vec<HashVersion>> {
+    pub fn hash_versions(&self, library_id: LibraryId) -> rusqlite::Result<Vec<HashVersion>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, media_type, hash_version FROM files WHERE library_id = ?1
              ORDER BY path",
@@ -547,7 +554,7 @@ impl Catalog {
     /// Number of media files in the given libraries (all if empty) the hash pass has not
     /// decoded: not scanned since they changed, or no decoder for them (RAW, HEIC without
     /// `ffmpeg`, video without `ffmpeg`, audio without `fpcalc`).
-    pub fn count_unhashed(&self, libraries: &[i64]) -> rusqlite::Result<usize> {
+    pub fn count_unhashed(&self, libraries: &[LibraryId]) -> rusqlite::Result<usize> {
         self.conn.query_row(
             &format!(
                 "SELECT count(*) FROM files WHERE {} AND hash_version IS NULL",
@@ -562,7 +569,7 @@ impl Catalog {
     /// decoding failed.
     pub fn set_video_signature(
         &self,
-        library_id: i64,
+        library_id: LibraryId,
         path: &str,
         version: &str,
         signature: Option<&VideoSignature>,
@@ -585,7 +592,7 @@ impl Catalog {
     /// that failed.
     pub fn set_audio_fingerprint(
         &self,
-        library_id: i64,
+        library_id: LibraryId,
         path: &str,
         version: &str,
         fingerprint: Option<&AudioFingerprint>,
@@ -649,7 +656,7 @@ impl Catalog {
     /// dimensions, or without if decoding failed.
     pub fn set_image_hashes(
         &self,
-        library_id: i64,
+        library_id: LibraryId,
         path: &str,
         version: &str,
         hashes: Option<&ImageHashes>,
@@ -712,7 +719,7 @@ impl Catalog {
     }
 
     /// Whether the catalog has a row for the file.
-    pub fn has_row(&self, library_id: i64, path: &str) -> rusqlite::Result<bool> {
+    pub fn has_row(&self, library_id: LibraryId, path: &str) -> rusqlite::Result<bool> {
         self.conn
             .query_row(
                 "SELECT 1 FROM files WHERE library_id = ?1 AND path = ?2",
@@ -754,7 +761,11 @@ impl Catalog {
     }
 
     /// Remove a file's row and return everything in it, so `put_row` can restore it.
-    pub fn take_row(&self, library_id: i64, path: &str) -> rusqlite::Result<Option<CatalogRow>> {
+    pub fn take_row(
+        &self,
+        library_id: LibraryId,
+        path: &str,
+    ) -> rusqlite::Result<Option<CatalogRow>> {
         let row = self
             .conn
             .query_row(
@@ -827,7 +838,7 @@ impl Catalog {
     }
 
     /// The root of a library, if it is in the catalog.
-    pub fn library_root(&self, library_id: i64) -> rusqlite::Result<Option<String>> {
+    pub fn library_root(&self, library_id: LibraryId) -> rusqlite::Result<Option<Root>> {
         self.conn
             .query_row(
                 "SELECT root FROM libraries WHERE id = ?1",
@@ -838,7 +849,7 @@ impl Catalog {
     }
 
     /// One cataloged file, if it is in the catalog.
-    pub fn file(&self, library_id: i64, path: &str) -> rusqlite::Result<Option<FileRecord>> {
+    pub fn file(&self, library_id: LibraryId, path: &str) -> rusqlite::Result<Option<FileRecord>> {
         self.conn
             .query_row(
                 &format!("SELECT {FILE_COLUMNS} FROM files WHERE library_id = ?1 AND path = ?2"),
@@ -852,7 +863,7 @@ impl Catalog {
     /// number of files below each, ordered by name.
     pub fn subfolders(
         &self,
-        library_id: i64,
+        library_id: LibraryId,
         dir: &str,
         media_type: Option<MediaType>,
     ) -> rusqlite::Result<Vec<Tally>> {
@@ -871,7 +882,7 @@ impl Catalog {
     /// The files directly inside the folder `dir` of a library, ordered by path.
     pub fn folder_files(
         &self,
-        library_id: i64,
+        library_id: LibraryId,
         dir: &str,
         media_type: Option<MediaType>,
         page: Page,
@@ -888,7 +899,7 @@ impl Catalog {
     /// The files before and after `path` among the files in its folder, in folder order.
     pub fn folder_neighbors(
         &self,
-        library_id: i64,
+        library_id: LibraryId,
         path: &str,
         media_type: Option<MediaType>,
     ) -> rusqlite::Result<Neighbors> {
@@ -951,7 +962,7 @@ impl Catalog {
     }
 
     /// When a file was taken, or its mtime in local time, as `YYYY-MM-DDTHH:MM:SS`.
-    pub fn date(&self, library_id: i64, path: &str) -> rusqlite::Result<Option<String>> {
+    pub fn date(&self, library_id: LibraryId, path: &str) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row(
                 &format!("SELECT {DATE_KEY} FROM files WHERE library_id = ?1 AND path = ?2"),
@@ -965,7 +976,7 @@ impl Catalog {
     pub fn date_neighbors(
         &self,
         filter: &Filter,
-        library_id: i64,
+        library_id: LibraryId,
         path: &str,
     ) -> rusqlite::Result<Neighbors> {
         let Some(date) = self.date(library_id, path)? else {
@@ -1033,7 +1044,7 @@ pub struct HashedImage {
 /// Everything in a file's catalog row, kept in a journal while the file is outside its library.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CatalogRow {
-    pub library_id: i64,
+    pub library_id: LibraryId,
     pub file: FileRecord,
     pub hash_version: Option<String>,
     pub pixel_hash: Option<String>,
@@ -1100,7 +1111,7 @@ impl AvSignature {
 /// A catalog row's key: a library ID and a path in that library, with `/` separators.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileRef {
-    pub library_id: i64,
+    pub library_id: LibraryId,
     pub path: String,
 }
 
@@ -1140,9 +1151,9 @@ fn tally(row: &rusqlite::Row) -> rusqlite::Result<Tally> {
 /// A library's ID and root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LibraryRoot {
-    pub id: i64,
+    pub id: LibraryId,
     /// Canonical root path, as stored.
-    pub root: String,
+    pub root: Root,
 }
 
 /// A library inside another library's root.
@@ -1157,9 +1168,9 @@ struct Nested {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Relocated {
     /// The root of the library the rows are in now: the new root, or the library it is inside.
-    pub root: String,
+    pub root: Root,
     /// The roots of the libraries inside it that were folded in.
-    pub folded: Vec<String>,
+    pub folded: Vec<Root>,
 }
 
 /// A cataloged file with no content hash yet.
@@ -1180,9 +1191,9 @@ pub struct HashVersion {
 /// A scanned library.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Library {
-    pub id: i64,
+    pub id: LibraryId,
     /// Canonical root path, as stored.
-    pub root: String,
+    pub root: Root,
     /// When the last scan finished, RFC 3339 in UTC.
     pub scanned_at: Option<String>,
     pub files: usize,
@@ -1191,7 +1202,7 @@ pub struct Library {
 /// A file with the library it is in and its date (see `Catalog::months`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatedFile {
-    pub library_id: i64,
+    pub library_id: LibraryId,
     pub file: FileRecord,
     pub date: String,
 }
@@ -1200,7 +1211,7 @@ pub struct DatedFile {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
     /// Only files in these libraries; all if empty.
-    pub libraries: Vec<i64>,
+    pub libraries: Vec<LibraryId>,
     pub media_type: Option<MediaType>,
 }
 
@@ -1218,7 +1229,7 @@ impl Filter {
 }
 
 /// The SQL condition selecting files in `libraries`, all if empty, with one `?` per library.
-fn in_libraries(libraries: &[i64]) -> String {
+fn in_libraries(libraries: &[LibraryId]) -> String {
     if libraries.is_empty() {
         String::from("1")
     } else {
@@ -1342,7 +1353,7 @@ pub fn cataloged_spelling(libraries: &[Library], path: &Path) -> PathBuf {
         return path.to_path_buf();
     }
     for library in libraries {
-        let root = Path::new(&library.root);
+        let root = library.root.as_path();
         if let Some(prefix) = path_below(root, path) {
             let mut spelled = root.to_path_buf();
             spelled.extend(prefix.split('/').filter(|part| !part.is_empty()));
@@ -1359,10 +1370,10 @@ pub fn cataloged_spelling(libraries: &[Library], path: &Path) -> PathBuf {
 pub fn one_row_per_file<'a>(files: impl IntoIterator<Item = &'a HashedFile>) -> Option<Vec<bool>> {
     let files: Vec<&HashedFile> = files.into_iter().collect();
     let mut best: HashMap<PathBuf, &HashedFile> = HashMap::new();
-    let mut rows: HashSet<(i64, &str)> = HashSet::new();
+    let mut rows: HashSet<(LibraryId, &str)> = HashSet::new();
     for &f in &files {
         rows.insert((f.library_id, &f.path));
-        best.entry(library_path(Path::new(&f.root), &f.path))
+        best.entry(library_path(f.root.as_path(), &f.path))
             .and_modify(|b| {
                 if f.root.len() < b.root.len() {
                     *b = f;
@@ -1370,7 +1381,7 @@ pub fn one_row_per_file<'a>(files: impl IntoIterator<Item = &'a HashedFile>) -> 
             })
             .or_insert(f);
     }
-    let keep: HashSet<(i64, &str)> = best
+    let keep: HashSet<(LibraryId, &str)> = best
         .into_values()
         .map(|f| (f.library_id, f.path.as_str()))
         .collect();
@@ -1458,7 +1469,7 @@ fn dir_prefix_len(dir: &str) -> usize {
 
 /// The condition selecting a library's files below the folder `dir`, with its parameters.
 /// Everything below `a/b` sorts between `a/b/` and `a/b0`, so this is a range on the primary key.
-fn below(library_id: i64, dir: &str, media_type: Option<MediaType>) -> (String, Vec<Value>) {
+fn below(library_id: LibraryId, dir: &str, media_type: Option<MediaType>) -> (String, Vec<Value>) {
     let mut cond = String::from("library_id = ?");
     let mut values = vec![Value::from(library_id)];
     if !dir.is_empty() {
@@ -1476,7 +1487,11 @@ fn below(library_id: i64, dir: &str, media_type: Option<MediaType>) -> (String, 
 }
 
 /// The condition selecting a library's files directly inside the folder `dir`.
-fn in_folder(library_id: i64, dir: &str, media_type: Option<MediaType>) -> (String, Vec<Value>) {
+fn in_folder(
+    library_id: LibraryId,
+    dir: &str,
+    media_type: Option<MediaType>,
+) -> (String, Vec<Value>) {
     let (cond, values) = below(library_id, dir, media_type);
     (
         format!(
@@ -1496,17 +1511,6 @@ pub fn library_path(root: &Path, rel: &str) -> PathBuf {
     path
 }
 
-/// A library root as users know it: without the `\\?\` prefix Windows puts on canonical paths.
-pub fn display_root(root: &str) -> String {
-    if let Some(unc) = root.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{unc}")
-    } else if let Some(local) = root.strip_prefix(r"\\?\") {
-        String::from(local)
-    } else {
-        String::from(root)
-    }
-}
-
 /// Build a `DatedFile` from a row selected as `FILE_COLUMNS, library_id, date`.
 fn dated_file(row: &Row) -> rusqlite::Result<DatedFile> {
     Ok(DatedFile {
@@ -1523,8 +1527,10 @@ fn hashed_file(row: &Row) -> rusqlite::Result<HashedFile> {
         library_id: row.get(0)?,
         root: row.get(1)?,
         path: row.get(2)?,
-        size: row.get(3)?,
-        mtime_ns: row.get(4)?,
+        stamp: Stamp {
+            size: row.get(3)?,
+            mtime_ns: row.get(4)?,
+        },
         sha256: row.get(5)?,
     })
 }
@@ -1610,7 +1616,7 @@ mod tests {
         catalog.upsert(other, &record("y.jpg", 1)).unwrap();
 
         let folded = catalog.fold_nested(outer, Path::new("/lib")).unwrap();
-        assert_eq!(folded, vec![String::from("/lib/sub")]);
+        assert_eq!(folded, vec!["/lib/sub"]);
         assert_eq!(
             catalog.files(outer).unwrap(),
             vec![
@@ -1627,7 +1633,7 @@ mod tests {
             .map(|file| file.version)
             .collect();
         assert_eq!(versions, vec![None, Some(String::from("v1")), None, None]);
-        let roots: Vec<String> = catalog
+        let roots: Vec<Root> = catalog
             .libraries()
             .unwrap()
             .into_iter()
@@ -1650,7 +1656,7 @@ mod tests {
         let found = |path: &str| catalog.containing_library(Path::new(path)).unwrap();
         let lib = Some(LibraryRoot {
             id: outer,
-            root: String::from("/lib"),
+            root: Root::from("/lib"),
         });
         assert_eq!(found("/lib/sub/deeper"), lib);
         assert_eq!(found("/lib"), lib);
@@ -1692,13 +1698,6 @@ mod tests {
             Err(Error::UnknownSchema { version: 0, .. })
         ));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_display_root() {
-        assert_eq!(display_root(r"\\?\C:\Photos"), r"C:\Photos");
-        assert_eq!(display_root(r"\\?\UNC\nas\share"), r"\\nas\share");
-        assert_eq!(display_root("/home/me/Photos"), "/home/me/Photos");
     }
 
     #[test]
@@ -1864,7 +1863,7 @@ mod tests {
     const JUNE_2020_NS: i64 = 1_592_222_400_000_000_000;
 
     /// A catalog with one library of nested folders, and another library with one file.
-    fn browse_fixture() -> (tempfile::TempDir, Catalog, i64, i64) {
+    fn browse_fixture() -> (tempfile::TempDir, Catalog, LibraryId, LibraryId) {
         let dir = tempdir().unwrap();
         let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
         let id = catalog.library_id("/lib").unwrap();
@@ -2100,10 +2099,10 @@ mod tests {
         );
         assert_eq!(catalog.file(other, "x/y/3.jpg").unwrap(), None);
         assert_eq!(
-            catalog.library_root(other).unwrap().as_deref(),
-            Some("/other")
+            catalog.library_root(other).unwrap(),
+            Some(Root::from("/other"))
         );
-        assert_eq!(catalog.library_root(other + 1).unwrap(), None);
+        assert_eq!(catalog.library_root(LibraryId(other.0 + 1)).unwrap(), None);
     }
 
     /// A symbolic link stands in for another spelling of the same folder, which only a
@@ -2140,8 +2139,8 @@ mod tests {
         assert_eq!(path_below(Path::new("/a"), Path::new("/ab")), None);
 
         let libraries = vec![Library {
-            id: 1,
-            root: lib.to_str().unwrap().to_string(),
+            id: LibraryId(1),
+            root: Root::new(&lib).unwrap(),
             scanned_at: None,
             files: 0,
         }];
@@ -2175,7 +2174,7 @@ mod tests {
             )
             .unwrap();
         let folded = catalog.fold_nested(a, &lib).unwrap();
-        assert_eq!(folded, vec![link.to_str().unwrap().to_string()]);
+        assert_eq!(folded, vec![Root::new(&link).unwrap()]);
         assert_eq!(catalog.files(a).unwrap()[0].sha256.as_deref(), Some("xxx"));
         assert_eq!(catalog.libraries().unwrap().len(), 1);
     }
@@ -2183,8 +2182,8 @@ mod tests {
     #[test]
     fn test_one_row_per_file_keeps_the_outer_row_each_time_it_is_given() {
         let file = |library_id: i64, root: &str, path: &str| HashedFile {
-            library_id,
-            root: String::from(root),
+            library_id: LibraryId(library_id),
+            root: Root::from(root),
             path: String::from(path),
             ..HashedFile::default()
         };

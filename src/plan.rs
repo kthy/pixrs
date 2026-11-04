@@ -6,12 +6,11 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::catalog::{
-    display_root, library_path, within, Catalog, FileRecord, FileRef, Library, Stamp,
-};
+use crate::catalog::{library_path, within, Catalog, FileRecord, FileRef, Library, Stamp};
 use crate::dates::{from_name, Taken};
 use crate::dupes::{plural, DupeFile, DupeGroup, DupeReport, Role, Tier};
 use crate::error::{AtPath, Error};
+use crate::library::{LibraryId, Root};
 use crate::media::MediaType;
 use crate::names::folded;
 use crate::template::{sanitize, Facts, Rendered, Template};
@@ -112,8 +111,8 @@ pub struct Keeper {
 /// A library a plan works in. Folders are never pruned at or above its root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanLibrary {
-    pub id: i64,
-    pub root: PathBuf,
+    pub id: LibraryId,
+    pub root: Root,
 }
 
 /// A plan, as written to and read from a plan file.
@@ -150,7 +149,7 @@ pub enum PlanError {
     Overlap {
         what: &'static str,
         folder: PathBuf,
-        library: String,
+        library: Root,
     },
     /// The file is not a plan.
     NotAPlan {
@@ -160,10 +159,7 @@ pub enum PlanError {
     /// The plan was written by another version of pixrs.
     Version { path: PathBuf, found: u32 },
     /// The plan's quarantine folder and one of its libraries overlap.
-    QuarantineOverlap {
-        destination: PathBuf,
-        library: PathBuf,
-    },
+    QuarantineOverlap { destination: PathBuf, library: Root },
     /// Move `number` (counted from 1), of the file `from`, is not one pixrs would plan.
     BadMove {
         number: usize,
@@ -212,7 +208,7 @@ impl fmt::Display for PlanError {
                 "{} {} must be outside the library {}, and not contain it",
                 what,
                 folder.display(),
-                display_root(library)
+                library
             ),
             Self::NotAPlan { path, source } => {
                 write!(f, "{} is not a plan file: {}", path.display(), source)
@@ -233,7 +229,7 @@ impl fmt::Display for PlanError {
                 "The plan cannot be carried out: the quarantine folder {} and the library {} \
                  overlap",
                 destination.display(),
-                display_root(&library.to_string_lossy())
+                library
             ),
             Self::BadMove {
                 number,
@@ -292,12 +288,14 @@ impl Plan {
     /// libraries, every target below its destination, and the moves must be of the plan's kind
     /// and refer to each other and to the libraries consistently.
     pub fn check(&self) -> Result<(), PlanError> {
-        let in_a_library = |path: &Path| self.libraries.iter().any(|l| below(path, &l.root));
+        let in_a_library =
+            |path: &Path| self.libraries.iter().any(|l| below(path, l.root.as_path()));
         let known = |row: &FileRef| self.libraries.iter().any(|l| l.id == row.library_id);
         let quarantine = self.kind == PlanKind::Quarantine;
         if quarantine {
             let overlapping = self.libraries.iter().find(|l| {
-                within(&self.destination, &l.root) || within(&l.root, &self.destination)
+                within(&self.destination, l.root.as_path())
+                    || within(l.root.as_path(), &self.destination)
             });
             if let Some(library) = overlapping {
                 return Err(PlanError::QuarantineOverlap {
@@ -772,7 +770,7 @@ fn wanted_targets(
 /// The moves that put each file where it is wanted, or at a free variant of that name.
 fn organize_moves(
     wanted: Vec<Wanted>,
-    library_id: i64,
+    library_id: LibraryId,
     root: &Path,
     suffix: &str,
     claims: &mut Claims,
@@ -825,7 +823,7 @@ fn organize_moves(
 pub fn plan_organize(
     catalog: &Catalog,
     catalog_path: &Path,
-    library_id: i64,
+    library_id: LibraryId,
     root: &Path,
     opts: &OrganizeOptions,
 ) -> Result<(Plan, PlanNotes), Error> {
@@ -858,7 +856,10 @@ pub fn plan_organize(
         destination: utf8(&base, "Target folder")?,
         libraries: vec![PlanLibrary {
             id: library_id,
-            root: utf8(root, "Library")?,
+            root: Root::new(root).ok_or_else(|| Error::NotUtf8 {
+                what: "Library",
+                path: root.to_path_buf(),
+            })?,
         }],
         moves,
     };
@@ -867,11 +868,11 @@ pub fn plan_organize(
 
 /// One folder name per library in the quarantine folder: the last folder of its root, with a
 /// number to tell same names apart.
-fn quarantine_folders(libraries: &[Library]) -> HashMap<i64, String> {
+fn quarantine_folders(libraries: &[Library]) -> HashMap<LibraryId, String> {
     let mut folder_of = HashMap::new();
     let mut used: HashSet<String> = HashSet::new();
     for library in libraries {
-        let shown = display_root(&library.root);
+        let shown = library.root.to_string();
         let last = Path::new(&shown).file_name().map_or_else(
             || String::from("library"),
             |n| n.to_string_lossy().into_owned(),
@@ -892,15 +893,15 @@ struct Quarantine<'a> {
     /// The quarantine folder.
     dir: &'a Path,
     /// Libraries to quarantine copies from; all if empty.
-    only: &'a [i64],
-    roots: HashMap<i64, &'a Path>,
-    folder_of: HashMap<i64, String>,
+    only: &'a [LibraryId],
+    roots: HashMap<LibraryId, &'a Path>,
+    folder_of: HashMap<LibraryId, String>,
     claims: Claims,
     links: Links,
     notes: PlanNotes,
     moves: Vec<Move>,
     /// Libraries copies are quarantined from, in the order first seen.
-    involved: Vec<i64>,
+    involved: Vec<LibraryId>,
 }
 
 impl Quarantine<'_> {
@@ -1033,7 +1034,7 @@ pub fn plan_quarantine(
     catalog: &Catalog,
     catalog_path: &Path,
     report: &DupeReport,
-    only: &[i64],
+    only: &[LibraryId],
     dir: &Path,
     now: OffsetDateTime,
 ) -> Result<(Plan, PlanNotes), Error> {
@@ -1077,7 +1078,7 @@ pub fn plan_quarantine(
             .filter(|l| involved.contains(&l.id))
             .map(|l| PlanLibrary {
                 id: l.id,
-                root: PathBuf::from(&l.root),
+                root: l.root.clone(),
             })
             .collect(),
         moves,
@@ -1094,7 +1095,7 @@ pub fn outside_libraries(
 ) -> Result<PathBuf, Error> {
     let resolved = crate::scan::resolve(dir).at(dir)?;
     for library in catalog.libraries()? {
-        let root = Path::new(&library.root);
+        let root = library.root.as_path();
         if within(&resolved, root) || within(root, &resolved) {
             return Err(PlanError::Overlap {
                 what,
@@ -1238,7 +1239,7 @@ mod tests {
         root: PathBuf,
         catalog_path: PathBuf,
         catalog: Catalog,
-        id: i64,
+        id: LibraryId,
     }
 
     fn fixture(files: &[(&str, Option<&str>)]) -> Fixture {
@@ -1502,7 +1503,7 @@ mod tests {
 
     /// `p` as a quarantine plan into a folder next to the library, with the media move's kind.
     fn as_quarantine(p: &mut Plan, kind: MoveKind) {
-        let q = p.libraries[0].root.parent().unwrap().join("q");
+        let q = p.libraries[0].root.as_path().parent().unwrap().join("q");
         p.kind = PlanKind::Quarantine;
         for m in &mut p.moves {
             m.to = q.join(m.to.file_name().unwrap());
@@ -1547,7 +1548,7 @@ mod tests {
                 Box::new(|p| {
                     p.moves[0].kind = MoveKind::Organize {
                         row: FileRef {
-                            library_id: 99,
+                            library_id: LibraryId(99),
                             path: String::from("1.jpg"),
                         },
                         new_path: None,
@@ -1570,7 +1571,7 @@ mod tests {
                 "quarantine folder is the library",
                 Box::new(|p| {
                     p.kind = PlanKind::Quarantine;
-                    p.destination = p.libraries[0].root.clone();
+                    p.destination = p.libraries[0].root.as_path().to_path_buf();
                 }),
             ),
             (

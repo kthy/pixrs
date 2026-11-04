@@ -6,7 +6,8 @@
  *************************************************************************************************/
 
 use crate::apply::{JournalError, MoveFault};
-use crate::catalog::{display_root, SCHEMA_VERSION};
+use crate::catalog::SCHEMA_VERSION;
+use crate::library::Root;
 use crate::plan::PlanError;
 use crate::template::TemplateError;
 use std::fmt;
@@ -32,11 +33,11 @@ pub enum Error {
     /// A library argument was never scanned.
     NotScanned(PathBuf),
     /// A library argument is a folder inside the library at `root`.
-    PartOfLibrary { path: PathBuf, root: String },
+    PartOfLibrary { path: PathBuf, root: Root },
     /// `relocate` was given a folder that is no library's root.
-    UnknownLibrary { path: PathBuf, roots: Vec<String> },
+    UnknownLibrary { path: PathBuf, roots: Vec<Root> },
     /// `relocate` was given the folder the library is at already.
-    AlreadyThere { root: String },
+    AlreadyThere { root: Root },
     /// Too few of the sampled files are at the folder `relocate` was given.
     TooFewMatch {
         matching: usize,
@@ -46,7 +47,7 @@ pub enum Error {
     /// A scan found no media where the catalog lists `cataloged` files.
     NoMedia { folder: PathBuf, cataloged: usize },
     /// The thumbnail cache would be inside a library.
-    CacheInLibrary { cache: PathBuf, library: String },
+    CacheInLibrary { cache: PathBuf, library: Root },
     /// The `--template` or `--layout` given is not valid.
     Template(TemplateError),
     /// A plan cannot be made, read or carried out.
@@ -153,7 +154,7 @@ impl fmt::Display for Error {
                 f,
                 "{} is part of the library {}. Pass the library instead.",
                 path.display(),
-                display_root(root)
+                root
             ),
             Self::UnknownLibrary { path, roots } => {
                 write!(
@@ -162,12 +163,12 @@ impl fmt::Display for Error {
                     path.display()
                 )?;
                 for root in roots {
-                    write!(f, "\n  {}", display_root(root))?;
+                    write!(f, "\n  {root}")?;
                 }
                 Ok(())
             }
             Self::AlreadyThere { root } => {
-                write!(f, "The library is already at {}", display_root(root))
+                write!(f, "The library is already at {root}")
             }
             Self::TooFewMatch {
                 matching,
@@ -194,7 +195,7 @@ impl fmt::Display for Error {
                 f,
                 "The thumbnail cache {} must be outside the library {}; pass --cache",
                 cache.display(),
-                display_root(library)
+                library
             ),
             Self::Template(e) => write!(f, "{e}"),
             Self::Plan(e) => write!(f, "{e}"),

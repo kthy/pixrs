@@ -6,8 +6,9 @@
  *************************************************************************************************/
 
 use crate::apply::Lock;
-use crate::catalog::{display_root, library_path, Catalog, Library};
+use crate::catalog::{library_path, Catalog, Library};
 use crate::error::{utf8, AtPath, Error};
+use crate::library::Root;
 use crate::names::{nfc, respelled_path};
 use crate::scan::{canonical, progress_bar, resolve, stamp, Unit};
 use same_file::is_same_file;
@@ -36,9 +37,9 @@ pub struct RelocateSummary {
     pub matching: usize,
     /// The root of the library the files are in now: the new place, or the library it is part
     /// of.
-    pub library: String,
+    pub library: Root,
     /// Roots of the libraries inside the new place that were folded in.
-    pub folded: Vec<String>,
+    pub folded: Vec<Root>,
 }
 
 /// Point the library at `old` at `new`, where its files are now, keeping everything the catalog
@@ -69,7 +70,7 @@ pub fn relocate(
         .ok_or_else(|| Error::NotADirectory(new.to_path_buf()))?;
     let new_str = utf8(&new, "Folder")?;
     // Also under another letter case on a case-insensitive file system, which Linux keeps.
-    if new == Path::new(&library.root) || is_same_file(&new, &library.root).unwrap_or(false) {
+    if new == library.root.as_path() || is_same_file(&new, &library.root).unwrap_or(false) {
         return Err(Error::AlreadyThere {
             root: library.root.clone(),
         });
@@ -121,12 +122,8 @@ pub fn relocate(
         files: files.len(),
         compared: sample.len(),
         matching,
-        library: display_root(&relocated.root),
-        folded: relocated
-            .folded
-            .iter()
-            .map(|root| display_root(root))
-            .collect(),
+        library: relocated.root,
+        folded: relocated.folded,
     })
 }
 
@@ -140,10 +137,10 @@ fn find<'a>(libraries: &'a [Library], old: &Path) -> Result<&'a Library, Error> 
     wanted.extend(absolute(old).ok());
     let find_by = |same: &dyn Fn(&Path, &Path) -> bool| {
         libraries.iter().find(|library| {
-            let shown = display_root(&library.root);
+            let shown = library.root.to_string();
             wanted
                 .iter()
-                .any(|path| same(path, Path::new(&library.root)) || same(path, Path::new(&shown)))
+                .any(|path| same(path, library.root.as_path()) || same(path, Path::new(&shown)))
         })
     };
     let in_nfc = |path: &Path| PathBuf::from(nfc(&path.to_string_lossy()).as_ref());
@@ -217,7 +214,7 @@ mod tests {
                         .into_iter()
                         .map(|f| (f.path, f.sha256.is_some()))
                         .collect();
-                    (library.root, files)
+                    (library.root.to_string(), files)
                 })
                 .collect()
         }
@@ -237,7 +234,7 @@ mod tests {
             (2, 2, 2)
         );
         let new_root = fx.root("data/k");
-        assert_eq!(summary.library, display_root(&new_root));
+        assert_eq!(summary.library, Root::from(new_root.as_str()));
         assert_eq!(
             fx.rows(),
             vec![(
@@ -314,7 +311,7 @@ mod tests {
         rename(fx.path("old"), fx.path("data/k")).unwrap();
 
         let summary = relocate(&fx.catalog(), &fx.path("old"), &fx.path("data/k"), false);
-        assert_eq!(summary.unwrap().library, display_root(&fx.root("data")));
+        assert_eq!(summary.unwrap().library, Root::from(fx.root("data")));
         assert_eq!(
             fx.rows(),
             vec![(
@@ -332,6 +329,8 @@ mod tests {
     fn test_relocate_names_the_libraries_when_old_is_unknown() {
         let fx = Fixture::new(&[("a.jpg", b"a")]);
         let e = relocate(&fx.catalog(), &fx.path("nope"), &fx.path("old"), false).unwrap_err();
-        assert!(e.to_string().contains(&display_root(&fx.root("old"))));
+        assert!(e
+            .to_string()
+            .contains(&Root::from(fx.root("old")).to_string()));
     }
 }

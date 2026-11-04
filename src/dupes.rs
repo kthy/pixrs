@@ -8,10 +8,9 @@
 use crate::avhash::{
     audio_durations_match, audio_match, frames_match, has_detail, video_durations_match, Frame,
 };
-use crate::catalog::{
-    display_root, library_path, one_row_per_file, Catalog, HashedAv, HashedFile, HashedImage,
-};
+use crate::catalog::{library_path, one_row_per_file, Catalog, HashedAv, HashedFile, HashedImage};
 use crate::imagehash::{distance, fingerprints_match, Visual};
+use crate::library::LibraryId;
 use crate::media::Dimensions;
 use crate::text::shown;
 use indicatif::HumanBytes;
@@ -61,7 +60,7 @@ impl Tier {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DupeFile {
     #[serde(skip)]
-    pub library_id: i64,
+    pub library_id: LibraryId,
     /// Root of the library the file is in.
     pub library: String,
     /// Path relative to the library root, with `/` separators.
@@ -208,7 +207,9 @@ fn group_tier(group: &[&Node]) -> Tier {
     };
     let all = |same: &dyn Fn(&Node) -> bool| group.iter().all(|n| same(n));
     if first.file.sha256.is_some()
-        && all(&|n| n.file.size == first.file.size && n.file.sha256 == first.file.sha256)
+        && all(&|n| {
+            n.file.stamp.size == first.file.stamp.size && n.file.sha256 == first.file.sha256
+        })
     {
         Tier::Exact
     } else if first.pixel_hash.is_some() && all(&|n| n.pixel_hash == first.pixel_hash) {
@@ -221,7 +222,7 @@ fn group_tier(group: &[&Node]) -> Tier {
 /// How `file` matches `keeper`: the same bytes, the same pixels, or neither (it is in the group
 /// because its perceptual hash is close to that of some file in it).
 fn match_tier(keeper: &Node, file: &Node) -> Tier {
-    if keeper.file.size == file.file.size
+    if keeper.file.stamp.size == file.file.stamp.size
         && keeper.file.sha256.is_some()
         && keeper.file.sha256 == file.file.sha256
     {
@@ -427,7 +428,7 @@ fn similar_av(items: &[AvItem], threshold: u32, short_videos: bool) -> Vec<(usiz
 /// are only read when `similar_images` is set.
 pub fn load_dupes(
     catalog: &Catalog,
-    libraries: &[i64],
+    libraries: &[LibraryId],
     similar_images: bool,
 ) -> rusqlite::Result<DupeInput> {
     let mut input = DupeInput {
@@ -482,7 +483,7 @@ pub fn load_dupes(
 /// The report reflects the catalog as of each library's last scan; files are not checked.
 pub fn find_dupes(
     catalog: &Catalog,
-    libraries: &[i64],
+    libraries: &[LibraryId],
     similarity: Similarity,
 ) -> rusqlite::Result<DupeReport> {
     let input = load_dupes(catalog, libraries, similarity.images)?;
@@ -535,7 +536,7 @@ impl<'a> Graph<'a> {
     )]
     fn build(input: &'a DupeInput) -> Self {
         let mut nodes: Vec<Node<'a>> = vec![];
-        let mut index: HashMap<(i64, &'a str), usize> = HashMap::new();
+        let mut index: HashMap<(LibraryId, &'a str), usize> = HashMap::new();
         let mut add = |file: &'a HashedFile| -> usize {
             *index
                 .entry((file.library_id, file.path.as_str()))
@@ -583,7 +584,7 @@ impl<'a> Graph<'a> {
         for &i in &self.exact {
             let file = self.nodes[i].file;
             exact_sets
-                .entry((file.size, file.sha256.as_deref()))
+                .entry((file.stamp.size, file.sha256.as_deref()))
                 .or_default()
                 .push(i);
         }
@@ -669,7 +670,7 @@ impl<'a> Graph<'a> {
 
     /// The groups of linked files, with at least one file in `libraries` unless it is empty,
     /// sorted as `DupeReport` says.
-    fn groups(&self, sets: &mut Sets, libraries: &[i64]) -> Vec<DupeGroup> {
+    fn groups(&self, sets: &mut Sets, libraries: &[LibraryId]) -> Vec<DupeGroup> {
         let mut members: HashMap<usize, Vec<&Node>> = HashMap::new();
         for (i, node) in self.nodes.iter().enumerate() {
             members.entry(sets.find(i)).or_default().push(node);
@@ -700,8 +701,8 @@ impl<'a> Graph<'a> {
 
 /// Earliest mtime first, then path order: library root, then the path inside the library.
 fn oldest(a: &Node, b: &Node) -> Ordering {
-    (a.file.mtime_ns, &a.file.root, &a.file.path).cmp(&(
-        b.file.mtime_ns,
+    (a.file.stamp.mtime_ns, &a.file.root, &a.file.path).cmp(&(
+        b.file.stamp.mtime_ns,
         &b.file.root,
         &b.file.path,
     ))
@@ -711,8 +712,8 @@ fn oldest(a: &Node, b: &Node) -> Ordering {
 /// first (pixels, then bytes), since similar copies are often smaller.
 fn keeper_order(tier: Tier, a: &Node, b: &Node) -> Ordering {
     if tier == Tier::Similar {
-        (b.pixels(), b.file.size)
-            .cmp(&(a.pixels(), a.file.size))
+        (b.pixels(), b.file.stamp.size)
+            .cmp(&(a.pixels(), a.file.stamp.size))
             .then_with(|| oldest(a, b))
     } else {
         oldest(a, b)
@@ -770,17 +771,21 @@ fn dupe_group(mut group: Vec<&Node>) -> Option<DupeGroup> {
 fn dupe_file(file: &HashedFile, role: Role) -> DupeFile {
     DupeFile {
         library_id: file.library_id,
-        library: display_root(&file.root),
+        library: file.root.to_string(),
         path: file.path.clone(),
-        size: file.size,
-        mtime: format_mtime(file.mtime_ns),
-        mtime_ns: file.mtime_ns,
+        size: file.stamp.size,
+        mtime: format_mtime(file.stamp.mtime_ns),
+        mtime_ns: file.stamp.mtime_ns,
         role,
     }
 }
 
 /// The grouping half of `find_dupes`, for input from `load_dupes`.
-pub fn group_dupes(input: &DupeInput, libraries: &[i64], similarity: Similarity) -> DupeReport {
+pub fn group_dupes(
+    input: &DupeInput,
+    libraries: &[LibraryId],
+    similarity: Similarity,
+) -> DupeReport {
     let mut graph = Graph::build(input);
     let mut sets = Sets::new(graph.nodes.len());
     graph.link_exact(&mut sets);

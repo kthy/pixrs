@@ -27,6 +27,7 @@ use pixrs::dupes::{
     find_dupes, plural, write_csv, write_json, write_text, DupeReport, Role, Tier,
 };
 use pixrs::error::{utf8, Error};
+use pixrs::library::{LibraryId, Root};
 use pixrs::plan::{
     outside_libraries, plan_organize, plan_quarantine, read_plan, write_plan, write_summary,
     OrganizeOptions,
@@ -110,7 +111,7 @@ fn fail(context: &str, e: &Error) -> ! {
 }
 
 /// The catalog IDs of the given libraries, which must have been scanned.
-fn library_ids(catalog: &Catalog, libraries: &[PathBuf]) -> Result<Vec<i64>, Error> {
+fn library_ids(catalog: &Catalog, libraries: &[PathBuf]) -> Result<Vec<LibraryId>, Error> {
     let known = catalog.libraries()?;
     libraries
         .iter()
@@ -133,7 +134,7 @@ fn cataloged_library(
         if let Some(id) = catalog.find_library(root)? {
             return Ok(LibraryRoot {
                 id,
-                root: String::from(root),
+                root: Root::from(root),
             });
         }
     }
@@ -183,7 +184,7 @@ fn quarantine(
     catalog: &Catalog,
     catalog_path: &Path,
     report: &DupeReport,
-    libraries: &[i64],
+    libraries: &[LibraryId],
     dir: &Path,
 ) -> Result<(), Error> {
     let dir = outside_libraries(catalog, dir, "The quarantine folder")?;
@@ -228,8 +229,13 @@ fn organize(opt: OrganizeOpt) -> Result<(), Error> {
         prune_empty: opt.prune_empty,
         now,
     };
-    let root = PathBuf::from(library.root);
-    let (plan, notes) = plan_organize(&catalog, &catalog_path, library.id, &root, &opts)?;
+    let (plan, notes) = plan_organize(
+        &catalog,
+        &catalog_path,
+        library.id,
+        library.root.as_path(),
+        &opts,
+    )?;
     let path = write_plan(&plan, now)?;
     write_summary(&plan, &notes, &path, &mut io::stdout().lock())?;
     Ok(())
@@ -300,7 +306,7 @@ fn relocate(opt: RelocateOpt) -> Result<(), Error> {
         "The catalog lists the {} {} in the library {} now. Scan it to pick up any changes.",
         HumanCount(u64::try_from(s.files).unwrap_or(u64::MAX)),
         plural(s.files, "file", "files"),
-        printable(&s.library)
+        printable(&s.library.to_string())
     );
     Ok(())
 }
@@ -318,7 +324,7 @@ fn scan(opt: ScanOpt, now: Instant) -> Result<(), Error> {
         println!(
             "{} is part of the library {}; scanned only that part.",
             shown(&opt.library),
-            printable(root)
+            printable(&root.to_string())
         );
     }
     println!(
@@ -362,11 +368,11 @@ fn scan(opt: ScanOpt, now: Instant) -> Result<(), Error> {
 }
 
 /// Report the libraries a scan or relocation folded into the one it worked on.
-fn print_folded(roots: &[String]) {
+fn print_folded(roots: &[Root]) {
     for root in roots {
         println!(
             "Folded the library {} into this one, with its hashes.",
-            printable(root)
+            printable(&root.to_string())
         );
     }
 }
@@ -439,7 +445,7 @@ mod tests {
             found,
             LibraryRoot {
                 id,
-                root: String::from(root.to_str().unwrap())
+                root: Root::new(&root).unwrap()
             }
         );
         assert!(matches!(
