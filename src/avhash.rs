@@ -236,7 +236,7 @@ fn span_from_probe(json: &[u8]) -> Result<Span, DecodeError> {
 }
 
 /// Seconds from a clock time like `01:02:03.500000000`.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "a fused multiply-add rounds differently, which would change the durations read"
 )]
@@ -272,11 +272,11 @@ fn frame_at(ffmpeg: &Path, source: &Path, seconds: f64) -> Result<Frame, DecodeE
 /// The signature of a video: its picture's duration and its frames at 5%, 15%, ... 85% of it.
 /// `ffmpeg` turns frames upright as the file says. A frame `ffmpeg` cannot decode counts as one
 /// without detail, unless no frame can be decoded at all.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "a fused multiply-add rounds differently, which would move the frames sampled"
 )]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     reason = "durations in seconds, frame indices below 10"
@@ -324,7 +324,7 @@ struct Fpcalc {
 /// The Chromaprint fingerprint of the first `AUDIO_SECONDS` of an audio file, from `fpcalc`.
 /// Clips shorter than about 5 seconds give too few values to compare, and never match; under
 /// about 3 seconds, `fpcalc` gives none.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "fpcalc prints the 32-bit values signed or unsigned depending on its version"
@@ -383,7 +383,7 @@ pub fn frames_match(a: &[Frame], b: &[Frame], threshold: u32) -> bool {
 /// The share of differing bits between two fingerprints at the offset (within about 2 seconds)
 /// where they agree best, or 1 if they hardly overlap. Offsets are given up on once they differ
 /// in more than `give_up` of the bits they are compared on; 1 compares them all.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,

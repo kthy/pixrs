@@ -807,9 +807,9 @@ pub fn resolve(path: &Path) -> io::Result<PathBuf> {
     let path = absolute(path)?;
     for ancestor in path.ancestors() {
         if let Ok(mut resolved) = ancestor.canonicalize() {
-            let rest = path
-                .strip_prefix(ancestor)
-                .expect("an ancestor is a prefix");
+            let Ok(rest) = path.strip_prefix(ancestor) else {
+                continue;
+            };
             for part in rest.components() {
                 match part {
                     Component::ParentDir => {
@@ -934,6 +934,10 @@ pub(crate) enum Unit {
 
 /// A progress bar of `len` files or bytes. The message is cut to fit the terminal: a line that
 /// wraps is not cleared when the bar is drawn again.
+#[expect(
+    clippy::expect_used,
+    reason = "the templates are constants; test_progress_templates_parse checks them"
+)]
 pub(crate) fn progress_bar(
     len: u64,
     prefix: &'static str,
@@ -978,6 +982,10 @@ fn finish_step(pb: &ProgressBar, done: &str) {
 }
 
 /// A spinner counting media files, with the current folder as its message.
+#[expect(
+    clippy::expect_used,
+    reason = "the templates are constants; test_progress_templates_parse checks them"
+)]
 fn spinner(prefix: &'static str, quiet: bool) -> ProgressBar {
     if quiet {
         return ProgressBar::hidden();
@@ -1089,7 +1097,7 @@ fn dimension(value: &EntryValue) -> Option<u32> {
         .or_else(|| value.as_u64().and_then(|n| u32::try_from(n).ok()))
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "test fixtures with small values"
@@ -1097,6 +1105,14 @@ fn dimension(value: &EntryValue) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_progress_templates_parse() {
+        for unit in [Unit::Bytes, Unit::Files] {
+            progress_bar(1, "test", unit, false).finish_and_clear();
+        }
+        spinner("test", false).finish_and_clear();
+    }
 
     use pretty_assertions::assert_eq;
     use std::fs::{create_dir_all, remove_file, write};

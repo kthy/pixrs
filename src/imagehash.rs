@@ -158,7 +158,7 @@ pub fn fingerprints_match(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// The mean brightness of a fingerprint.
-#[allow(clippy::cast_precision_loss, reason = "fingerprints have 1024 pixels")]
+#[expect(clippy::cast_precision_loss, reason = "fingerprints have 1024 pixels")]
 fn mean(fingerprint: &[u8]) -> f64 {
     fingerprint.iter().map(|&v| f64::from(v)).sum::<f64>() / fingerprint.len() as f64
 }
@@ -166,7 +166,7 @@ fn mean(fingerprint: &[u8]) -> f64 {
 /// How two fingerprints differ: the absolute differences of their pixels after subtracting each
 /// fingerprint's mean brightness (so slightly different decoders or resizers do not count),
 /// sorted ascending. Empty if the sizes differ.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "differences fit in a byte"
@@ -212,7 +212,7 @@ fn shrink(img: &DynamicImage) -> DynamicImage {
 
 /// 64-bit gradient hash and grayscale fingerprint of a shrunk upright image, unless it has
 /// almost no detail.
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     reason = "images have far fewer than 2^52 pixels"
 )]
@@ -271,7 +271,7 @@ fn pixel_hash(img: &DynamicImage) -> String {
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -288,7 +288,7 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     /// A photo-like test image: smooth gradients and a few shapes, different per `seed`.
-    #[allow(
+    #[expect(
         clippy::suboptimal_flops,
         reason = "a fused multiply-add rounds differently, which would change the test images"
     )]

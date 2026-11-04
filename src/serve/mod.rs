@@ -162,7 +162,7 @@ impl AppState {
     /// it cannot skip or repeat groups. One report is made at a time and shared by every request
     /// waiting for it. Only reading the catalog holds it; comparing the images does not, so
     /// other pages stay responsive meanwhile.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the lock is held while the report is made, so one is made at a time"
     )]

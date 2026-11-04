@@ -17,6 +17,12 @@
 //! which are the same picture. Paste the page's JSON into a file and pass it as `--labels` to
 //! see how well each way of measuring separates the answers.
 
+#![expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "a development tool run by hand: a failure should stop it with the reason"
+)]
+
 /*************************************************************************************************
  * Copyright © 2022-2026 Kristian Thy (<thy@42.dk>)                                              *
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
@@ -166,7 +172,7 @@ impl Metrics {
     };
 
     /// Mean, 90th, 95th and 99th percentile, and largest of sorted differences.
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         reason = "statistics over counts far below 2^52"
     )]
@@ -518,7 +524,7 @@ fn print_spread(title: &str, all: impl Iterator<Item = Metrics>) {
 
 /// Measure each metric against the answers from the review page: for each limit, the share of
 /// synthetic copies kept, and how many answered pairs land on each side.
-#[allow(
+#[expect(
     clippy::cast_precision_loss,
     reason = "statistics over counts far below 2^52"
 )]
@@ -614,7 +620,7 @@ fn decode_all(
 ) -> HashMap<usize, DynamicImage> {
     let chunk = list.len().div_ceil(workers()).max(1);
     std::thread::scope(|scope| {
-        #[allow(
+        #[expect(
             clippy::needless_collect,
             reason = "every thread must start before any is joined"
         )]
@@ -725,7 +731,7 @@ fn print_size(side: u32, copies: &[Metrics], answered: &[(Metrics, bool)]) {
 
 /// Write `DIR/index.html`, `DIR/thumbs/` and `DIR/large/` with candidate pairs, grouped by the
 /// review metric so the page covers its whole range.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "the shuffle picks an index below a bucket's length"
 )]

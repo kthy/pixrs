@@ -32,6 +32,10 @@ fn numbers(version: &str) -> Vec<u64> {
         .collect()
 }
 
+#[expect(
+    clippy::panic,
+    reason = "a build script reports a broken build by panicking with the reason"
+)]
 fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
     let lock = fs::read_to_string("Cargo.lock")

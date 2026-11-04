@@ -417,6 +417,11 @@ fn serve(opt: ServeOpt) -> Result<(), Error> {
 }
 
 /// Set Ctrl-C handler
+#[expect(
+    clippy::expect_used,
+    reason = "runs once at startup, before any work; without the handler an interrupted apply \
+              would keep its lock"
+)]
 fn set_ctrlc_handler() {
     ctrlc::set_handler(move || {
         println!("Ctrl-C received, stopping.");

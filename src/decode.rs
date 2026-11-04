@@ -12,6 +12,7 @@ use log::debug;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -329,8 +330,11 @@ pub(crate) fn run_with_timeout(mut command: Command) -> Result<Vec<u8>, DecodeEr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other("the tool's output is not piped").into());
+    };
     let out = thread::spawn(move || {
         let mut buf = vec![];
         stdout.read_to_end(&mut buf).map(|_| buf)
@@ -357,8 +361,11 @@ pub(crate) fn run_with_timeout(mut command: Command) -> Result<Vec<u8>, DecodeEr
             }
         }
     };
-    let out = out.join().expect("reader thread")?;
-    let err = err.join().expect("reader thread").unwrap_or_default();
+    let out = out.join().unwrap_or_else(|e| panic::resume_unwind(e))?;
+    let err = err
+        .join()
+        .unwrap_or_else(|e| panic::resume_unwind(e))
+        .unwrap_or_default();
     if status.success() {
         Ok(out)
     } else {
@@ -369,7 +376,7 @@ pub(crate) fn run_with_timeout(mut command: Command) -> Result<Vec<u8>, DecodeEr
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "test fixtures with small values"
 )]
