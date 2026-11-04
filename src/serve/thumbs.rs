@@ -240,7 +240,7 @@ fn render_in_process(source: &Path, max: u32) -> Result<Vec<u8>, DecodeError> {
 }
 
 /// The image without transparency, on a white background.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "a blend of two bytes stays below 256"
 )]

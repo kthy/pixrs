@@ -12,6 +12,11 @@
 //! rate of its fingerprint against the original is compared with that of unrelated pairs. It
 //! prints counts and statistics only, no file names.
 
+#![expect(
+    clippy::indexing_slicing,
+    reason = "a development tool run by hand: a failure should stop it with the reason"
+)]
+
 /*************************************************************************************************
  * Copyright © 2022-2026 Kristian Thy (<thy@42.dk>)                                              *
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *

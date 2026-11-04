@@ -236,6 +236,10 @@ fn match_tier(keeper: &Node, file: &Node) -> Tier {
 /// Union-find over node indices.
 struct Sets(Vec<usize>);
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every index is a node id below the length `new` was given, and parents are ids"
+)]
 impl Sets {
     /// `n` nodes, each in a set of its own.
     fn new(n: usize) -> Self {
@@ -309,7 +313,7 @@ fn pairs_by_row(
     let workers = available_parallelism().map_or(1, std::num::NonZero::get);
     let row = &row;
     thread::scope(|scope| {
-        #[allow(
+        #[expect(
             clippy::needless_collect,
             reason = "every thread must start before any is joined"
         )]
@@ -525,6 +529,10 @@ struct Graph<'a> {
 }
 
 impl<'a> Graph<'a> {
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`add` returns the index of the node it found or pushed"
+    )]
     fn build(input: &'a DupeInput) -> Self {
         let mut nodes: Vec<Node<'a>> = vec![];
         let mut index: HashMap<(i64, &'a str), usize> = HashMap::new();
@@ -566,6 +574,10 @@ impl<'a> Graph<'a> {
     /// Link files with the same size and SHA-256. Byte-identical files have the same pixels and
     /// size, even if only one was decoded: the others take its pixel hash and dimensions.
     /// Videos and audio have no pixel hash, but may have dimensions.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`self.exact` holds node indices from `build`"
+    )]
     fn link_exact(&mut self, sets: &mut Sets) {
         let mut exact_sets: HashMap<(u64, Option<&str>), Vec<usize>> = HashMap::new();
         for &i in &self.exact {

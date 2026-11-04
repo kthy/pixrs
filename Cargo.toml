@@ -74,3 +74,10 @@ option_if_let_else = "allow"
 too_long_first_doc_paragraph = "allow"
 # Pairs like `moving`/`moved` and `fault`/`faulty` name related things on purpose.
 similar_names = "allow"
+# Production code must not panic on bad input: no unwrap, expect, panic or slice indexing outside
+# tests (clippy.toml allows them in tests). A site that cannot fail by construction says why in
+# a narrow `#[expect]`.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"

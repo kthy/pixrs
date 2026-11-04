@@ -508,7 +508,10 @@ fn remove_source(path: &Path) -> io::Result<()> {
     if cfg!(windows) {
         let mut permissions = fs::metadata(path)?.permissions();
         if permissions.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows only, where this clears the read-only attribute and nothing else"
+            )]
             permissions.set_readonly(false);
             fs::set_permissions(path, permissions)?;
         }

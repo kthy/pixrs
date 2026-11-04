@@ -160,7 +160,11 @@ impl Template {
             }
             segments.push(parse_segment(source, segment)?);
         }
-        let file = segments.pop().expect("split yields at least one segment");
+        let Some(file) = segments.pop() else {
+            return Err(TemplateError::NoExt {
+                template: String::from(source),
+            });
+        };
         if !file.contains(&Part::Token(Token::Ext)) {
             return Err(TemplateError::NoExt {
                 template: String::from(source),
