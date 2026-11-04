@@ -783,10 +783,10 @@ impl Catalog {
                         hash_version: row.get(10)?,
                         pixel_hash: row.get(11)?,
                         phash: row.get::<_, Option<i64>>(12)?.map(i64::cast_unsigned),
-                        fingerprint: row.get::<_, Option<Vec<u8>>>(13)?.as_deref().map(hex),
+                        fingerprint: row.get(13)?,
                         duration_ms: row.get(14)?,
-                        frames: row.get::<_, Option<Vec<u8>>>(15)?.as_deref().map(hex),
-                        chromaprint: row.get::<_, Option<Vec<u8>>>(16)?.as_deref().map(hex),
+                        frames: row.get(15)?,
+                        chromaprint: row.get(16)?,
                     })
                 },
             )
@@ -811,10 +811,10 @@ impl Catalog {
                 row.hash_version,
                 row.pixel_hash,
                 row.phash.map(u64::cast_signed),
-                unhex(row.fingerprint.as_deref()),
+                row.fingerprint,
                 row.duration_ms,
-                unhex(row.frames.as_deref()),
-                unhex(row.chromaprint.as_deref()),
+                row.frames,
+                row.chromaprint,
             ],
         )?;
         tx.commit()
@@ -1048,21 +1048,45 @@ pub struct CatalogRow {
     pub hash_version: Option<String>,
     pub pixel_hash: Option<String>,
     pub phash: Option<u64>,
-    /// BLOBs as lowercase hex.
-    pub fingerprint: Option<String>,
+    #[serde(default, with = "hex_blob")]
+    pub fingerprint: Option<Vec<u8>>,
     pub duration_ms: Option<i64>,
-    pub frames: Option<String>,
-    pub chromaprint: Option<String>,
+    #[serde(default, with = "hex_blob")]
+    pub frames: Option<Vec<u8>>,
+    #[serde(default, with = "hex_blob")]
+    pub chromaprint: Option<Vec<u8>>,
 }
 
-/// A BLOB as lowercase hex, for `CatalogRow`.
-fn hex(blob: &[u8]) -> String {
-    data_encoding::HEXLOWER.encode(blob)
-}
+/// BLOBs in a `CatalogRow` as lowercase hex, which JSON can hold.
+mod hex_blob {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
 
-/// Lowercase hex from `hex` as a BLOB.
-fn unhex(text: Option<&str>) -> Option<Vec<u8>> {
-    text.and_then(|t| data_encoding::HEXLOWER.decode(t.as_bytes()).ok())
+    #[expect(
+        clippy::ref_option,
+        reason = "serde's serialize_with passes the field by reference"
+    )]
+    pub fn serialize<S: Serializer>(
+        blob: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match blob {
+            Some(bytes) => serializer.serialize_some(&data_encoding::HEXLOWER.encode(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|text| {
+                data_encoding::HEXLOWER
+                    .decode(text.as_bytes())
+                    .map_err(Error::custom)
+            })
+            .transpose()
+    }
 }
 
 /// A video or audio file with its signature or fingerprint.
@@ -1593,6 +1617,27 @@ mod tests {
             sha256: None,
             meta: MediaMeta::default(),
         }
+    }
+
+    #[test]
+    fn test_catalog_row_keeps_blobs_as_hex() {
+        let row = CatalogRow {
+            library_id: LibraryId(1),
+            file: record("a.jpg", 1),
+            hash_version: None,
+            pixel_hash: None,
+            phash: None,
+            fingerprint: Some(vec![0x00, 0xab, 0xff]),
+            duration_ms: None,
+            frames: None,
+            chromaprint: Some(vec![]),
+        };
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains(r#""fingerprint":"00abff""#), "{json}");
+        assert!(json.contains(r#""frames":null"#), "{json}");
+        assert_eq!(serde_json::from_str::<CatalogRow>(&json).unwrap(), row);
+        let corrupt = json.replace("00abff", "00abzz");
+        assert!(serde_json::from_str::<CatalogRow>(&corrupt).is_err());
     }
 
     #[test]
