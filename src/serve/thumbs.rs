@@ -58,10 +58,20 @@ impl Size {
 
 /// How a file is turned into a JPEG.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Decoder {
+enum Renderer<'a> {
+    /// By the `image` crate.
     InProcess,
-    FfmpegImage,
-    FfmpegVideo,
+    /// By `ffmpeg`, at this frame.
+    Ffmpeg { ffmpeg: &'a Path, frame: Frame },
+}
+
+/// The frame `ffmpeg` renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frame {
+    /// The first, the only one of an image.
+    First,
+    /// One second into a video, past fades from black; the first if it is shorter.
+    OneSecondIn,
 }
 
 /// The lowercase extension of a cataloged file.
@@ -89,22 +99,11 @@ pub fn view_source(file: &FileRecord) -> ViewSource {
     }
 }
 
-/// How the viewer makes renditions of the file, if it can.
-fn decoder(file: &FileRecord) -> Option<Decoder> {
-    match file.media_type {
-        MediaType::Image => match image_decoder(&file.path)? {
-            decode::Decoder::InProcess(_) => Some(Decoder::InProcess),
-            decode::Decoder::Ffmpeg => Some(Decoder::FfmpegImage),
-        },
-        MediaType::Video => Some(Decoder::FfmpegVideo),
-        MediaType::Audio => None,
-    }
-}
-
 /// Makes and caches renditions.
 pub struct Thumbnailer {
     cache_dir: Option<PathBuf>,
     ffmpeg: Option<PathBuf>,
+    ffprobe: Option<PathBuf>,
     /// Limits how many renditions are made at once.
     permits: Semaphore,
     /// Cache keys of files that could not be decoded, so they are not retried on every request.
@@ -112,13 +111,35 @@ pub struct Thumbnailer {
 }
 
 impl Thumbnailer {
-    pub fn new(cache_dir: Option<PathBuf>, ffmpeg: Option<PathBuf>) -> Self {
+    pub fn new(
+        cache_dir: Option<PathBuf>,
+        ffmpeg: Option<PathBuf>,
+        ffprobe: Option<PathBuf>,
+    ) -> Self {
         let workers = available_parallelism().map_or(2, std::num::NonZero::get);
         Self {
             cache_dir,
             ffmpeg,
+            ffprobe,
             permits: Semaphore::new(workers),
             failed: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// How renditions of `file` are made, if they can be.
+    fn renderer(&self, file: &FileRecord) -> Option<Renderer<'_>> {
+        let ffmpeg = |frame| {
+            self.ffmpeg
+                .as_deref()
+                .map(|ffmpeg| Renderer::Ffmpeg { ffmpeg, frame })
+        };
+        match file.media_type {
+            MediaType::Image => match image_decoder(&file.path)? {
+                decode::Decoder::InProcess(_) => Some(Renderer::InProcess),
+                decode::Decoder::Ffmpeg => ffmpeg(Frame::First),
+            },
+            MediaType::Video => ffmpeg(Frame::OneSecondIn),
+            MediaType::Audio => None,
         }
     }
 
@@ -126,11 +147,7 @@ impl Thumbnailer {
     /// decoded, or there is no cache.
     pub async fn get(&self, located: &Located, size: Size) -> Option<Vec<u8>> {
         let cache_dir = self.cache_dir.as_ref()?;
-        let decoder = decoder(&located.file)?;
-        let ffmpeg = match decoder {
-            Decoder::InProcess => None,
-            Decoder::FfmpegImage | Decoder::FfmpegVideo => Some(self.ffmpeg.clone()?),
-        };
+        let renderer = self.renderer(&located.file)?;
         let key = cache_key(located, size);
         // Spread over folders by the key's first two hex digits, so none holds too many files.
         let dir = cache_dir
@@ -149,16 +166,7 @@ impl Thumbnailer {
         if let Ok(jpeg) = tokio::fs::read(&cached).await {
             return Some(jpeg);
         }
-        let source = located.full_path.clone();
-        let made = match ffmpeg {
-            None => tokio::task::spawn_blocking(move || render_in_process(&source, size.pixels()))
-                .await
-                .unwrap_or(Err(DecodeError::Crashed)),
-            Some(ffmpeg) => {
-                decode_with_ffmpeg(&ffmpeg, &source, size, decoder == Decoder::FfmpegVideo).await
-            }
-        };
-        match made {
+        match render(renderer, &located.full_path, size).await {
             Ok(jpeg) => tokio::task::spawn_blocking(move || {
                 if let Err(e) = write_atomically(&dir, &cached, &jpeg) {
                     warn!("Unable to cache {}: {}", shown(&cached), e);
@@ -183,8 +191,10 @@ impl Thumbnailer {
         }
     }
 
-    /// The video codec of a file, from `ffprobe`. Shares the limit on concurrent tool runs.
-    pub async fn video_codec(&self, ffprobe: &Path, source: &Path) -> Option<String> {
+    /// The video codec of a file, from `ffprobe` if it is on `PATH`. Shares the limit on
+    /// concurrent tool runs.
+    pub async fn video_codec(&self, source: &Path) -> Option<String> {
+        let ffprobe = self.ffprobe.as_deref()?;
         let _permit = self.permits.acquire().await.ok()?;
         let mut command = Command::new(ffprobe);
         command
@@ -215,13 +225,32 @@ impl Thumbnailer {
 fn cache_key(located: &Located, size: Size) -> String {
     let id = format!(
         "{}\0{}\0{}\0{}\0{}",
-        located.root,
+        located.root.as_str(),
         located.file.path,
         located.file.stamp.size,
         located.file.stamp.mtime_ns,
         size.pixels()
     );
     data_encoding::HEXLOWER.encode(digest(&SHA256, id.as_bytes()).as_ref())
+}
+
+/// A rendition of the file at `source` at `size`, as JPEG.
+async fn render(
+    renderer: Renderer<'_>,
+    source: &Path,
+    size: Size,
+) -> Result<Vec<u8>, DecodeError> {
+    match renderer {
+        Renderer::InProcess => {
+            let source = source.to_path_buf();
+            tokio::task::spawn_blocking(move || render_in_process(&source, size.pixels()))
+                .await
+                .unwrap_or(Err(DecodeError::Crashed))
+        }
+        Renderer::Ffmpeg { ffmpeg, frame } => {
+            decode_with_ffmpeg(ffmpeg, source, size, frame).await
+        }
+    }
 }
 
 /// Decode an image with the `image` crate, upright, shrunk to fit `max` pixels, as JPEG.
@@ -257,12 +286,12 @@ fn flatten(img: &DynamicImage) -> RgbImage {
     })
 }
 
-/// Decode the first frame of an image, or a frame one second into a video, with `ffmpeg`.
+/// Decode `frame` of the file at `source` with `ffmpeg`.
 async fn decode_with_ffmpeg(
     ffmpeg: &Path,
     source: &Path,
     size: Size,
-    video: bool,
+    frame: Frame,
 ) -> Result<Vec<u8>, DecodeError> {
     let max = size.pixels();
     let attempt = |seek: bool| {
@@ -281,14 +310,13 @@ async fn decode_with_ffmpeg(
             .args(["-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "3", "-"]);
         run(command)
     };
-    let jpeg = if video {
+    let jpeg = match frame {
         // Videos shorter than a second have no frame there.
-        match attempt(true).await {
+        Frame::OneSecondIn => match attempt(true).await {
             Ok(jpeg) if !jpeg.is_empty() => jpeg,
             _ => attempt(false).await?,
-        }
-    } else {
-        attempt(false).await?
+        },
+        Frame::First => attempt(false).await?,
     };
     if jpeg.is_empty() {
         Err(DecodeError::NoFrame)
@@ -379,21 +407,32 @@ mod tests {
     }
 
     #[test]
-    fn test_decoder_choice() {
+    fn test_renderer_choice() {
+        let ffmpeg = Path::new("ffmpeg");
+        let with = Thumbnailer::new(None, Some(ffmpeg.to_path_buf()), None);
+        let renderer = |path, media_type| with.renderer(&record(path, media_type));
         assert_eq!(
-            decoder(&record("a/B.JPG", MediaType::Image)),
-            Some(Decoder::InProcess)
+            renderer("a/B.JPG", MediaType::Image),
+            Some(Renderer::InProcess)
         );
         assert_eq!(
-            decoder(&record("b.heic", MediaType::Image)),
-            Some(Decoder::FfmpegImage)
+            renderer("b.heic", MediaType::Image),
+            Some(Renderer::Ffmpeg {
+                ffmpeg,
+                frame: Frame::First
+            })
         );
         assert_eq!(
-            decoder(&record("c.mov", MediaType::Video)),
-            Some(Decoder::FfmpegVideo)
+            renderer("c.mov", MediaType::Video),
+            Some(Renderer::Ffmpeg {
+                ffmpeg,
+                frame: Frame::OneSecondIn
+            })
         );
-        assert_eq!(decoder(&record("d.cr2", MediaType::Image)), None);
-        assert_eq!(decoder(&record("e.mp3", MediaType::Audio)), None);
+        assert_eq!(renderer("d.cr2", MediaType::Image), None);
+        assert_eq!(renderer("e.mp3", MediaType::Audio), None);
+        let without = Thumbnailer::new(None, None, None);
+        assert_eq!(without.renderer(&record("b.heic", MediaType::Image)), None);
         assert_eq!(
             view_source(&record("f.TIFF", MediaType::Image)),
             ViewSource::Preview
@@ -447,7 +486,7 @@ mod tests {
             eprintln!("ffmpeg not available, skipping");
             return;
         }
-        let jpeg = decode_with_ffmpeg(ffmpeg, &video, Size::Thumb, true)
+        let jpeg = decode_with_ffmpeg(ffmpeg, &video, Size::Thumb, Frame::OneSecondIn)
             .await
             .unwrap();
         let img = image::load_from_memory(&jpeg).unwrap();

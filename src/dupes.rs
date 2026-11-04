@@ -752,13 +752,15 @@ impl<'a> Graph<'a> {
     }
 }
 
-/// Earliest mtime first, then path order: library root, then the path inside the library.
+/// The order in which copies are kept: earliest mtime first, then path order (library root,
+/// then the path inside the library).
+pub fn oldest_first(a: &HashedFile, b: &HashedFile) -> Ordering {
+    (a.stamp.mtime_ns, &a.root, &a.path).cmp(&(b.stamp.mtime_ns, &b.root, &b.path))
+}
+
+/// `oldest_first` for nodes.
 fn oldest(a: &Node, b: &Node) -> Ordering {
-    (a.file.stamp.mtime_ns, &a.file.root, &a.file.path).cmp(&(
-        b.file.stamp.mtime_ns,
-        &b.file.root,
-        &b.file.path,
-    ))
+    oldest_first(a.file, b.file)
 }
 
 /// The order in which files of a group are kept: oldest first, or in similar groups largest
