@@ -229,7 +229,7 @@ fn full_path(image: &HashedImage, roots: &[String]) -> PathBuf {
 fn decode(image: &HashedImage, roots: &[String], ffmpeg: Option<&Path>) -> Option<DynamicImage> {
     let path = full_path(image, roots);
     match image_decoder(&image.file.path)? {
-        Decoder::InProcess => {
+        Decoder::InProcess(_) => {
             let (mut img, orientation) = decode_in_process(&path).ok()?;
             img.apply_orientation(orientation);
             Some(img)

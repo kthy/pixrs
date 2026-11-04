@@ -24,6 +24,7 @@ pub mod avhash;
 pub mod catalog;
 pub mod dates;
 pub mod decode;
+pub mod digest;
 pub mod dupes;
 pub mod error;
 pub mod imagehash;

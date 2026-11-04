@@ -23,7 +23,7 @@ use pixrs::avhash::{
     video_signature, AudioFingerprint, Frame, FRAMES,
 };
 use pixrs::catalog::{library_path, Catalog, HashedAv};
-use pixrs::decode::Tools;
+use pixrs::decode::{Tool, Tools};
 use pixrs::dupes::{aspects_match, DEFAULT_THRESHOLD};
 use pixrs::imagehash::distance;
 use pixrs::scan::resolve;
@@ -141,7 +141,7 @@ fn frame_counts(a: &[Frame], b: &[Frame], threshold: u32) -> (usize, usize) {
 fn main() {
     let opt = Opt::parse();
     let tools = Tools::find();
-    let (Some((ffmpeg, _)), Some(ffprobe)) = (&tools.ffmpeg, &tools.ffprobe) else {
+    let (Some(Tool { path: ffmpeg, .. }), Some(ffprobe)) = (&tools.ffmpeg, &tools.ffprobe) else {
         die("ffmpeg and ffprobe must be on PATH");
     };
     let catalog = Catalog::open_existing(&opt.catalog).unwrap_or_else(|e| die(&e.to_string()));
@@ -264,7 +264,9 @@ fn histogram(values: &[usize], max: usize) -> Vec<usize> {
 }
 
 fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
-    let (Some((ffmpeg, _)), Some((fpcalc, _))) = (&tools.ffmpeg, &tools.fpcalc) else {
+    let (Some(Tool { path: ffmpeg, .. }), Some(Tool { path: fpcalc, .. })) =
+        (&tools.ffmpeg, &tools.fpcalc)
+    else {
         die("ffmpeg and fpcalc must be on PATH for audio");
     };
     let files: Vec<PathBuf> = walkdir::WalkDir::new(folder)

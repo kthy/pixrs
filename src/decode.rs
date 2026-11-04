@@ -5,6 +5,7 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
+use crate::media::Format;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageError, ImageReader, Limits};
 use log::debug;
@@ -110,12 +111,6 @@ impl From<serde_json::Error> for DecodeError {
 /// phones store HEIC photos as.
 const FFMPEG_FOR_HEIC: (u32, u32) = (7, 1);
 
-/// Image extensions the `image` crate decodes, lowercase.
-const DECODED_IN_PROCESS: &[&str] = &["bmp", "gif", "jpeg", "jpg", "png", "tif", "tiff", "webp"];
-
-/// Image extensions only `ffmpeg` decodes, lowercase.
-const DECODED_BY_FFMPEG: &[&str] = &["avif", "heic", "heif"];
-
 /// Most bytes of pixels an image decoded in-process may take (the `image` crate's default): a
 /// file can claim any size in a few bytes, and allocating what it claims aborts the process.
 /// The largest camera images, 100 megapixels, take about 400 MB.
@@ -160,31 +155,32 @@ fn input_options(max_pixels: u64) -> Vec<String> {
         .collect()
 }
 
-/// How an image is decoded.
+/// How an image format is decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decoder {
-    InProcess,
+    /// By the `image` crate, with the crate that decodes the format and its major and minor
+    /// version, as image hash versions name it; `None` for formats the `image` crate decodes
+    /// itself, like BMP.
+    InProcess(Option<&'static str>),
+    /// By `ffmpeg`.
     Ffmpeg,
 }
 
-/// The lowercase extension of a `/`-separated path.
-pub fn extension(path: &str) -> String {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
+impl Decoder {
+    pub const GIF: Self = Self::InProcess(Some(concat!("gif ", env!("PIXRS_CRATE_gif"))));
+    pub const JPEG: Self =
+        Self::InProcess(Some(concat!("zune-jpeg ", env!("PIXRS_CRATE_zune_jpeg"))));
+    pub const PNG: Self = Self::InProcess(Some(concat!("png ", env!("PIXRS_CRATE_png"))));
+    pub const TIFF: Self = Self::InProcess(Some(concat!("tiff ", env!("PIXRS_CRATE_tiff"))));
+    pub const WEBP: Self =
+        Self::InProcess(Some(concat!("image-webp ", env!("PIXRS_CRATE_image_webp"))));
 }
 
-/// How an image at `path` can be decoded, if at all (RAW formats cannot).
+/// How an image at the `/`-separated `path` can be decoded, if at all (RAW formats cannot).
 pub fn image_decoder(path: &str) -> Option<Decoder> {
-    let ext = extension(path);
-    if DECODED_IN_PROCESS.contains(&ext.as_str()) {
-        Some(Decoder::InProcess)
-    } else if DECODED_BY_FFMPEG.contains(&ext.as_str()) {
-        Some(Decoder::Ffmpeg)
-    } else {
-        None
+    match Format::of(Path::new(path))? {
+        Format::Image(decoder) => decoder,
+        Format::Video | Format::Audio => None,
     }
 }
 
@@ -250,26 +246,34 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
     found.then(|| PathBuf::from(name))
 }
 
-/// The external tools the hash pass can use, found on `PATH`, with their versions.
+/// An external tool whose version goes into hash versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tool {
+    pub path: PathBuf,
+    /// As hash versions name it, e.g. `7.1` for `ffmpeg`.
+    pub version: String,
+}
+
+/// The external tools the hash pass can use, found on `PATH`.
 #[derive(Clone, Debug, Default)]
 pub struct Tools {
-    pub ffmpeg: Option<(PathBuf, String)>,
+    pub ffmpeg: Option<Tool>,
     pub ffprobe: Option<PathBuf>,
-    pub fpcalc: Option<(PathBuf, String)>,
+    pub fpcalc: Option<Tool>,
 }
 
 impl Tools {
     /// The tools on `PATH`.
     pub fn find() -> Self {
         Self {
-            ffmpeg: find_tool("ffmpeg").map(|f| {
-                let version = ffmpeg_version(&f);
-                (f, version)
+            ffmpeg: find_tool("ffmpeg").map(|path| Tool {
+                version: ffmpeg_version(&path),
+                path,
             }),
             ffprobe: find_tool("ffprobe"),
-            fpcalc: find_tool("fpcalc").map(|f| {
-                let version = crate::avhash::fpcalc_version(&f);
-                (f, version)
+            fpcalc: find_tool("fpcalc").map(|path| Tool {
+                version: crate::avhash::fpcalc_version(&path),
+                path,
             }),
         }
     }
@@ -293,13 +297,11 @@ pub fn ffmpeg_version(ffmpeg: &Path) -> String {
 
 /// `7.1` for `7.1.5-0+deb13u1` or `n7.1.2`; other versions unchanged.
 pub(crate) fn major_minor(version: &str) -> String {
-    let digits = version.trim_start_matches('n');
-    let parts: Vec<&str> = digits.splitn(3, '.').collect();
     let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
-    if parts.len() >= 2 && numeric(parts[0]) {
-        let minor: String = parts[1].chars().take_while(char::is_ascii_digit).collect();
-        if !minor.is_empty() {
-            return format!("{}.{}", parts[0], minor);
+    if let Some((major, rest)) = version.trim_start_matches('n').split_once('.') {
+        let minor: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if numeric(major) && !minor.is_empty() {
+            return format!("{major}.{minor}");
         }
     }
     String::from(version)
@@ -378,7 +380,8 @@ mod tests {
 
     #[test]
     fn test_image_decoder() {
-        assert_eq!(image_decoder("a/B.JPG"), Some(Decoder::InProcess));
+        assert_eq!(image_decoder("a/B.JPG"), Some(Decoder::JPEG));
+        assert_eq!(image_decoder("a.bmp"), Some(Decoder::InProcess(None)));
         assert_eq!(image_decoder("b.heic"), Some(Decoder::Ffmpeg));
         assert_eq!(image_decoder("d.cr2"), None);
         assert_eq!(image_decoder("no extension"), None);

@@ -5,9 +5,7 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::decode::{
-    decode_in_process, decode_with_ffmpeg, extension, image_decoder, DecodeError, Decoder,
-};
+use crate::decode::{decode_in_process, decode_with_ffmpeg, image_decoder, DecodeError, Decoder};
 use crate::media::Dimensions;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
@@ -69,15 +67,8 @@ pub fn hash_version(rel: &str, ffmpeg_version: &str) -> Option<String> {
     );
     let format_decoder = match image_decoder(rel)? {
         Decoder::Ffmpeg => format!("ffmpeg {}; png {}", ffmpeg_version, env!("PIXRS_CRATE_png")),
-        Decoder::InProcess => match extension(rel).as_str() {
-            "jpg" | "jpeg" => format!("zune-jpeg {}", env!("PIXRS_CRATE_zune_jpeg")),
-            "png" => format!("png {}", env!("PIXRS_CRATE_png")),
-            "gif" => format!("gif {}", env!("PIXRS_CRATE_gif")),
-            "webp" => format!("image-webp {}", env!("PIXRS_CRATE_image_webp")),
-            "tif" | "tiff" => format!("tiff {}", env!("PIXRS_CRATE_tiff")),
-            // BMP is decoded by the `image` crate itself.
-            _ => return Some(base),
-        },
+        Decoder::InProcess(Some(format_crate)) => String::from(format_crate),
+        Decoder::InProcess(None) => return Some(base),
     };
     Some(format!("{base}; {format_decoder}"))
 }
@@ -96,7 +87,7 @@ pub fn hash_image(
 ) -> Result<Option<ImageHashes>, DecodeError> {
     let (pixels, small, width, height) = match image_decoder(rel) {
         None => return Ok(None),
-        Some(Decoder::InProcess) => {
+        Some(Decoder::InProcess(_)) => {
             let (img, orientation) = decode_in_process(source)?;
             let pixels = pixel_hash(&img);
             let (mut width, mut height) = (img.width(), img.height());
