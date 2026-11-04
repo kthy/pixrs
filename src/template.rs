@@ -90,50 +90,58 @@ pub struct Facts<'a> {
 /// Why a template or layout is not valid.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TemplateError {
-    /// A folder name in the template is empty, `.` or `..`.
-    BadFolder { template: String },
-    /// The file name lacks `{ext}`.
-    NoExt { template: String },
-    /// A `{` is not closed.
-    Unclosed { template: String },
-    /// A `}` was not opened.
-    Unopened { template: String },
-    /// A token name is not one of the tokens.
-    UnknownToken { template: String, name: String },
-    /// A character is not allowed in file names on Windows.
-    Illegal { template: String, c: char },
+    /// The template `template` has a `problem`.
+    Template {
+        template: String,
+        problem: TemplateProblem,
+    },
     /// A layout lists a preset twice.
     Repeated { layout: String, preset: String },
     /// A layout preset does not exist.
     UnknownPreset { preset: String },
 }
 
+/// What is wrong with a template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TemplateProblem {
+    /// A folder name is empty, `.` or `..`.
+    BadFolder,
+    /// The file name lacks `{ext}`.
+    NoExt,
+    /// A `{` is not closed.
+    Unclosed,
+    /// A `}` was not opened.
+    Unopened,
+    /// A token name is not one of the tokens.
+    UnknownToken(String),
+    /// A character is not allowed in file names on Windows.
+    Illegal(char),
+}
+
+impl fmt::Display for TemplateProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadFolder => write!(f, "folder names cannot be empty, `.` or `..`"),
+            Self::NoExt => write!(
+                f,
+                "the file name must contain {{ext}}, or files lose their extension"
+            ),
+            Self::Unclosed => write!(f, "`{{` without a closing `}}`"),
+            Self::Unopened => write!(f, "`}}` without `{{`"),
+            Self::UnknownToken(name) => write!(
+                f,
+                "unknown token {{{name}}}. Tokens: {{year}} {{month}} {{day}} {{hour}} \
+                 {{minute}} {{second}} {{date}} {{time}} {{type}} {{camera}} {{name}} {{ext}}"
+            ),
+            Self::Illegal(c) => write!(f, "{c:?} is not allowed in file names on Windows"),
+        }
+    }
+}
+
 impl fmt::Display for TemplateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadFolder { template } => write!(
-                f,
-                "Template {template:?}: folder names cannot be empty, `.` or `..`"
-            ),
-            Self::NoExt { template } => write!(
-                f,
-                "Template {template:?}: the file name must contain {{ext}}, or files lose their \
-                 extension"
-            ),
-            Self::Unclosed { template } => {
-                write!(f, "Template {template:?}: `{{` without a closing `}}`")
-            }
-            Self::Unopened { template } => write!(f, "Template {template:?}: `}}` without `{{`"),
-            Self::UnknownToken { template, name } => write!(
-                f,
-                "Template {template:?}: unknown token {{{name}}}. Tokens: {{year}} {{month}} \
-                 {{day}} {{hour}} {{minute}} {{second}} {{date}} {{time}} {{type}} {{camera}} \
-                 {{name}} {{ext}}"
-            ),
-            Self::Illegal { template, c } => write!(
-                f,
-                "Template {template:?}: {c:?} is not allowed in file names on Windows"
-            ),
+            Self::Template { template, problem } => write!(f, "Template {template:?}: {problem}"),
             Self::Repeated { layout, preset } => {
                 write!(f, "Layout {layout:?} lists {preset} twice")
             }
@@ -151,25 +159,24 @@ impl std::error::Error for TemplateError {}
 impl Template {
     /// Parse a template like `{type}/{year}/{date}_{time}.{ext}`.
     pub fn parse(source: &str) -> Result<Self, TemplateError> {
+        Self::parse_parts(source).map_err(|problem| TemplateError::Template {
+            template: String::from(source),
+            problem,
+        })
+    }
+
+    fn parse_parts(source: &str) -> Result<Self, TemplateProblem> {
         let mut segments: Vec<Vec<Part>> = vec![];
         for segment in source.split('/') {
             if segment.is_empty() || segment == "." || segment == ".." {
-                return Err(TemplateError::BadFolder {
-                    template: String::from(source),
-                });
+                return Err(TemplateProblem::BadFolder);
             }
-            segments.push(parse_segment(source, segment)?);
+            segments.push(parse_segment(segment)?);
         }
-        let Some(file) = segments.pop() else {
-            return Err(TemplateError::NoExt {
-                template: String::from(source),
-            });
-        };
-        if !file.contains(&Part::Token(Token::Ext)) {
-            return Err(TemplateError::NoExt {
-                template: String::from(source),
-            });
-        }
+        let file = segments
+            .pop()
+            .filter(|file| file.contains(&Part::Token(Token::Ext)))
+            .ok_or(TemplateProblem::NoExt)?;
         Ok(Self {
             source: String::from(source),
             folders: segments,
@@ -272,44 +279,29 @@ fn whatsapp_counter(name: &str) -> Option<&str> {
 }
 
 /// Parse one `/`-free part of a template.
-fn parse_segment(source: &str, segment: &str) -> Result<Vec<Part>, TemplateError> {
-    let template = || String::from(source);
+fn parse_segment(segment: &str) -> Result<Vec<Part>, TemplateProblem> {
     let mut parts = vec![];
     let mut rest = segment;
     while !rest.is_empty() {
-        match rest.find(['{', '}']) {
-            Some(0) if rest.starts_with('{') => {
-                let end = rest.find('}').ok_or_else(|| TemplateError::Unclosed {
-                    template: template(),
-                })?;
-                let name = &rest[1..end];
-                let token = Token::parse(name).ok_or_else(|| TemplateError::UnknownToken {
-                    template: template(),
-                    name: String::from(name),
-                })?;
-                parts.push(Part::Token(token));
-                rest = &rest[end + 1..];
+        if let Some(after) = rest.strip_prefix('{') {
+            let (name, after) = after.split_once('}').ok_or(TemplateProblem::Unclosed)?;
+            let token = Token::parse(name)
+                .ok_or_else(|| TemplateProblem::UnknownToken(String::from(name)))?;
+            parts.push(Part::Token(token));
+            rest = after;
+        } else if rest.starts_with('}') {
+            return Err(TemplateProblem::Unopened);
+        } else {
+            let end = rest.find(['{', '}']).unwrap_or(rest.len());
+            let (text, after) = rest.split_at_checked(end).unwrap_or((rest, ""));
+            if let Some(c) = text
+                .chars()
+                .find(|&c| ILLEGAL.contains(&c) || c.is_control())
+            {
+                return Err(TemplateProblem::Illegal(c));
             }
-            Some(0) => {
-                return Err(TemplateError::Unopened {
-                    template: template(),
-                })
-            }
-            found => {
-                let end = found.unwrap_or(rest.len());
-                let text = &rest[..end];
-                if let Some(c) = text
-                    .chars()
-                    .find(|&c| ILLEGAL.contains(&c) || c.is_control())
-                {
-                    return Err(TemplateError::Illegal {
-                        template: template(),
-                        c,
-                    });
-                }
-                parts.push(Part::Text(String::from(text)));
-                rest = &rest[end..];
-            }
+            parts.push(Part::Text(String::from(text)));
+            rest = after;
         }
     }
     Ok(parts)

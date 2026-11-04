@@ -70,10 +70,10 @@ impl Format {
     /// The format of the file at `path`, by its extension in any letter case; `None` for files
     /// that are not media.
     pub fn of(path: &Path) -> Option<Self> {
-        let ext = extension(path)?;
+        let ext = path.extension()?.to_str()?;
         FORMATS
             .iter()
-            .find(|(known, _)| *known == ext)
+            .find(|(known, _)| known.eq_ignore_ascii_case(ext))
             .map(|&(_, format)| format)
     }
 
@@ -134,7 +134,7 @@ impl FromSql for MediaType {
         value
             .as_str()?
             .parse()
-            .map_err(|e: String| FromSqlError::Other(e.into()))
+            .map_err(|e: UnknownMediaType| FromSqlError::Other(e.into()))
     }
 }
 
@@ -178,15 +178,27 @@ impl Dimensions {
     }
 }
 
+/// A media type name that is none of `image`, `video` and `audio`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnknownMediaType(String);
+
+impl fmt::Display for UnknownMediaType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown media type {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownMediaType {}
+
 impl FromStr for MediaType {
-    type Err = String;
+    type Err = UnknownMediaType;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "image" => Ok(Self::Image),
             "video" => Ok(Self::Video),
             "audio" => Ok(Self::Audio),
-            _ => Err(format!("unknown media type {s:?}")),
+            _ => Err(UnknownMediaType(String::from(s))),
         }
     }
 }

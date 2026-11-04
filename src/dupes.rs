@@ -781,17 +781,15 @@ fn oldest_copy_of_largest_first(group: &mut [&Node]) {
     let Some((&largest, rest)) = group.split_first() else {
         return;
     };
-    let (first, _) = rest
+    // The first of equally old copies, as `min_by` gives it; the largest file itself unless a
+    // copy is older.
+    let first = rest
         .iter()
         .enumerate()
         .filter(|(_, node)| match_tier(largest, node) != Tier::Similar)
-        .fold((0, largest), |(best, best_node), (p, &node)| {
-            if oldest(node, best_node).is_lt() {
-                (p + 1, node)
-            } else {
-                (best, best_node)
-            }
-        });
+        .min_by(|(_, a), (_, b)| oldest(a, b))
+        .filter(|(_, copy)| oldest(copy, largest).is_lt())
+        .map_or(0, |(p, _)| p + 1);
     if let Some(head) = group.get_mut(..=first) {
         head.rotate_right(1);
     }

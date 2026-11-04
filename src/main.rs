@@ -304,7 +304,7 @@ fn relocate(opt: RelocateOpt) -> Result<(), Error> {
     print_folded(&s.folded);
     println!(
         "The catalog lists the {} {} in the library {} now. Scan it to pick up any changes.",
-        HumanCount(u64::try_from(s.files).unwrap_or(u64::MAX)),
+        HumanCount(s.files as u64),
         plural(s.files, "file", "files"),
         printable(&s.library.to_string())
     );
