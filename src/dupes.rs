@@ -12,6 +12,7 @@ use crate::catalog::{
     display_root, library_path, one_row_per_file, Catalog, HashedAv, HashedFile, HashedImage,
 };
 use crate::imagehash::{distance, fingerprints_match};
+use crate::media::Dimensions;
 use crate::text::shown;
 use indicatif::HumanBytes;
 use log::debug;
@@ -141,7 +142,6 @@ pub struct DupeInput {
 /// A file with whatever hashes it has.
 struct Node {
     file: HashedFile,
-    sha256: Option<String>,
     pixel_hash: Option<String>,
     phash: Option<u64>,
     fingerprint: Option<Vec<u8>>,
@@ -156,8 +156,8 @@ struct Node {
 fn group_tier(nodes: &[Node], group: &[usize]) -> Tier {
     let first = &nodes[group[0]];
     let all = |same: &dyn Fn(&Node) -> bool| group.iter().all(|&i| same(&nodes[i]));
-    if first.sha256.is_some()
-        && all(&|n| n.file.size == first.file.size && n.sha256 == first.sha256)
+    if first.file.sha256.is_some()
+        && all(&|n| n.file.size == first.file.size && n.file.sha256 == first.file.sha256)
     {
         Tier::Exact
     } else if first.pixel_hash.is_some() && all(&|n| n.pixel_hash == first.pixel_hash) {
@@ -171,7 +171,7 @@ fn group_tier(nodes: &[Node], group: &[usize]) -> Tier {
 /// because its perceptual hash is close to that of some file in it).
 fn match_tier(keeper: &Node, file: &Node) -> Tier {
     let same = |a: &Option<String>, b: &Option<String>| a.is_some() && a == b;
-    if keeper.file.size == file.file.size && same(&keeper.sha256, &file.sha256) {
+    if keeper.file.size == file.file.size && same(&keeper.file.sha256, &file.file.sha256) {
         Tier::Exact
     } else if same(&keeper.pixel_hash, &file.pixel_hash) {
         Tier::SamePixels
@@ -205,12 +205,8 @@ impl Sets {
 }
 
 /// Long side over short side of an image, 0 if unknown.
-pub fn aspect(width: u32, height: u32) -> f64 {
-    if width == 0 || height == 0 {
-        0.0
-    } else {
-        f64::from(width.max(height)) / f64::from(width.min(height))
-    }
+pub fn aspect(dimensions: Option<Dimensions>) -> f64 {
+    dimensions.map_or(0.0, Dimensions::aspect)
 }
 
 /// Whether two aspect ratios (from `aspect`) are close enough for the images to be resized
@@ -281,7 +277,6 @@ fn add_node(
         .entry((file.library_id, file.path.clone()))
         .or_insert_with(|| {
             nodes.push(Node {
-                sha256: (!file.sha256.is_empty()).then(|| file.sha256.clone()),
                 pixel_hash: None,
                 phash: None,
                 fingerprint: None,
@@ -307,15 +302,15 @@ fn similar_av(
 ) -> Vec<(usize, usize)> {
     let mut videos: Vec<(usize, i64, f64, &[Frame])> = items
         .iter()
-        .filter(|(_, a)| short_videos || a.duration_ms >= SHORT_VIDEO_MS)
+        .filter(|(_, a)| short_videos || a.signature.duration_ms() >= SHORT_VIDEO_MS)
         .filter_map(|(i, a)| {
-            let frames = a.frames.as_deref()?;
-            Some((*i, a.duration_ms, aspect(a.width, a.height), frames))
+            let frames = a.signature.frames()?;
+            Some((*i, a.signature.duration_ms(), aspect(a.dimensions), frames))
         })
         .collect();
     let mut audio: Vec<(usize, i64, &[u32])> = items
         .iter()
-        .filter_map(|(i, a)| Some((*i, a.duration_ms, a.chromaprint.as_deref()?)))
+        .filter_map(|(i, a)| Some((*i, a.signature.duration_ms(), a.signature.chromaprint()?)))
         .filter(|(_, _, values)| has_detail(values))
         .collect();
     videos.sort_by_key(|v| v.1);
@@ -364,10 +359,11 @@ pub fn load_dupes(
     let files = files.chain(input.images.iter().map(|image| &image.file));
     let files = files.chain(input.av.iter().map(|av| &av.file));
     if let Some(keep) = one_row_per_file(files) {
-        let kept = |f: &HashedFile| keep.contains(&(f.library_id, f.path.clone()));
-        input.exact.retain(|f| kept(f));
-        input.images.retain(|image| kept(&image.file));
-        input.av.retain(|av| kept(&av.file));
+        // In the order the files were chained.
+        let mut keep = keep.into_iter();
+        input.exact.retain(|_| keep.next().unwrap_or(true));
+        input.images.retain(|_| keep.next().unwrap_or(true));
+        input.av.retain(|_| keep.next().unwrap_or(true));
     }
     debug!(
         "Loaded {} files that share size and SHA-256, {} decoded images, {} videos and audio",
@@ -455,10 +451,12 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similarity: Similarity) 
     for (i, image) in images {
         let node = &mut nodes[i];
         node.pixel_hash = Some(image.pixel_hash);
-        node.phash = image.phash;
-        node.fingerprint = image.fingerprint;
-        node.pixels = u64::from(image.width) * u64::from(image.height);
-        node.aspect = aspect(image.width, image.height);
+        if let Some(visual) = image.visual {
+            node.phash = Some(visual.phash);
+            node.fingerprint = Some(visual.fingerprint);
+        }
+        node.pixels = image.dimensions.map_or(0, Dimensions::pixels);
+        node.aspect = aspect(image.dimensions);
     }
 
     // Videos and audio, for the keeper rule (largest first) and similarity.
@@ -467,14 +465,14 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similarity: Similarity) 
         .into_iter()
         .map(|item| {
             let i = add_node(&mut nodes, &mut index, item.file.clone());
-            nodes[i].pixels = u64::from(item.width) * u64::from(item.height);
-            nodes[i].aspect = aspect(item.width, item.height);
+            nodes[i].pixels = item.dimensions.map_or(0, Dimensions::pixels);
+            nodes[i].aspect = aspect(item.dimensions);
             (i, item)
         })
         .collect();
 
     let mut sets = Sets((0..nodes.len()).collect());
-    let mut exact_sets: HashMap<(u64, String), Vec<usize>> = HashMap::new();
+    let mut exact_sets: HashMap<(u64, Option<String>), Vec<usize>> = HashMap::new();
     for &i in &exact {
         let key = (nodes[i].file.size, nodes[i].file.sha256.clone());
         exact_sets.entry(key).or_default().push(i);
@@ -616,7 +614,7 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similarity: Similarity) 
                 })
                 .collect();
             let sha256 = (tier == Tier::Exact)
-                .then(|| keeper.sha256.clone())
+                .then(|| keeper.file.sha256.clone())
                 .flatten();
             DupeGroup {
                 tier,
@@ -780,10 +778,27 @@ fn csv_field(value: &str) -> String {
 mod tests {
     use super::*;
 
-    use crate::catalog::{FileRecord, MediaMeta, Stamp};
+    use crate::avhash::{AudioFingerprint, VideoSignature};
+    use crate::catalog::{AvSignature, FileRecord, MediaMeta, Stamp};
+    use crate::imagehash::{ImageHashes, Visual};
     use crate::media::MediaType;
     use pretty_assertions::assert_eq;
     use tempfile::{tempdir, TempDir};
+
+    /// Image hashes with a perceptual hash, if `phash` is given, and `fingerprint`.
+    fn image_hashes(
+        pixels: &str,
+        phash: Option<u64>,
+        fingerprint: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> ImageHashes {
+        ImageHashes {
+            pixels: String::from(pixels),
+            visual: phash.map(|phash| Visual { phash, fingerprint }),
+            dimensions: Dimensions { width, height },
+        }
+    }
 
     /// A catalog in a temp dir, filled directly so tests control sizes, hashes and mtimes.
     struct Fixture {
@@ -1178,13 +1193,7 @@ mod tests {
         fx.add("/lib", "c.jpg", 50, 5, None);
         let id = fx.catalog.find_library("/lib").unwrap().unwrap();
         let set = |path: &str, pixels: &str, perceptual: u64, side: u32| {
-            let hashes = crate::imagehash::ImageHashes {
-                pixels: String::from(pixels),
-                perceptual: Some(perceptual),
-                fingerprint: Some(vec![100; 16]),
-                width: side,
-                height: side,
-            };
+            let hashes = image_hashes(pixels, Some(perceptual), vec![100; 16], side, side);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
@@ -1236,13 +1245,7 @@ mod tests {
         fx.add("/lib", "burst.jpg", 90, 3, None);
         let id = fx.catalog.find_library("/lib").unwrap().unwrap();
         let set = |path: &str, pixels: &str, perceptual: u64| {
-            let hashes = crate::imagehash::ImageHashes {
-                pixels: String::from(pixels),
-                perceptual: Some(perceptual),
-                fingerprint: Some(vec![100; 16]),
-                width: 10,
-                height: 10,
-            };
+            let hashes = image_hashes(pixels, Some(perceptual), vec![100; 16], 10, 10);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
@@ -1270,11 +1273,11 @@ mod tests {
     fn test_audio_without_detail_is_never_similar() {
         let audio = |values: Vec<u32>| HashedAv {
             file: HashedFile::default(),
-            duration_ms: 30_000,
-            width: 0,
-            height: 0,
-            frames: None,
-            chromaprint: Some(values),
+            dimensions: None,
+            signature: AvSignature::Audio(AudioFingerprint {
+                duration_ms: 30_000,
+                values,
+            }),
         };
         let tone = || vec![558_758_263; 221];
         let music = || (0..221u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
@@ -1294,13 +1297,7 @@ mod tests {
         fx.add("/lib", "flat too.jpg", 60, 5, None);
         let id = fx.catalog.find_library("/lib").unwrap().unwrap();
         let set = |path: &str, perceptual: Option<u64>, width: u32, height: u32| {
-            let hashes = crate::imagehash::ImageHashes {
-                pixels: String::from(path),
-                perceptual,
-                fingerprint: perceptual.map(|_| vec![100; 16]),
-                width,
-                height,
-            };
+            let hashes = image_hashes(path, perceptual, vec![100; 16], width, height);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
@@ -1334,13 +1331,7 @@ mod tests {
         let mut moved = vec![100u8; 1024];
         moved[..40].fill(200);
         for (path, fingerprint) in [("shot 1.jpg", vec![100u8; 1024]), ("shot 2.jpg", moved)] {
-            let hashes = crate::imagehash::ImageHashes {
-                pixels: String::from(path),
-                perceptual: Some(0),
-                fingerprint: Some(fingerprint),
-                width: 40,
-                height: 30,
-            };
+            let hashes = image_hashes(path, Some(0), fingerprint, 40, 30);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
@@ -1360,13 +1351,8 @@ mod tests {
         fx.add("/lib", "c.jpg", 90, 3, None);
         let id = fx.catalog.find_library("/lib").unwrap().unwrap();
         for path in ["a.jpg", "c.jpg"] {
-            let hashes = crate::imagehash::ImageHashes {
-                pixels: String::from("p"),
-                perceptual: Some(path.len() as u64 * 0xffff),
-                fingerprint: Some(vec![100; 16]),
-                width: 10,
-                height: 10,
-            };
+            let phash = path.len() as u64 * 0xffff;
+            let hashes = image_hashes("p", Some(phash), vec![100; 16], 10, 10);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
@@ -1380,11 +1366,14 @@ mod tests {
     fn test_short_videos_are_only_compared_with_similar() {
         let video = |duration_ms: i64| HashedAv {
             file: HashedFile::default(),
-            duration_ms,
-            width: 640,
-            height: 360,
-            frames: Some((0..9).map(Some).collect()),
-            chromaprint: None,
+            dimensions: Some(Dimensions {
+                width: 640,
+                height: 360,
+            }),
+            signature: AvSignature::Video(VideoSignature {
+                duration_ms,
+                frames: (0..9).map(Some).collect(),
+            }),
         };
         let short = [(0, video(3000)), (1, video(3000))];
         assert_eq!(similar_av(&short, DEFAULT_THRESHOLD, false), vec![]);

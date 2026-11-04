@@ -114,7 +114,7 @@ fn main() {
         .hashed_images(true)
         .unwrap_or_else(|e| die(&e.to_string()))
         .into_iter()
-        .filter(|image| image.phash.is_some() && image.fingerprint.is_some())
+        .filter(|image| image.visual.is_some())
         .collect();
     // A fixed order, so samples and saved answers stay the same between runs.
     images.sort_by(|a, b| (&a.file.root, &a.file.path).cmp(&(&b.file.root, &b.file.path)));
@@ -191,7 +191,7 @@ fn metrics(diffs: &[u8]) -> [f64; 5] {
 }
 
 fn find_candidates(images: &[HashedImage], max_distance: u32) -> Vec<Candidate> {
-    let aspects: Vec<f64> = images.iter().map(|i| aspect(i.width, i.height)).collect();
+    let aspects: Vec<f64> = images.iter().map(|i| aspect(i.dimensions)).collect();
     let mut candidates = vec![];
     for a in 0..images.len() {
         for b in a + 1..images.len() {
@@ -199,12 +199,12 @@ fn find_candidates(images: &[HashedImage], max_distance: u32) -> Vec<Candidate> 
             if x.pixel_hash == y.pixel_hash || !aspects_match(aspects[a], aspects[b]) {
                 continue;
             }
-            let hash_distance = distance(x.phash.unwrap_or_default(), y.phash.unwrap_or_default());
+            let (Some(xv), Some(yv)) = (&x.visual, &y.visual) else {
+                continue;
+            };
+            let hash_distance = distance(xv.phash, yv.phash);
             if hash_distance <= max_distance {
-                let diffs = fingerprint_differences(
-                    x.fingerprint.as_deref().unwrap_or_default(),
-                    y.fingerprint.as_deref().unwrap_or_default(),
-                );
+                let diffs = fingerprint_differences(&xv.fingerprint, &yv.fingerprint);
                 candidates.push(Candidate {
                     a,
                     b,
@@ -300,14 +300,20 @@ fn sample_variants(
                         let Some(upright) = decode(image, roots, ffmpeg) else {
                             continue;
                         };
-                        let original = image.phash.unwrap_or_default();
-                        let fingerprint = image.fingerprint.as_deref().unwrap_or_default();
+                        let Some(visual) = &image.visual else {
+                            continue;
+                        };
+                        let (original, fingerprint) =
+                            (visual.phash, visual.fingerprint.as_slice());
                         for (v, name) in VARIANTS.iter().enumerate() {
                             // A variant without detail counts as missed.
                             let measured = match perceptual_hash(&make_variant(&upright, name)) {
-                                Some((hash, variant)) => (
-                                    distance(original, hash),
-                                    metrics(&fingerprint_differences(fingerprint, &variant)),
+                                Some(variant) => (
+                                    distance(original, variant.phash),
+                                    metrics(&fingerprint_differences(
+                                        fingerprint,
+                                        &variant.fingerprint,
+                                    )),
                                 ),
                                 None => (64, [255.0; 5]),
                             };
@@ -696,6 +702,7 @@ fn write_review(
             for k in [c.a, c.b] {
                 let f = &images[k].file;
                 let (small, big) = renditions(k);
+                let (width, height) = images[k].dimensions.map_or((0, 0), |d| (d.width, d.height));
                 let _ = write!(
                     html,
                     "<figure><img loading=\"lazy\" src=\"{}\" data-large=\"{}\">\
@@ -704,8 +711,8 @@ fn write_review(
                     big,
                     escape(&f.path),
                     f.size / 1000,
-                    images[k].width,
-                    images[k].height
+                    width,
+                    height
                 );
             }
             html.push_str("<label><input type=\"checkbox\"> different pictures</label></div>");

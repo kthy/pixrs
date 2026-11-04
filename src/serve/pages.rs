@@ -217,14 +217,10 @@ fn respond(query: &ListQuery, items: Markup, page: impl FnOnce(Markup) -> Markup
 
 /// The offset and one extra row, to find out whether there is a next page. `page` is at most
 /// `MAX_PAGE`.
-#[allow(
-    clippy::cast_possible_wrap,
-    reason = "page numbers and sizes are small"
-)]
 const fn page_slice(page: usize, size: usize) -> Page {
     Page {
-        limit: size as i64 + 1,
-        offset: ((page - 1) * size) as i64,
+        limit: size + 1,
+        offset: (page - 1) * size,
     }
 }
 

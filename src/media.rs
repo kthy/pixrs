@@ -5,6 +5,7 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, Value, ValueRef};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
@@ -63,6 +64,52 @@ impl MediaType {
 impl fmt::Display for MediaType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl ToSql for MediaType {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for MediaType {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|e: String| FromSqlError::Other(e.into()))
+    }
+}
+
+impl From<MediaType> for Value {
+    fn from(media_type: MediaType) -> Self {
+        Self::Text(String::from(media_type.as_str()))
+    }
+}
+
+/// Width and height of an image or video in pixels, both above zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Dimensions {
+    /// The dimensions, if both are known and above zero.
+    pub fn new(width: Option<u32>, height: Option<u32>) -> Option<Self> {
+        let (width, height) = (width?, height?);
+        (width > 0 && height > 0).then_some(Self { width, height })
+    }
+
+    /// Width times height.
+    pub fn pixels(self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
+
+    /// Long side over short side.
+    pub fn aspect(self) -> f64 {
+        f64::from(self.width.max(self.height)) / f64::from(self.width.min(self.height))
     }
 }
 
