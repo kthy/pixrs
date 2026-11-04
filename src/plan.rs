@@ -7,7 +7,7 @@
  *************************************************************************************************/
 
 use crate::catalog::{display_root, library_path, Catalog, FileRecord, FileRef, Library, Stamp};
-use crate::dates::{from_name, from_taken_at, Taken};
+use crate::dates::{from_name, Taken};
 use crate::dupes::{plural, DupeFile, DupeGroup, DupeReport, Role, Tier};
 use crate::error::{AtPath, Error};
 use crate::media::MediaType;
@@ -685,7 +685,7 @@ fn date_taken(
     opts: &OrganizeOptions,
 ) -> (Option<Taken>, &'static str) {
     let plausible = |t: &Taken| opts.trust_dates || t.is_plausible(opts.now);
-    let from_meta = file.meta.taken_at.as_deref().and_then(from_taken_at);
+    let from_meta = file.meta.taken();
     if let (Some(raw), Some(false)) = (&file.meta.taken_at, from_meta.map(|t| plausible(&t))) {
         debug!(
             "{}: metadata date {} is before 1980 or in the future; ignored",

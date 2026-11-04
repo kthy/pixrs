@@ -8,7 +8,6 @@
 use super::thumbs::{self, ViewSource};
 use super::{AppError, AppState};
 use crate::catalog::{display_root, FileRecord, FileRef, Filter, Page};
-use crate::dates::from_taken_at;
 use crate::dupes::{human_mtime, plural, DupeGroup, Role, Tier};
 use crate::media::MediaType;
 use axum::extract::{Path as UrlPath, Query, State};
@@ -17,7 +16,7 @@ use indicatif::HumanBytes;
 use maud::{html, Markup, DOCTYPE};
 use serde::Deserialize;
 use std::sync::Arc;
-use time::OffsetDateTime;
+use time::{Month, OffsetDateTime};
 
 /// Files per page in listings.
 const PAGE_SIZE: usize = 200;
@@ -410,26 +409,11 @@ pub async fn dates_latest(
 
 /// `YYYY-MM` as `May 2024`, or `None` if it is not a month.
 fn month_label(month: &str) -> Option<String> {
-    const NAMES: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ];
     let (year, number) = month.split_once('-')?;
     if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) || number.len() != 2 {
         return None;
     }
-    let index: usize = number.parse().ok()?;
-    let name = NAMES.get(index.checked_sub(1)?)?;
+    let name = Month::try_from(number.parse::<u8>().ok()?).ok()?;
     Some(format!("{name} {year}"))
 }
 
@@ -671,9 +655,7 @@ pub async fn view(
 
     let dubious_date = file
         .meta
-        .taken_at
-        .as_deref()
-        .and_then(from_taken_at)
+        .taken()
         .is_some_and(|taken| !taken.is_plausible(OffsetDateTime::now_utc()));
 
     let context = Context {
@@ -783,6 +765,24 @@ mod tests {
     #[test]
     fn test_month_label() {
         assert_eq!(month_label("2024-05").as_deref(), Some("May 2024"));
+        let names = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ];
+        for (number, name) in (1..=12).zip(names) {
+            let label = month_label(&format!("1999-{number:02}"));
+            assert_eq!(label, Some(format!("{name} 1999")));
+        }
         assert_eq!(month_label("2024-13"), None);
         assert_eq!(month_label("2024-00"), None);
         assert_eq!(month_label("../etc"), None);
