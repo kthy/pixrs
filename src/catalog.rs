@@ -28,7 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i32 = 2;
+pub(crate) const SCHEMA_VERSION: i32 = 2;
 
 /// SQL that takes a catalog from one schema version to the next: the first entry takes version 1
 /// to 2, and so on.
@@ -172,14 +172,11 @@ impl Catalog {
             ))?,
             SCHEMA_VERSION => {}
             v if (1..SCHEMA_VERSION).contains(&v) => migrate(&conn)?,
-            v => {
-                return Err(Error::Usage(format!(
-                    "{} has catalog schema version {}, but this version of pixrs only \
-                     understands version {}",
-                    path.display(),
-                    v,
-                    SCHEMA_VERSION
-                )))
+            version => {
+                return Err(Error::UnknownSchema {
+                    path: path.to_path_buf(),
+                    version,
+                })
             }
         }
         Ok(Self { conn })
@@ -190,10 +187,7 @@ impl Catalog {
     /// journal file cannot make a catalog, or put tables into another SQLite file.
     pub fn open_for_update(path: &Path) -> Result<Self, Error> {
         if !path.is_file() {
-            return Err(Error::Usage(format!(
-                "There is no catalog at {}",
-                path.display()
-            )));
+            return Err(Error::CatalogGone(path.to_path_buf()));
         }
         let conn = Connection::open_with_flags(
             path,
@@ -205,13 +199,10 @@ impl Catalog {
         if (1..SCHEMA_VERSION).contains(&version) {
             migrate(&conn)?;
         } else if version != SCHEMA_VERSION {
-            return Err(Error::Usage(format!(
-                "{} is not a catalog this version of pixrs understands (schema version {}, \
-                 expected {})",
-                path.display(),
+            return Err(Error::UnknownSchema {
+                path: path.to_path_buf(),
                 version,
-                SCHEMA_VERSION
-            )));
+            });
         }
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -223,10 +214,7 @@ impl Catalog {
     /// one is migrated first.
     pub fn open_existing(path: &Path) -> Result<Self, Error> {
         if !path.is_file() {
-            return Err(Error::Usage(format!(
-                "There is no catalog at {}. Run `pixrs scan <LIBRARY>` first.",
-                path.display()
-            )));
+            return Err(Error::NoCatalog(path.to_path_buf()));
         }
         let conn = Connection::open_with_flags(
             path,
@@ -244,13 +232,10 @@ impl Catalog {
             writer.busy_timeout(Duration::from_secs(5))?;
             migrate(&writer)?;
         } else if version != SCHEMA_VERSION {
-            return Err(Error::Usage(format!(
-                "{} is not a catalog this version of pixrs understands (schema version {}, \
-                 expected {})",
-                path.display(),
+            return Err(Error::UnknownSchema {
+                path: path.to_path_buf(),
                 version,
-                SCHEMA_VERSION
-            )));
+            });
         }
         Ok(Self { conn })
     }
@@ -1604,7 +1589,7 @@ mod tests {
         let path = dir.path().join("catalog.sqlite");
         assert!(matches!(
             Catalog::open_existing(&path),
-            Err(Error::Usage(_))
+            Err(Error::NoCatalog(_))
         ));
         assert!(!path.exists());
     }
@@ -1616,7 +1601,7 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(
             Catalog::open_existing(&path),
-            Err(Error::Usage(_))
+            Err(Error::UnknownSchema { version: 0, .. })
         ));
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
@@ -1636,7 +1621,10 @@ mod tests {
             .unwrap()
             .pragma_update(None, "user_version", 99)
             .unwrap();
-        assert!(matches!(Catalog::open(&path), Err(Error::Usage(_))));
+        assert!(matches!(
+            Catalog::open(&path),
+            Err(Error::UnknownSchema { version: 99, .. })
+        ));
     }
 
     /// A catalog at `path` with schema version 1 and one library holding `files`: path, media

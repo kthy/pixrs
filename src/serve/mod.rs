@@ -22,7 +22,7 @@ use axum::routing::get;
 use axum::Router;
 use directories::ProjectDirs;
 use log::{debug, log_enabled, warn, Level};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -80,12 +80,41 @@ pub(crate) struct CachedDupes {
 #[derive(Debug)]
 pub(crate) enum AppError {
     NotFound,
-    Internal(String),
+    /// A catalog query failed.
+    Catalog(rusqlite::Error),
+    /// A task on the blocking thread pool panicked or was cancelled.
+    Task(tokio::task::JoinError),
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "Not found"),
+            Self::Catalog(e) => write!(f, "catalog error: {e}"),
+            Self::Task(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for AppError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotFound => None,
+            Self::Catalog(e) => Some(e),
+            Self::Task(e) => Some(e),
+        }
+    }
 }
 
 impl From<rusqlite::Error> for AppError {
     fn from(e: rusqlite::Error) -> Self {
-        Self::Internal(format!("catalog error: {e}"))
+        Self::Catalog(e)
+    }
+}
+
+impl From<tokio::task::JoinError> for AppError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        Self::Task(e)
     }
 }
 
@@ -93,7 +122,8 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "Not found").into_response(),
-            Self::Internal(msg) => {
+            e => {
+                let msg = e.to_string();
                 warn!("{msg}");
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             }
@@ -122,8 +152,7 @@ impl AppState {
             let catalog = state.catalog.lock().unwrap_or_else(PoisonError::into_inner);
             f(&catalog)
         })
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
+        .await?
         .map_err(AppError::from)
     }
 
@@ -157,8 +186,7 @@ impl AppState {
         let report = tokio::task::spawn_blocking(move || {
             Arc::new(group_dupes(input, &state.libraries, state.similarity))
         })
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .await?;
         *cached = Some(CachedDupes {
             version,
             made: Instant::now(),
@@ -212,11 +240,9 @@ pub fn run(config: Config, ready: impl FnOnce(&str)) -> Result<(), Error> {
     runtime.block_on(async {
         let listener = TcpListener::bind(("127.0.0.1", config.port))
             .await
-            .map_err(|e| {
-                Error::Usage(format!(
-                    "Unable to listen on 127.0.0.1:{}: {}",
-                    config.port, e
-                ))
+            .map_err(|source| Error::Listen {
+                port: config.port,
+                source,
             })?;
         // The port the OS picked, if it was 0.
         let port = listener.local_addr()?.port();
@@ -256,11 +282,10 @@ fn check_cache_outside_libraries(catalog: &Catalog, cache_dir: &Path) -> Result<
     let cache_dir = resolve(cache_dir)?;
     for library in catalog.libraries()? {
         if cache_dir.starts_with(&library.root) {
-            return Err(Error::Usage(format!(
-                "The thumbnail cache {} must be outside the library {}; pass --cache",
-                cache_dir.display(),
-                crate::catalog::display_root(&library.root)
-            )));
+            return Err(Error::CacheInLibrary {
+                cache: cache_dir,
+                library: library.root,
+            });
         }
     }
     Ok(())
@@ -398,10 +423,7 @@ async fn media(
     req: Request,
 ) -> Result<Response, AppError> {
     let located = state.locate(lib, path).await?;
-    let res = ServeFile::new(located.full_path)
-        .oneshot(req)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let Ok(res) = ServeFile::new(located.full_path).oneshot(req).await;
     Ok(res.map(Body::new))
 }
 
@@ -760,7 +782,7 @@ mod tests {
         let catalog = Catalog::open_existing(&dir.join("catalog.sqlite")).unwrap();
         assert!(matches!(
             check_cache_outside_libraries(&catalog, &f.root.join("thumbs")),
-            Err(Error::Usage(_))
+            Err(Error::CacheInLibrary { .. })
         ));
         assert!(check_cache_outside_libraries(&catalog, &f.cache).is_ok());
     }

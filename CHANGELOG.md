@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Exit codes follow the cause of an error, after `sysexits.h`: 64 for a bad argument (as all
+  errors were before), 65 for a plan, journal or catalog file pixrs cannot use, 74 for a file
+  or folder that cannot be read or written (a library that disappears during a scan, a folder
+  that cannot be listed), 75 while another `apply`, `undo` or `relocate` holds the lock, and 70
+  for a catalog database error.
+- Ctrl-C exits with 130, as shells report an interrupted program, instead of 0.
+- Errors about a library that has not been scanned, or is part of another library, start with
+  the command that failed (`Dupes failed: ...`), like every other error. An I/O error on a plan
+  or journal file names the file.
 - The viewer marks a date taken before 1980 or in the future with a `?` whose tooltip says it is
   probably wrong; `pixrs organize` ignores such dates unless `--trust-dates` is given.
 - `pixrs organize` names WhatsApp files by their date and WhatsApp's counter, which stands in for

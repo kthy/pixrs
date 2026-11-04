@@ -6,7 +6,7 @@
  *************************************************************************************************/
 
 use crate::catalog::{Catalog, CatalogRow};
-use crate::error::Error;
+use crate::error::{AtPath, Error};
 use crate::names::folded;
 use crate::plan::{state_dir, Keeper, Move, Plan};
 use crate::text::{printable, shown};
@@ -15,6 +15,7 @@ use ring::digest::{Context, SHA256};
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -127,11 +128,7 @@ impl Lock {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.clone());
                 Ok(Self(path))
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Usage(format!(
-                "{} exists: another `pixrs apply`, `undo` or `relocate` is running on this \
-                 catalog. If none is (it crashed), delete the file and try again.",
-                path.display()
-            ))),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Locked(path)),
             Err(e) => Err(e.into()),
         }
     }
@@ -151,22 +148,25 @@ impl Drop for Lock {
 }
 
 /// Test hooks for `apply`.
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "test hooks, to become an enum"
-)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ApplyOptions {
-    /// Stop as if interrupted after this many files were moved.
-    pub stop_after: Option<usize>,
-    /// Stop as if interrupted after the first move, before the catalog follows it.
-    pub stop_before_catalog: bool,
+pub(crate) struct ApplyOptions {
     /// Copy instead of renaming, as across file systems.
-    pub force_copy: bool,
-    /// Stop as if interrupted halfway through the first copy.
-    pub stop_in_copy: bool,
-    /// Stop as if interrupted halfway through the first rename that only changes letter case.
-    pub stop_in_rename: bool,
+    pub(crate) force_copy: bool,
+    /// Where to stop as if interrupted.
+    pub(crate) stop: Option<Stop>,
+}
+
+/// Where a test stops `apply` as if it was interrupted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// After this many files were moved.
+    AfterMoves(usize),
+    /// After the first move, before the catalog follows it.
+    BeforeCatalog,
+    /// Halfway through the first copy.
+    InCopy,
+    /// Halfway through the first rename that only changes letter case.
+    InRename,
 }
 
 /// What `apply` did.
@@ -191,10 +191,137 @@ enum MoveError {
     /// Something is at the target; nothing is ever overwritten.
     Taken,
     /// It failed before anything changed.
-    Failed(io::Error),
+    Failed(MoveFault),
     /// It failed halfway: the file may be at a temporary name, or in two places. Only undo
     /// should touch it now.
-    Partial(io::Error),
+    Partial(MoveFault),
+}
+
+/// What went wrong in a move.
+#[derive(Debug)]
+pub enum MoveFault {
+    /// A file operation failed.
+    Io(io::Error),
+    /// The `copy` of `source` across file systems does not read back the same.
+    CopyMismatch { copy: PathBuf, source: PathBuf },
+    /// The source changed while it was copied, so both are kept.
+    ChangedWhileCopied(PathBuf),
+    /// A file turned up at `target` during a rename that only changes the spelling; the moved
+    /// file waits at `waiting`.
+    TurnedUp { target: PathBuf, waiting: PathBuf },
+    /// Someone replaced the temporary file at this path.
+    Replaced(PathBuf),
+    /// A symbolic link is on the way to this folder.
+    ThroughLink(PathBuf),
+    /// A test stopped the move halfway.
+    Stopped,
+}
+
+impl fmt::Display for MoveFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{e}"),
+            Self::CopyMismatch { copy, source } => write!(
+                f,
+                "the copy {} does not match {}",
+                copy.display(),
+                source.display()
+            ),
+            Self::ChangedWhileCopied(source) => write!(
+                f,
+                "{} changed while it was copied; both are kept",
+                source.display()
+            ),
+            Self::TurnedUp { target, waiting } => write!(
+                f,
+                "{} turned up during the rename; the file waits at {}",
+                target.display(),
+                waiting.display()
+            ),
+            Self::Replaced(temp) => write!(
+                f,
+                "the temporary file {} was replaced by something else; left there",
+                temp.display()
+            ),
+            Self::ThroughLink(dir) => {
+                write!(f, "{} is reached through a symbolic link", dir.display())
+            }
+            Self::Stopped => write!(f, "stopped as asked"),
+        }
+    }
+}
+
+impl std::error::Error for MoveFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for MoveFault {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Why a move of the plan was skipped.
+#[derive(Debug)]
+enum Skip {
+    /// The file is no longer there.
+    Gone,
+    /// The path is not a file.
+    NotAFile,
+    /// The file changed since the plan was made.
+    Changed,
+    /// It is a sidecar whose media file was not moved.
+    MediaNotMoved,
+    /// The kept copy at this path is gone or changed.
+    KeeperChanged(String),
+    /// It is the same file as the kept copy at this path.
+    SameAsKeeper(String),
+    /// A symbolic link is on the way to its folder (`target`: its target folder).
+    ThroughLink { target: bool, dir: PathBuf },
+    /// Whether a link is on the way to `dir` cannot be checked.
+    Unchecked { dir: PathBuf, source: io::Error },
+    /// Its target folder cannot be created.
+    NoFolder(io::Error),
+    /// Something is at the target.
+    Taken(String),
+    /// The move failed before anything changed.
+    Failed(MoveFault),
+}
+
+impl fmt::Display for Skip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gone => write!(f, "it is no longer there"),
+            Self::NotAFile => write!(f, "it is not a file"),
+            Self::Changed => write!(f, "it changed since the plan was made"),
+            Self::MediaNotMoved => write!(f, "its media file was not moved"),
+            Self::KeeperChanged(path) => write!(f, "the kept copy {path} is gone or changed"),
+            Self::SameAsKeeper(path) => {
+                write!(f, "it is the same file as the kept copy {path}")
+            }
+            Self::ThroughLink { target, dir } => write!(
+                f,
+                "{} {} is reached through a symbolic link",
+                if *target {
+                    "its target folder"
+                } else {
+                    "its folder"
+                },
+                dir.display()
+            ),
+            Self::Unchecked { dir, source } => {
+                write!(f, "cannot check {}: {}", dir.display(), source)
+            }
+            Self::NoFolder(e) => write!(f, "cannot create its folder: {e}"),
+            Self::Taken(target) => write!(f, "{target} is taken"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// Number for temporary file names, unique within the process.
@@ -415,7 +542,7 @@ fn copy_verified(
     copy: &mut File,
     mtime: i64,
     stop_in_copy: bool,
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, MoveFault> {
     let mut source = File::open(from)?;
     let mut context = Context::new(&SHA256);
     let mut buffer = vec![0; 256 * 1024];
@@ -424,12 +551,12 @@ fn copy_verified(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         context.update(&buffer[..n]);
         copy.write_all(&buffer[..n])?;
         if stop_in_copy {
-            return Err(io::Error::other("stopped in the middle of a copy"));
+            return Err(MoveFault::Stopped);
         }
     }
     copy.sync_all()?;
@@ -437,11 +564,10 @@ fn copy_verified(
     let hash = context.finish().as_ref().to_vec();
     copy.seek(io::SeekFrom::Start(0))?;
     if sha256_from(copy)? != hash {
-        return Err(io::Error::other(format!(
-            "the copy {} does not match {}",
-            via.display(),
-            from.display()
-        )));
+        return Err(MoveFault::CopyMismatch {
+            copy: via.to_path_buf(),
+            source: from.to_path_buf(),
+        });
     }
     Ok(hash)
 }
@@ -467,7 +593,7 @@ fn move_file(
         if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
             return Err(MoveError::Taken);
         }
-        let (via, reservation) = reserve_temp(dir).map_err(MoveError::Failed)?;
+        let (via, reservation) = reserve_temp(dir).map_err(|e| MoveError::Failed(e.into()))?;
         debug!(
             "Renaming only the spelling (letter case or Unicode normalization), through {}",
             shown(&via)
@@ -476,28 +602,27 @@ fn move_file(
         drop(reservation);
         if let Err(e) = note_via(&via, ViaKind::Stop, None).and_then(|()| fs::rename(from, &via)) {
             let _ = fs::remove_file(&via);
-            return Err(MoveError::Failed(e));
+            return Err(MoveError::Failed(e.into()));
         }
-        if opts.stop_in_rename {
-            return Err(MoveError::Partial(io::Error::other("stopped in a rename")));
+        if opts.stop == Some(Stop::InRename) {
+            return Err(MoveError::Partial(MoveFault::Stopped));
         }
         // `from` is out of the way now, so anything at `to` is another file. Go back if the old
         // name is free; on Windows and macOS it is the same name as `to`, so the file waits at
         // `via` for undo instead of replacing the newcomer.
         if exists(to) {
             if exists(from) {
-                return Err(MoveError::Partial(io::Error::other(format!(
-                    "{} turned up during the rename; the file waits at {}",
-                    to.display(),
-                    via.display()
-                ))));
+                return Err(MoveError::Partial(MoveFault::TurnedUp {
+                    target: to.to_path_buf(),
+                    waiting: via,
+                }));
             }
             return match fs::rename(&via, from) {
                 Ok(()) => Err(MoveError::Taken),
-                Err(e) => Err(MoveError::Partial(e)),
+                Err(e) => Err(MoveError::Partial(e.into())),
             };
         }
-        return fs::rename(&via, to).map_err(MoveError::Partial);
+        return fs::rename(&via, to).map_err(|e| MoveError::Partial(e.into()));
     }
     if exists(to) {
         return Err(MoveError::Taken);
@@ -506,20 +631,22 @@ fn move_file(
         match fs::rename(from, to) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {}
-            Err(e) => return Err(MoveError::Failed(e)),
+            Err(e) => return Err(MoveError::Failed(e.into())),
         }
     }
-    let (via, mut copy) = reserve_temp(dir).map_err(MoveError::Failed)?;
+    let (via, mut copy) = reserve_temp(dir).map_err(|e| MoveError::Failed(e.into()))?;
     debug!(
         "Copying {} to another file system, through {}",
         shown(from),
         shown(&via)
     );
+    let stop_in_copy = opts.stop == Some(Stop::InCopy);
     let copied = note_via(&via, ViaKind::Copy, Some(from))
-        .and_then(|()| copy_verified(from, &via, &mut copy, mtime, opts.stop_in_copy));
+        .map_err(MoveFault::from)
+        .and_then(|()| copy_verified(from, &via, &mut copy, mtime, stop_in_copy));
     let hash = match copied {
         Ok(hash) => hash,
-        Err(e) if opts.stop_in_copy => {
+        Err(e) if stop_in_copy => {
             // As if the process died here: the partial copy stays for undo to clean up.
             return Err(MoveError::Partial(e));
         }
@@ -534,43 +661,43 @@ fn move_file(
     }
     // Only the verified copy goes into place, not what someone put under its name.
     if !still_ours(&via, &copy) {
-        return Err(MoveError::Failed(io::Error::other(format!(
-            "the temporary file {} was replaced by something else; left there",
-            via.display()
-        ))));
+        return Err(MoveError::Failed(MoveFault::Replaced(via)));
     }
     if let Err(e) = fs::rename(&via, to) {
         discard(&via, copy);
-        return Err(MoveError::Failed(e));
+        return Err(MoveError::Failed(e.into()));
     }
     // Through the open file, which is the one at `to` now, whatever the name leads to.
     if let Ok(meta) = fs::metadata(from) {
         let _ = copy.set_permissions(meta.permissions());
     }
     drop(copy);
-    sync_dir(dir).map_err(MoveError::Partial)?;
+    sync_dir(dir).map_err(|e| MoveError::Partial(e.into()))?;
     // An edit to `from` while it was copied would be lost with it.
     let unchanged = fs::symlink_metadata(from).is_ok_and(|m| matches(&m, size, mtime))
         && sha256_of(from).is_ok_and(|h| h == hash);
     if !unchanged {
-        return Err(MoveError::Partial(io::Error::other(format!(
-            "{} changed while it was copied; both are kept",
-            from.display()
-        ))));
+        return Err(MoveError::Partial(MoveFault::ChangedWhileCopied(
+            from.to_path_buf(),
+        )));
     }
-    remove_source(from).map_err(MoveError::Partial)
+    remove_source(from).map_err(|e| MoveError::Partial(e.into()))
 }
 
-/// Why the file at `path` should not be moved, if it should not: gone, or not as expected.
-fn changed(path: &Path, size: u64, mtime_ns: i64) -> Option<String> {
+/// `Err` if the file at `path` should not be moved: gone, or not as expected.
+fn unchanged(path: &Path, size: u64, mtime_ns: i64) -> Result<(), Skip> {
     let Ok(meta) = fs::symlink_metadata(path) else {
-        return Some(String::from("it is no longer there"));
+        return Err(Skip::Gone);
     };
     if !meta.is_file() {
-        return Some(String::from("it is not a file"));
+        return Err(Skip::NotAFile);
     }
     let same = crate::scan::stamp(&meta).is_ok_and(|s| s.size == size && s.mtime_ns == mtime_ns);
-    (!same).then(|| String::from("it changed since the plan was made"))
+    if same {
+        Ok(())
+    } else {
+        Err(Skip::Changed)
+    }
 }
 
 /// Folders a run of `apply` or `undo` has found to be real: they exist, and no symbolic link is
@@ -627,19 +754,16 @@ fn through_symlink(dir: &Path, base: Option<&Path>, known: &mut KnownFolders) ->
 fn link_free(dir: &Path, known: &mut KnownFolders) -> Result<(), MoveError> {
     match through_symlink(dir, None, known) {
         Ok(false) => Ok(()),
-        Ok(true) => Err(MoveError::Failed(io::Error::other(format!(
-            "{} is reached through a symbolic link",
-            dir.display()
-        )))),
-        Err(e) => Err(MoveError::Failed(e)),
+        Ok(true) => Err(MoveError::Failed(MoveFault::ThroughLink(dir.to_path_buf()))),
+        Err(e) => Err(MoveError::Failed(e.into())),
     }
 }
 
-/// Why a move must not happen, if it must not: a symbolic link on the way to its source or its
+/// `Err` if a move must not happen: a symbolic link on the way to its source or its
 /// target would make the file come from, or go, somewhere else than the plan says. A link
 /// inside a library (from an extracted archive, say) is not in the catalog, since the scan
 /// does not follow links, so this is where it is caught.
-fn misplaced(m: &Move, plan: &Plan, known: &mut KnownFolders) -> Option<String> {
+fn not_misplaced(m: &Move, plan: &Plan, known: &mut KnownFolders) -> Result<(), Skip> {
     let (from, to) = (Path::new(&m.from), Path::new(&m.to));
     // `Plan::check` has seen to it that the source is in one of the plan's libraries and the
     // target below its destination; the parts below those are what a link can hide in.
@@ -649,9 +773,9 @@ fn misplaced(m: &Move, plan: &Plan, known: &mut KnownFolders) -> Option<String> 
         .map(|l| Path::new(l.root.as_str()))
         .find(|root| from.starts_with(root));
     let destination = Some(Path::new(plan.destination.as_str()));
-    for (what, dir, base) in [
-        ("its folder", from.parent(), root),
-        ("its target folder", to.parent(), destination),
+    for (target, dir, base) in [
+        (false, from.parent(), root),
+        (true, to.parent(), destination),
     ] {
         let Some(dir) = dir else {
             continue;
@@ -659,23 +783,27 @@ fn misplaced(m: &Move, plan: &Plan, known: &mut KnownFolders) -> Option<String> 
         match through_symlink(dir, base, known) {
             Ok(false) => {}
             Ok(true) => {
-                return Some(format!(
-                    "{} {} is reached through a symbolic link",
-                    what,
-                    dir.display()
-                ))
+                return Err(Skip::ThroughLink {
+                    target,
+                    dir: dir.to_path_buf(),
+                })
             }
-            Err(e) => return Some(format!("cannot check {}: {}", dir.display(), e)),
+            Err(source) => {
+                return Err(Skip::Unchecked {
+                    dir: dir.to_path_buf(),
+                    source,
+                })
+            }
         }
     }
-    None
+    Ok(())
 }
 
-/// Why a move should not happen now, if it should not.
-fn problem(m: &Move, done: &[bool]) -> Option<String> {
+/// `Err` if a move should not happen now.
+fn ready(m: &Move, done: &[bool]) -> Result<(), Skip> {
     if let Some(media) = m.sidecar_of {
         if !done[media] {
-            return Some(String::from("its media file was not moved"));
+            return Err(Skip::MediaNotMoved);
         }
     }
     if let Some(Keeper {
@@ -684,14 +812,14 @@ fn problem(m: &Move, done: &[bool]) -> Option<String> {
         mtime_ns,
     }) = &m.keeper
     {
-        if changed(Path::new(path), *size, *mtime_ns).is_some() {
-            return Some(format!("the kept copy {path} is gone or changed"));
+        if unchanged(Path::new(path), *size, *mtime_ns).is_err() {
+            return Err(Skip::KeeperChanged(path.clone()));
         }
         if same_file(Path::new(path), Path::new(&m.from)) {
-            return Some(format!("it is the same file as the kept copy {path}"));
+            return Err(Skip::SameAsKeeper(path.clone()));
         }
     }
-    changed(Path::new(&m.from), m.size, m.mtime_ns)
+    unchanged(Path::new(&m.from), m.size, m.mtime_ns)
 }
 
 /// A new journal for a plan, next to the catalog.
@@ -723,13 +851,25 @@ pub struct ApplyError {
     pub journal: Option<PathBuf>,
 }
 
+impl fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// Carry out the plan in `plan_path`.
 pub fn apply(plan_path: &Path, plan: &Plan) -> Result<ApplySummary, ApplyError> {
     apply_with(plan_path, plan, &ApplyOptions::default())
 }
 
 /// `apply`, with test hooks.
-pub fn apply_with(
+pub(crate) fn apply_with(
     plan_path: &Path,
     plan: &Plan,
     opts: &ApplyOptions,
@@ -766,7 +906,8 @@ fn apply_journaled(
     let mut known = KnownFolders::default();
     for (index, m) in plan.moves.iter().enumerate() {
         let (from, to) = (Path::new(&m.from), Path::new(&m.to));
-        let mut skip = |journal: &mut Journal, reason: String| -> Result<(), Error> {
+        let mut skip = |journal: &mut Journal, why: &Skip| -> Result<(), Error> {
+            let reason = why.to_string();
             debug!(
                 "Move {}: skipped {}: {}",
                 index,
@@ -780,16 +921,13 @@ fn apply_journaled(
             summary.skipped.push((m.from.clone(), reason));
             Ok(())
         };
-        if let Some(reason) = problem(m, &done) {
-            skip(&mut journal, reason)?;
-            continue;
-        }
-        if let Some(reason) = misplaced(m, plan, &mut known) {
-            skip(&mut journal, reason)?;
+        let checked = ready(m, &done).and_then(|()| not_misplaced(m, plan, &mut known));
+        if let Err(why) = checked {
+            skip(&mut journal, &why)?;
             continue;
         }
         if let Err(e) = create_folders(to.parent(), &mut journal, &mut known) {
-            skip(&mut journal, format!("cannot create its folder: {e}"))?;
+            skip(&mut journal, &Skip::NoFolder(e))?;
             continue;
         }
         journal.write(&Record::Intent {
@@ -812,11 +950,11 @@ fn apply_journaled(
         match moved {
             Ok(()) => {}
             Err(MoveError::Taken) => {
-                skip(&mut journal, format!("{} is taken", m.to))?;
+                skip(&mut journal, &Skip::Taken(m.to.clone()))?;
                 continue;
             }
             Err(MoveError::Failed(e)) => {
-                skip(&mut journal, e.to_string())?;
+                skip(&mut journal, &Skip::Failed(e))?;
                 continue;
             }
             Err(MoveError::Partial(e)) => return Err(e.into()),
@@ -825,12 +963,12 @@ fn apply_journaled(
         debug!("Move {}: {} -> {}", index, shown(from), shown(to));
         done[index] = true;
         summary.moved += 1;
-        if opts.stop_before_catalog {
-            return Err(Error::Usage(String::from("stopped as asked")));
+        if opts.stop == Some(Stop::BeforeCatalog) {
+            return Err(Error::Interrupted);
         }
         update_catalog(&catalog, &mut journal, index, m)?;
-        if opts.stop_after == Some(summary.moved) {
-            return Err(Error::Usage(String::from("stopped as asked")));
+        if opts.stop == Some(Stop::AfterMoves(summary.moved)) {
+            return Err(Error::Interrupted);
         }
     }
 
@@ -929,24 +1067,63 @@ fn update_catalog(
 
 /// The records of a journal. A last line cut short by a crash is ignored.
 fn read_journal(path: &Path) -> Result<Vec<Record>, Error> {
-    let file = File::open(path)?;
+    let file = File::open(path).at(path)?;
     let lines: Vec<String> = BufReader::new(file).lines().collect::<Result<_, _>>()?;
     let mut records = vec![];
     for (n, line) in lines.iter().enumerate() {
         match serde_json::from_str(line) {
             Ok(record) => records.push(record),
             Err(_) if n + 1 == lines.len() => {}
-            Err(e) => {
-                return Err(Error::Usage(format!(
-                    "{} line {} is not a journal record: {}",
-                    path.display(),
-                    n + 1,
-                    e
-                )))
+            Err(source) => {
+                return Err(JournalError::BadRecord {
+                    path: path.to_path_buf(),
+                    line: n + 1,
+                    source,
+                }
+                .into())
             }
         }
     }
     Ok(records)
+}
+
+/// Why a journal cannot be read.
+#[derive(Debug)]
+pub enum JournalError {
+    /// A line other than the last is not a journal record.
+    BadRecord {
+        path: PathBuf,
+        line: usize,
+        source: serde_json::Error,
+    },
+    /// The file does not start like a journal.
+    NotAJournal(PathBuf),
+}
+
+impl fmt::Display for JournalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadRecord { path, line, source } => write!(
+                f,
+                "{} line {} is not a journal record: {}",
+                path.display(),
+                line,
+                source
+            ),
+            Self::NotAJournal(path) => {
+                write!(f, "{} does not start like a pixrs journal", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for JournalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BadRecord { source, .. } => Some(source),
+            Self::NotAJournal(_) => None,
+        }
+    }
 }
 
 /// Where a moved file is now.
@@ -1132,10 +1309,7 @@ fn via_belongs_to(via: &ViaFile, from: &Path, to: &Path) -> bool {
 pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
     let records = read_journal(path)?;
     let Some(Record::Start { catalog, .. }) = records.first() else {
-        return Err(Error::Usage(format!(
-            "{} does not start like a pixrs journal",
-            path.display()
-        )));
+        return Err(JournalError::NotAJournal(path.to_path_buf()).into());
     };
     let catalog_path = PathBuf::from(catalog);
     let catalog = Catalog::open_for_update(&catalog_path)?;
@@ -1465,7 +1639,7 @@ mod tests {
             plan_path.file_stem().unwrap().to_string_lossy()
         ));
         let opts = ApplyOptions {
-            stop_after: Some(2),
+            stop: Some(Stop::AfterMoves(2)),
             ..ApplyOptions::default()
         };
         assert!(apply_with(&plan_path, &plan, &opts).is_err());
@@ -1476,8 +1650,7 @@ mod tests {
         // Stopped halfway through a copy across file systems.
         let opts = ApplyOptions {
             force_copy: true,
-            stop_in_copy: true,
-            ..ApplyOptions::default()
+            stop: Some(Stop::InCopy),
         };
         assert!(apply_with(&plan_path, &plan, &opts).is_err());
         let journal = state_dir(&f.catalog_path, "journals").join(format!(
@@ -1630,7 +1803,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let catalog = dir.path().join("catalog.sqlite");
         let lock = Lock::take(&catalog).unwrap();
-        assert!(matches!(Lock::take(&catalog), Err(Error::Usage(_))));
+        assert!(matches!(Lock::take(&catalog), Err(Error::Locked(_))));
         drop(lock);
         assert!(Lock::take(&catalog).is_ok());
     }
@@ -1741,7 +1914,7 @@ mod tests {
         let (before, catalog_before) = (tree(&f.root), rows(&f));
         let (plan_path, plan) = organize_plan(&f, "{type}/{name}.{ext}", false);
         let opts = ApplyOptions {
-            stop_before_catalog: true,
+            stop: Some(Stop::BeforeCatalog),
             ..ApplyOptions::default()
         };
         assert!(apply_with(&plan_path, &plan, &opts).is_err());
@@ -1788,7 +1961,7 @@ mod tests {
         let f = fixture(&[("Upper.JPG", b"original")]);
         let (plan_path, plan) = organize_plan(&f, "{name}.{ext}", false);
         let opts = ApplyOptions {
-            stop_in_rename: true,
+            stop: Some(Stop::InRename),
             ..ApplyOptions::default()
         };
         let error = apply_with(&plan_path, &plan, &opts).unwrap_err();
@@ -1806,7 +1979,7 @@ mod tests {
         let before = tree(&f.root);
         let (plan_path, plan) = organize_plan(&f, "{name}.{ext}", false);
         let opts = ApplyOptions {
-            stop_after: Some(1),
+            stop: Some(Stop::AfterMoves(1)),
             ..ApplyOptions::default()
         };
         let journal = apply_with(&plan_path, &plan, &opts)
@@ -2091,7 +2264,7 @@ mod tests {
         plan.catalog = missing.to_string_lossy().into_owned();
         assert!(matches!(
             apply(&plan_path, &plan).unwrap_err().error,
-            Error::Usage(_)
+            Error::CatalogGone(_)
         ));
         assert!(!missing.parent().unwrap().exists());
         assert!(f.root.join("photo.jpg").exists());
@@ -2113,7 +2286,10 @@ mod tests {
                 catalog: foreign.to_string_lossy().into_owned(),
             }],
         );
-        assert!(matches!(undo(&journal), Err(Error::Usage(_))));
+        assert!(matches!(
+            undo(&journal),
+            Err(Error::UnknownSchema { version: 0, .. })
+        ));
         assert_eq!(fs::read(&foreign).unwrap(), before);
         assert!(!f.dir.path().join("pixrs.lock").exists());
         let journal = write_journal(
@@ -2124,7 +2300,7 @@ mod tests {
                 catalog: missing.to_string_lossy().into_owned(),
             }],
         );
-        assert!(matches!(undo(&journal), Err(Error::Usage(_))));
+        assert!(matches!(undo(&journal), Err(Error::CatalogGone(_))));
         assert!(!missing.parent().unwrap().exists());
     }
 
@@ -2135,7 +2311,14 @@ mod tests {
         let (plan_path, mut plan) = organize_plan(&f, "{type}/{name}.{ext}", false);
         plan.moves[0].sidecar_of = Some(99);
         let error = apply(&plan_path, &plan).unwrap_err();
-        assert!(matches!(error.error, Error::Usage(_)), "{}", error.error);
+        assert!(
+            matches!(
+                error.error,
+                Error::Plan(crate::plan::PlanError::BadMove { .. })
+            ),
+            "{}",
+            error.error
+        );
         assert!(error.journal.is_none());
         assert_eq!(tree(&f.root), before);
         assert!(!state_dir(&f.catalog_path, "journals").exists());

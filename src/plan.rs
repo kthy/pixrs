@@ -9,7 +9,7 @@
 use crate::catalog::{display_root, library_path, Catalog};
 use crate::dates::{from_name, from_taken_at};
 use crate::dupes::{plural, DupeReport, Tier};
-use crate::error::Error;
+use crate::error::{AtPath, Error};
 use crate::media::MediaType;
 use crate::names::folded;
 use crate::template::{sanitize, Facts, Template};
@@ -18,6 +18,7 @@ use log::debug;
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -102,13 +103,145 @@ pub struct Plan {
     pub moves: Vec<Move>,
 }
 
+/// Why a plan cannot be made, read or carried out.
+#[derive(Debug)]
+pub enum PlanError {
+    /// `--suffix` lacks `{n}`.
+    SuffixWithoutN,
+    /// A folder files would be moved to (`what`, like "The quarantine folder") overlaps a
+    /// library.
+    Overlap {
+        what: &'static str,
+        folder: PathBuf,
+        library: String,
+    },
+    /// The file is not a plan.
+    NotAPlan {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    /// The plan was written by another version of pixrs.
+    Version { path: PathBuf, found: u32 },
+    /// The plan's quarantine folder and one of its libraries overlap.
+    QuarantineOverlap {
+        destination: String,
+        library: String,
+    },
+    /// Move `number` (counted from 1), of the file `from`, is not one pixrs would plan.
+    BadMove {
+        number: usize,
+        from: String,
+        problem: MoveProblem,
+    },
+}
+
+/// What is wrong with a move in a plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MoveProblem {
+    /// Its source is not in a library of the plan.
+    OutsideLibraries,
+    /// Its target is not below the plan's destination.
+    OutsideDestination(String),
+    /// It is a sidecar of a move that is not an earlier media move.
+    BadSidecar,
+    /// It refers to a library that is not in the plan.
+    UnknownLibrary,
+    /// Its kept copy is not in a library of the plan.
+    KeeperOutside,
+}
+
+impl PlanError {
+    /// The process exit code: a bad argument is a usage error, a bad plan file a data error.
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::SuffixWithoutN | Self::Overlap { .. } => exitcode::USAGE,
+            _ => exitcode::DATAERR,
+        }
+    }
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SuffixWithoutN => write!(f, "--suffix must contain {{n}}"),
+            Self::Overlap {
+                what,
+                folder,
+                library,
+            } => write!(
+                f,
+                "{} {} must be outside the library {}, and not contain it",
+                what,
+                folder.display(),
+                display_root(library)
+            ),
+            Self::NotAPlan { path, source } => {
+                write!(f, "{} is not a plan file: {}", path.display(), source)
+            }
+            Self::Version { path, found } => write!(
+                f,
+                "{} has plan version {}, but this version of pixrs only understands version {}; \
+                 plan again",
+                path.display(),
+                found,
+                PLAN_VERSION
+            ),
+            Self::QuarantineOverlap {
+                destination,
+                library,
+            } => write!(
+                f,
+                "The plan cannot be carried out: the quarantine folder {} and the library {} \
+                 overlap",
+                destination,
+                display_root(library)
+            ),
+            Self::BadMove {
+                number,
+                from,
+                problem,
+            } => write!(
+                f,
+                "The plan cannot be carried out: move {number} ({from}) {problem}"
+            ),
+        }
+    }
+}
+
+impl fmt::Display for MoveProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutsideLibraries => write!(f, "is not in a library of the plan"),
+            Self::OutsideDestination(destination) => write!(f, "goes outside {destination}"),
+            Self::BadSidecar => {
+                write!(
+                    f,
+                    "is a sidecar of a move that is not an earlier media move"
+                )
+            }
+            Self::UnknownLibrary => write!(f, "refers to a library that is not in the plan"),
+            Self::KeeperOutside => {
+                write!(f, "has a kept copy that is not in a library of the plan")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotAPlan { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 impl Plan {
     /// Why the plan must not be carried out, if it must not: a plan file is input like any
     /// other file, so before anything is moved every source must be in one of the plan's
     /// libraries, every target below its destination, and the moves must refer to each other
     /// and to the libraries consistently.
-    pub fn check(&self) -> Result<(), Error> {
-        let fault = |what: String| Error::Usage(format!("The plan cannot be carried out: {what}"));
+    pub fn check(&self) -> Result<(), PlanError> {
         let below = |path: &str, folder: &str| {
             let (path, folder) = (Path::new(path), Path::new(folder));
             path.starts_with(folder) && path != folder
@@ -125,40 +258,41 @@ impl Plan {
                     || below(&library.root, &self.destination)
                     || library.root == self.destination
                 {
-                    return Err(fault(format!(
-                        "the quarantine folder {} and the library {} overlap",
-                        self.destination,
-                        display_root(&library.root)
-                    )));
+                    return Err(PlanError::QuarantineOverlap {
+                        destination: self.destination.clone(),
+                        library: library.root.clone(),
+                    });
                 }
             }
         }
         for (index, m) in self.moves.iter().enumerate() {
-            let fault = |what: &str| fault(format!("move {} ({}) {}", index + 1, m.from, what));
+            let fault = |problem| PlanError::BadMove {
+                number: index + 1,
+                from: m.from.clone(),
+                problem,
+            };
             if !in_a_library(&m.from) {
-                return Err(fault("is not in a library of the plan"));
+                return Err(fault(MoveProblem::OutsideLibraries));
             }
             if !below(&m.to, &self.destination) {
-                return Err(fault(&format!("goes outside {}", self.destination)));
+                return Err(fault(MoveProblem::OutsideDestination(
+                    self.destination.clone(),
+                )));
             }
             if let Some(media) = m.sidecar_of {
                 let earlier_media = media < index && self.moves[media].sidecar_of.is_none();
                 if !earlier_media {
-                    return Err(fault(
-                        "is a sidecar of a move that is not an earlier media move",
-                    ));
+                    return Err(fault(MoveProblem::BadSidecar));
                 }
             }
             for (library_id, _) in m.cataloged.iter().chain(&m.cataloged_to) {
                 if !known(*library_id) {
-                    return Err(fault("refers to a library that is not in the plan"));
+                    return Err(fault(MoveProblem::UnknownLibrary));
                 }
             }
             if let Some(keeper) = &m.keeper {
                 if !in_a_library(&keeper.path) {
-                    return Err(fault(
-                        "has a kept copy that is not in a library of the plan",
-                    ));
+                    return Err(fault(MoveProblem::KeeperOutside));
                 }
             }
         }
@@ -355,11 +489,9 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(sanitize(&format!("{stem}{suffix}{ext}")))
 }
 
-/// `path` as UTF-8, or a usage error naming `what`.
-fn utf8(path: &Path, what: &str) -> Result<String, Error> {
-    path.to_str()
-        .map(String::from)
-        .ok_or_else(|| Error::Usage(format!("{} {} is not valid UTF-8", what, path.display())))
+/// `path` as UTF-8, or an error naming `what` it is.
+fn utf8(path: &Path, what: &'static str) -> Result<String, Error> {
+    crate::error::utf8(path, what).map(String::from)
 }
 
 /// `target` relative to `root` with `/` separators, if it is inside it.
@@ -505,7 +637,7 @@ pub fn plan_organize(
 ) -> Result<(Plan, PlanNotes), Error> {
     let base = opts.to.clone().unwrap_or_else(|| root.to_path_buf());
     if !opts.suffix.contains("{n}") {
-        return Err(Error::Usage(String::from("--suffix must contain {n}")));
+        return Err(PlanError::SuffixWithoutN.into());
     }
     let mut notes = PlanNotes::default();
     let mut claims = Taken::default();
@@ -785,16 +917,20 @@ pub fn plan_quarantine(
 
 /// `dir` resolved (symlinks and `..`), if it is outside every cataloged library and contains
 /// none: files moved there must not be cataloged again by the next scan.
-pub fn outside_libraries(catalog: &Catalog, dir: &Path, what: &str) -> Result<PathBuf, Error> {
+pub fn outside_libraries(
+    catalog: &Catalog,
+    dir: &Path,
+    what: &'static str,
+) -> Result<PathBuf, Error> {
     let resolved = crate::scan::resolve(dir)?;
     for library in catalog.libraries()? {
         if resolved.starts_with(&library.root) || Path::new(&library.root).starts_with(&resolved) {
-            return Err(Error::Usage(format!(
-                "{} {} must be outside the library {}, and not contain it",
+            return Err(PlanError::Overlap {
                 what,
-                resolved.display(),
-                display_root(&library.root)
-            )));
+                folder: resolved,
+                library: library.root,
+            }
+            .into());
         }
     }
     Ok(resolved)
@@ -840,17 +976,17 @@ pub fn write_plan(plan: &Plan, now: OffsetDateTime) -> Result<PathBuf, Error> {
 
 /// Read a plan file.
 pub fn read_plan(path: &Path) -> Result<Plan, Error> {
-    let text = fs::read_to_string(path)?;
-    let plan: Plan = serde_json::from_str(&text)
-        .map_err(|e| Error::Usage(format!("{} is not a plan file: {}", path.display(), e)))?;
+    let text = fs::read_to_string(path).at(path)?;
+    let plan: Plan = serde_json::from_str(&text).map_err(|source| PlanError::NotAPlan {
+        path: path.to_path_buf(),
+        source,
+    })?;
     if plan.version != PLAN_VERSION {
-        return Err(Error::Usage(format!(
-            "{} has plan version {}, but this version of pixrs only understands version {}; \
-             plan again",
-            path.display(),
-            plan.version,
-            PLAN_VERSION
-        )));
+        return Err(PlanError::Version {
+            path: path.to_path_buf(),
+            found: plan.version,
+        }
+        .into());
     }
     plan.check()?;
     Ok(plan)
@@ -1234,7 +1370,13 @@ mod tests {
             let mut faulty = plan.clone();
             fault(&mut faulty);
             let err = faulty.check().unwrap_err();
-            assert!(matches!(err, Error::Usage(_)), "{what}: {err}");
+            assert!(
+                matches!(
+                    err,
+                    PlanError::QuarantineOverlap { .. } | PlanError::BadMove { .. }
+                ),
+                "{what}: {err}"
+            );
         }
         // Moving the files into a folder outside the library, or another library's copies into
         // quarantine, is fine.
