@@ -50,15 +50,13 @@ fn main() {
     // Start the timer
     let now = Instant::now();
 
-    // Log from RUST_LOG; without it, only pixrs's own errors. Dependencies log errors pixrs
-    // already reports (nom-exif on truncated files), and the lines break the progress bars.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("pixrs=error"))
-        .init();
-
-    set_ctrlc_handler();
-
     // Load command line arguments
     let cli = Cli::parse();
+
+    // Log as RUST_LOG says; without it, pixrs's own errors, or its debug output with --debug.
+    pixrs::logging::init(cli.debug);
+
+    set_ctrlc_handler();
 
     // Short circuit to license display. Long texts are often piped to a pager; quitting it
     // early is not an error.

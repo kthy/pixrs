@@ -28,6 +28,10 @@ pub struct Cli {
     #[arg(long)]
     pub third_party_notices: bool,
 
+    /// Print debug output to stderr (debug builds only; `RUST_LOG` takes precedence)
+    #[arg(long, global = true, hide = true)]
+    pub debug: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -219,4 +223,40 @@ pub enum Format {
     Json,
     /// One row per file
     Csv,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_debug_is_accepted_before_and_after_the_subcommand() {
+        for args in [
+            vec!["pixrs", "--debug", "scan", "lib"],
+            vec!["pixrs", "scan", "--debug", "lib"],
+            vec!["pixrs", "scan", "lib", "--debug"],
+            vec!["pixrs", "serve", "--debug"],
+            vec!["pixrs", "undo", "journal.jsonl", "--debug"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(cli.debug, "{:?}", args);
+        }
+        assert!(!Cli::try_parse_from(["pixrs", "scan", "lib"]).unwrap().debug);
+    }
+
+    #[test]
+    fn test_debug_is_not_in_the_help() {
+        let mut cli = Cli::command();
+        cli.build();
+        for help in [cli.render_help(), cli.render_long_help()] {
+            assert!(!help.to_string().contains("--debug"), "{}", help);
+        }
+        for sub in cli.get_subcommands_mut() {
+            for help in [sub.render_help(), sub.render_long_help()] {
+                assert!(!help.to_string().contains("--debug"), "{}", help);
+            }
+        }
+    }
 }

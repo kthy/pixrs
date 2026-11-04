@@ -123,6 +123,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a scan folds a library cataloged under another spelling into it; `relocate` and the
   commands that take library arguments accept any spelling too. Quarantine never moves a copy
   that is the same file as the kept one (one folder under two names, or a hard link).
+- Log lines enabled with `RUST_LOG` were written into the progress bars of `pixrs scan` and
+  `pixrs relocate`. The bar is now cleared for each line and drawn again below it. File names in
+  the viewer's log lines are escaped like everywhere else.
 
 ## [0.2.0] - 2026-10-20
 

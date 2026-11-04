@@ -12,15 +12,16 @@ use crate::catalog::{library_path, Catalog, FileRecord};
 use crate::dupes::{group_dupes, load_dupes, DupeReport, Similarity};
 use crate::error::Error;
 use crate::scan::resolve;
+use crate::text::printable;
 use axum::body::Body;
 use axum::extract::{Path as UrlPath, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use directories::ProjectDirs;
-use log::warn;
+use log::{debug, log_enabled, warn, Level};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -295,7 +296,53 @@ fn router(state: Arc<AppState>) -> Router {
             Arc::clone(&state),
             check_host,
         ))
+        .layer(middleware::from_fn(log_request))
         .with_state(state)
+}
+
+/// Log each request at debug level, refused ones too, with its answer's status and how long it
+/// took until the answer started (a file's body is still streaming then).
+async fn log_request(req: Request, next: Next) -> Response {
+    if !log_enabled!(Level::Debug) {
+        return next.run(req).await;
+    }
+    let started = Instant::now();
+    let request = describe_request(req.method(), req.uri(), req.headers());
+    let res = next.run(req).await;
+    debug!(
+        "{} -> {} in {:.1?}",
+        request,
+        res.status().as_u16(),
+        started.elapsed()
+    );
+    res
+}
+
+/// A request as a log line: method, path and query, and the `HX-*` headers HTMX sends. Only what
+/// the request carries; paths name files, so they are decoded and their control characters
+/// escaped.
+fn describe_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> String {
+    let decoded = |text: &str| {
+        let text = urlencoding::decode(text).map_or_else(|_| text.into(), |t| t.into_owned());
+        printable(&text).into_owned()
+    };
+    let target = uri.path_and_query().map_or("/", |p| p.as_str());
+    let mut line = format!("{} {}", method, decoded(target));
+    let htmx: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.as_str().starts_with("hx-"))
+        .map(|(name, value)| {
+            format!(
+                "{}: {}",
+                name,
+                decoded(&String::from_utf8_lossy(value.as_bytes()))
+            )
+        })
+        .collect();
+    if !htmx.is_empty() {
+        line.push_str(&format!(" [{}]", htmx.join(", ")));
+    }
+    line
 }
 
 /// Answer only requests from the viewer itself or typed into the browser.
@@ -649,6 +696,30 @@ mod tests {
         }
         let res = get(&f.app, "/dates", "localhost:2635").await;
         assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[test]
+    fn test_describe_request() {
+        let uri: Uri = "/view/1/sub%20dir/a%1B%5B2J%C3%A9.png?from=date"
+            .parse()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:2635"));
+        headers.insert("hx-request", HeaderValue::from_static("true"));
+        headers.insert(
+            "hx-current-url",
+            HeaderValue::from_static("http://localhost:2635/folders/1/sub%20dir"),
+        );
+        assert_eq!(
+            describe_request(&Method::GET, &uri, &headers),
+            "GET /view/1/sub dir/a\\u{1b}[2Jé.png?from=date [hx-request: true, hx-current-url: \
+             http://localhost:2635/folders/1/sub dir]"
+        );
+        let uri: Uri = "/".parse().unwrap();
+        assert_eq!(
+            describe_request(&Method::GET, &uri, &HeaderMap::new()),
+            "GET /"
+        );
     }
 
     #[test]

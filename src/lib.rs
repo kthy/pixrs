@@ -27,6 +27,7 @@ pub mod decode;
 pub mod dupes;
 pub mod error;
 pub mod imagehash;
+pub mod logging;
 pub mod media;
 pub mod names;
 pub mod plan;

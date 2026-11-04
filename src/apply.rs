@@ -9,6 +9,7 @@ use crate::catalog::{Catalog, CatalogRow};
 use crate::error::Error;
 use crate::names::folded;
 use crate::plan::{state_dir, Keeper, Move, Plan};
+use crate::text::{printable, shown};
 use log::debug;
 use ring::digest::{Context, SHA256};
 use same_file::is_same_file;
@@ -372,7 +373,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     let synced = synced.and_then(|()| tests::folder_sync_result());
     match synced {
         Err(e) if cannot_sync_folders(&e) => {
-            debug!("Cannot flush the folder {}: {}", dir.display(), e);
+            debug!("Cannot flush the folder {}: {}", shown(dir), e);
             Ok(())
         }
         other => other,
@@ -454,6 +455,10 @@ fn move_file(
             return Err(MoveError::Taken);
         }
         let (via, reservation) = reserve_temp(dir).map_err(MoveError::Failed)?;
+        debug!(
+            "Renaming only the spelling (letter case or Unicode normalization), through {}",
+            shown(&via)
+        );
         // The file itself goes to `via`, by a rename that replaces the reservation.
         drop(reservation);
         if let Err(e) = note_via(&via, ViaKind::Stop, None).and_then(|()| fs::rename(from, &via)) {
@@ -492,6 +497,11 @@ fn move_file(
         }
     }
     let (via, mut copy) = reserve_temp(dir).map_err(MoveError::Failed)?;
+    debug!(
+        "Copying {} to another file system, through {}",
+        shown(from),
+        shown(&via)
+    );
     let copied = note_via(&via, ViaKind::Copy, Some(from))
         .and_then(|()| copy_verified(from, &via, &mut copy, mtime, opts.stop_in_copy));
     let hash = match copied {
@@ -743,6 +753,12 @@ fn apply_journaled(
     for (index, m) in plan.moves.iter().enumerate() {
         let (from, to) = (Path::new(&m.from), Path::new(&m.to));
         let mut skip = |journal: &mut Journal, reason: String| -> Result<(), Error> {
+            debug!(
+                "Move {}: skipped {}: {}",
+                index,
+                shown(from),
+                printable(&reason)
+            );
             journal.write(&Record::Skipped {
                 index,
                 reason: reason.clone(),
@@ -792,6 +808,7 @@ fn apply_journaled(
             Err(MoveError::Partial(e)) => return Err(e.into()),
         }
         journal.write(&Record::Done { index })?;
+        debug!("Move {}: {} -> {}", index, shown(from), shown(to));
         done[index] = true;
         summary.moved += 1;
         if opts.stop_before_catalog {
@@ -823,6 +840,7 @@ fn apply_journaled(
                 journal.write(&Record::Rmdir {
                     path: dir.to_string_lossy().into_owned(),
                 })?;
+                debug!("Removing the empty folder {}", shown(&dir));
                 fs::remove_dir(&dir)?;
                 summary.folders_removed += 1;
                 if !dir.pop() {
@@ -1204,6 +1222,7 @@ pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
             clean_up_via(via, from, *size, *mtime_ns, &mut summary.warnings);
         }
         if skipped.contains(index) {
+            debug!("Move {}: skipped by apply; {} stays", index, shown(from));
             continue;
         }
         let had_copy = index_vias.iter().any(|v| v.kind == ViaKind::Copy);
@@ -1211,6 +1230,13 @@ pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
             Ok(found) => found,
             Err(e) => Found::Unclear(format!("Cannot check {}: {}", to.display(), e)),
         };
+        let at = match &found {
+            Found::AtTarget => "at the target, moving it back",
+            Found::Copied => "copied, removing the copy",
+            Found::AtSource => "back at its place already",
+            Found::Unclear(_) => "unclear, leaving it",
+        };
+        debug!("Move {}: {} -> {}: {}", index, shown(from), shown(to), at);
         let back = match found {
             Found::AtTarget => {
                 // Without a plan, the folder it goes back to must at least be where its path

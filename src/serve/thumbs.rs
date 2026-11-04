@@ -10,6 +10,7 @@ use crate::apply::{reserve_temp, still_ours};
 use crate::catalog::FileRecord;
 use crate::decode::{self, decode_in_process, file_url, image_decoder, TOOL_TIMEOUT};
 use crate::media::MediaType;
+use crate::text::{printable_lines, shown};
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, RgbImage};
 use log::{debug, warn};
@@ -174,12 +175,16 @@ impl Thumbnailer {
                 .await
                 .ok()?;
                 if let (Err(e), cached, _) = &written {
-                    warn!("Unable to cache {}: {}", cached.display(), e);
+                    warn!("Unable to cache {}: {}", shown(cached), e);
                 }
                 Some(written.2)
             }
             Err(e) => {
-                warn!("No thumbnail for {}: {}", located.full_path.display(), e);
+                warn!(
+                    "No thumbnail for {}: {}",
+                    shown(&located.full_path),
+                    printable_lines(&e)
+                );
                 if e != TIMED_OUT {
                     self.failed().insert(key);
                 }

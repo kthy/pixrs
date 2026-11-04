@@ -789,6 +789,7 @@ pub(crate) fn progress_bar(
             })
             .progress_chars("##-"),
     );
+    crate::logging::log_around(&pb);
     pb
 }
 
@@ -815,6 +816,7 @@ fn spinner(prefix: &'static str, quiet: bool) -> ProgressBar {
     );
     // Tick on a timer, so the spinner moves while a slow folder listing blocks the walk.
     pb.enable_steady_tick(Duration::from_millis(100));
+    crate::logging::log_around(&pb);
     pb
 }
 
@@ -868,7 +870,11 @@ fn read_meta(path: &Path) -> io::Result<MediaMeta> {
         },
         Err(nom_exif::Error::Io(e)) if e.kind() != io::ErrorKind::UnexpectedEof => return Err(e),
         Err(e) => {
-            debug!("No metadata in {}: {}", path.display(), e);
+            debug!(
+                "No metadata in {}: {}",
+                shown(path),
+                printable(&e.to_string())
+            );
             MediaMeta::default()
         }
     };
