@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The viewer marks a date taken before 1980 or in the future with a `?` whose tooltip says it is
+  probably wrong; `pixrs organize` ignores such dates unless `--trust-dates` is given.
 - `pixrs organize` names WhatsApp files by their date and WhatsApp's counter, which stands in for
   the time they lack: `IMG-20190501-WA0001.jpg` becomes `2019-05-01_WA0001.jpg` with the
   presets (`{date}_{time}.{ext}`), so they sort among the other files of the day instead of
@@ -126,6 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Log lines enabled with `RUST_LOG` were written into the progress bars of `pixrs scan` and
   `pixrs relocate`. The bar is now cleared for each line and drawn again below it. File names in
   the viewer's log lines are escaped like everywhere else.
+- Videos whose QuickTime header holds Unix time instead of seconds since 1904 (some encoders
+  write it that way) were cataloged 66 years early, e.g. 1948 instead of 2014. A date before
+  1970 from that header is now read as Unix time, as `ffmpeg` reads it, and a header without a
+  time (1904-01-01) gives no date. Catalogs are upgraded to schema version 2 the first time this
+  version opens them, which corrects such dates without scanning again.
 
 ## [0.2.0] - 2026-10-20
 

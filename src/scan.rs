@@ -12,6 +12,7 @@ use crate::avhash::{
 use crate::catalog::{
     cataloged_spelling, display_root, library_path, Catalog, FileRecord, MediaMeta, Stamp,
 };
+use crate::dates::quicktime_creation;
 use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, Tools};
 use crate::error::Error;
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
@@ -35,6 +36,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, available_parallelism};
 use std::time::{Duration, UNIX_EPOCH};
+use time::macros::format_description;
+use time::OffsetDateTime;
 use walkdir::WalkDir;
 
 /// Commit to the catalog after this many files, so an interrupted scan keeps its progress.
@@ -862,7 +865,7 @@ fn read_meta(path: &Path) -> io::Result<MediaMeta> {
                 .and_then(dimension),
         },
         Ok(Metadata::Track(track)) => MediaMeta {
-            taken_at: track.get(TrackInfoTag::CreateDate).and_then(datetime),
+            taken_at: track.get(TrackInfoTag::CreateDate).and_then(track_date),
             camera_make: track.get(TrackInfoTag::Make).and_then(text),
             camera_model: track.get(TrackInfoTag::Model).and_then(text),
             width: track.get(TrackInfoTag::Width).and_then(dimension),
@@ -887,6 +890,27 @@ fn datetime(value: &EntryValue) -> Option<String> {
         ExifDateTime::Aware(dt) => dt.to_rfc3339(),
         ExifDateTime::Naive(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
     })
+}
+
+/// A track's creation date like `datetime`, with a QuickTime header's time read as ffmpeg reads
+/// it (`quicktime_creation`). Only a date before 1970 in UTC is taken for such a time: `nom-exif`
+/// gives header times in UTC, Matroska dates count from 2001, and phones write QuickTime's
+/// `creationdate` key with their local offset.
+fn track_date(value: &EntryValue) -> Option<String> {
+    match value.as_datetime() {
+        Some(ExifDateTime::Aware(dt))
+            if dt.offset().local_minus_utc() == 0 && dt.timestamp() < 0 =>
+        {
+            let unix = quicktime_creation(dt.timestamp())?;
+            let format =
+                format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]+00:00");
+            OffsetDateTime::from_unix_timestamp(unix)
+                .ok()?
+                .format(&format)
+                .ok()
+        }
+        _ => datetime(value),
+    }
 }
 
 /// A text value without the NUL and space padding cameras like to add.
@@ -1017,6 +1041,29 @@ mod tests {
         jpeg.extend([0; 256]);
         jpeg.extend([0xff, 0xd9]);
         jpeg
+    }
+
+    /// A minimal MP4: a file type box and a movie box with only a movie header, created at
+    /// `created` (seconds since 1904, or since 1970 as some encoders write it).
+    fn mp4_created_at(created: u32) -> Vec<u8> {
+        fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut b = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+            b.extend(kind);
+            b.extend(body);
+            b
+        }
+        let mut mvhd = vec![0; 4]; // Version 0, no flags.
+        mvhd.extend(created.to_be_bytes());
+        mvhd.extend(created.to_be_bytes()); // Modified.
+        mvhd.extend(1000u32.to_be_bytes()); // Time scale.
+        mvhd.extend(1000u32.to_be_bytes()); // Duration.
+        mvhd.extend([0; 76]); // Rate, volume, matrix and so on.
+        mvhd.extend(2u32.to_be_bytes()); // Next track ID.
+        let mut mp4 = mp4_box(b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
+        mp4.extend(mp4_box(b"moov", &mp4_box(b"mvhd", &mvhd)));
+        // nom-exif sniffs the type from the first 128 bytes.
+        mp4.extend(mp4_box(b"free", &[0; 128]));
+        mp4
     }
 
     fn paths(files: &[FileRecord]) -> Vec<&str> {
@@ -1375,6 +1422,34 @@ mod tests {
         assert_eq!(meta.taken_at.as_deref(), Some("2019-07-14T12:34:56"));
         assert_eq!(meta.camera_make.as_deref(), Some("Canon"));
         assert_eq!(meta.camera_model.as_deref(), Some("EOS 5D"));
+    }
+
+    #[test]
+    fn test_reads_quicktime_creation_time_as_ffmpeg_does() {
+        use crate::dates::QUICKTIME_EPOCH_OFFSET;
+        let unix = time::macros::datetime!(2014-05-12 18:18:27 UTC).unix_timestamp();
+        let fx = Fixture::new();
+        fx.write("unix.mp4", &mp4_created_at(unix as u32));
+        fx.write(
+            "quicktime.mp4",
+            &mp4_created_at((unix + QUICKTIME_EPOCH_OFFSET) as u32),
+        );
+        fx.write("unset.mp4", &mp4_created_at(0));
+        fx.scan();
+        let taken: Vec<_> = fx
+            .files()
+            .into_iter()
+            .map(|f| (f.path, f.meta.taken_at))
+            .collect();
+        let date = Some(String::from("2014-05-12T18:18:27+00:00"));
+        assert_eq!(
+            taken,
+            vec![
+                (String::from("quicktime.mp4"), date.clone()),
+                (String::from("unix.mp4"), date),
+                (String::from("unset.mp4"), None),
+            ]
+        );
     }
 
     #[test]
