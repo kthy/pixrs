@@ -22,6 +22,7 @@ use rusqlite::{
     TransactionBehavior,
 };
 use same_file::is_same_file;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::create_dir_all;
@@ -1022,10 +1023,8 @@ impl Catalog {
         )?;
         let rows = stmt.query_map(params![size, sha256], hashed_file)?;
         let mut copies: Vec<HashedFile> = rows.collect::<rusqlite::Result<_>>()?;
-        if let Some(keep) = one_row_per_file(&copies) {
-            let mut keep = keep.into_iter();
-            copies.retain(|_| keep.next().unwrap_or(true));
-        }
+        let extra = extra_rows(&copies);
+        copies.retain(|copy| !extra.contains(copy));
         Ok(copies)
     }
 }
@@ -1363,34 +1362,58 @@ pub fn cataloged_spelling(libraries: &[Library], path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Whether to keep each of `files`, in order, so that each file on disk has one row, or `None`
-/// if it already has. Overlapping libraries, which catalogs scanned before pixrs folded nested
-/// libraries can have, list a file once in each; the row from the outermost library is kept, so
-/// a file is never its own duplicate. A row given more than once is kept or dropped each time.
-pub fn one_row_per_file<'a>(files: impl IntoIterator<Item = &'a HashedFile>) -> Option<Vec<bool>> {
-    let files: Vec<&HashedFile> = files.into_iter().collect();
-    let mut best: HashMap<PathBuf, &HashedFile> = HashMap::new();
-    let mut rows: HashSet<(LibraryId, &str)> = HashSet::new();
-    for &f in &files {
-        rows.insert((f.library_id, &f.path));
-        best.entry(library_path(f.root.as_path(), &f.path))
-            .and_modify(|b| {
-                if f.root.len() < b.root.len() {
-                    *b = f;
-                }
-            })
-            .or_insert(f);
+/// Rows of files that another row lists too, by library.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ExtraRows(HashMap<LibraryId, HashSet<String>>);
+
+impl ExtraRows {
+    /// Whether `file` is the row of a file that another row lists too.
+    pub fn contains(&self, file: &HashedFile) -> bool {
+        self.0
+            .get(&file.library_id)
+            .is_some_and(|paths| paths.contains(file.path.as_str()))
     }
-    let keep: HashSet<(LibraryId, &str)> = best
-        .into_values()
-        .map(|f| (f.library_id, f.path.as_str()))
-        .collect();
-    (keep.len() < rows.len()).then(|| {
-        files
-            .iter()
-            .map(|f| keep.contains(&(f.library_id, f.path.as_str())))
-            .collect()
-    })
+
+    /// Whether every file has one row.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The rows among `files` to drop so that each file on disk has one row. Overlapping
+/// libraries, which catalogs scanned before pixrs folded nested libraries can have, list a file
+/// once in each; the row from the outermost library stays, so a file is never its own
+/// duplicate.
+pub fn extra_rows<'a>(files: impl IntoIterator<Item = &'a HashedFile>) -> ExtraRows {
+    let mut best: HashMap<PathBuf, &HashedFile> = HashMap::new();
+    let mut extra = ExtraRows::default();
+    let mut drop = |f: &HashedFile| {
+        extra
+            .0
+            .entry(f.library_id)
+            .or_default()
+            .insert(f.path.clone());
+    };
+    for f in files {
+        match best.entry(library_path(f.root.as_path(), &f.path)) {
+            Entry::Vacant(entry) => {
+                entry.insert(f);
+            }
+            Entry::Occupied(mut entry) => {
+                let b = *entry.get();
+                if (b.library_id, &b.path) == (f.library_id, &f.path) {
+                    continue;
+                }
+                if f.root.len() < b.root.len() {
+                    drop(b);
+                    entry.insert(f);
+                } else {
+                    drop(f);
+                }
+            }
+        }
+    }
+    extra
 }
 
 /// How long a connection waits for another one's lock.
@@ -2180,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_one_row_per_file_keeps_the_outer_row_each_time_it_is_given() {
+    fn test_extra_rows_keep_the_outer_row_each_time_it_is_given() {
         let file = |library_id: i64, root: &str, path: &str| HashedFile {
             library_id: LibraryId(library_id),
             root: Root::from(root),
@@ -2190,11 +2213,11 @@ mod tests {
         let outer = file(1, "/lib", "sub/a.jpg");
         let inner = file(2, "/lib/sub", "a.jpg");
         let other = file(1, "/lib", "b.jpg");
-        assert_eq!(one_row_per_file([&outer, &other]), None);
+        assert!(extra_rows([&outer, &other]).is_empty());
         // The outer row twice, as when a file is both an exact copy and a decoded image.
-        assert_eq!(
-            one_row_per_file([&inner, &outer, &other, &outer, &inner]),
-            Some(vec![false, true, true, true, false])
-        );
+        let all = [&inner, &outer, &other, &outer, &inner];
+        let extra = extra_rows(all);
+        let kept: Vec<bool> = all.iter().map(|f| !extra.contains(f)).collect();
+        assert_eq!(kept, vec![false, true, true, true, false]);
     }
 }

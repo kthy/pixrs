@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its reason too, instead of as not scanned, and a library argument whose name is not valid
   UTF-8 as that.
 - Ctrl-C exits with 130, as shells report an interrupted program, instead of 0.
-- New plan and journal format (version 3). Plans made and journals written by earlier versions
+- New plan and journal format (version 4). Plans made and journals written by earlier versions
   are refused with a message: plan again, and undo an earlier `apply` with the version that
   carried it out. `apply` also refuses a plan whose moves are not of the plan's kind, such as a
   quarantine move without its kept copy.

@@ -46,9 +46,9 @@ enum Record {
     Via {
         index: usize,
         path: PathBuf,
-        kind: ViaKind,
-        /// For a copy, the file it is copied from.
-        source: Option<PathBuf>,
+        /// Reported as the fields `kind` and, for a copy, `source`.
+        #[serde(flatten)]
+        via: Via,
     },
     /// The catalog row of a file that left its library, so undo can put it back.
     Row {
@@ -87,14 +87,14 @@ struct Header {
 }
 
 /// What a temporary file is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum ViaKind {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum Via {
     /// The file itself, stopped on its way during a rename that only changes letter case or
     /// Unicode normalization. It may be the only copy: never removed.
     Stop,
-    /// A copy being made across file systems. Redundant while its source exists.
-    Copy,
+    /// A copy of `source` being made across file systems. Redundant while its source exists.
+    Copy { source: PathBuf },
 }
 
 /// An open journal file.
@@ -111,18 +111,11 @@ impl Journal {
     }
 
     /// Journal a temporary file of the move at `index`.
-    fn via(
-        &mut self,
-        index: usize,
-        path: &Path,
-        kind: ViaKind,
-        source: Option<&Path>,
-    ) -> io::Result<()> {
+    fn via(&mut self, index: usize, path: &Path, via: Via) -> io::Result<()> {
         self.write(&Record::Via {
             index,
             path: path.to_path_buf(),
-            kind,
-            source: source.map(Path::to_path_buf),
+            via,
         })
     }
 }
@@ -606,7 +599,7 @@ fn move_file(
     to: &Path,
     stamp: Stamp,
     opts: &ApplyOptions,
-    note_via: impl FnMut(&Path, ViaKind, Option<&Path>) -> io::Result<()>,
+    note_via: impl FnMut(&Path, Via) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     if spelling_only(from, to) {
         return rename_spelling(from, to, opts, note_via);
@@ -636,7 +629,7 @@ fn rename_spelling(
     from: &Path,
     to: &Path,
     opts: &ApplyOptions,
-    mut note_via: impl FnMut(&Path, ViaKind, Option<&Path>) -> io::Result<()>,
+    mut note_via: impl FnMut(&Path, Via) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
         return Err(MoveError::Taken);
@@ -649,7 +642,7 @@ fn rename_spelling(
     );
     // The file itself goes to `via`, by a rename that replaces the reservation.
     drop(reservation);
-    if let Err(e) = note_via(&via, ViaKind::Stop, None).and_then(|()| fs::rename(from, &via)) {
+    if let Err(e) = note_via(&via, Via::Stop).and_then(|()| fs::rename(from, &via)) {
         let _ = fs::remove_file(&via);
         return Err(MoveError::Failed(e.into()));
     }
@@ -682,7 +675,7 @@ fn copy_across(
     to: &Path,
     stamp: Stamp,
     opts: &ApplyOptions,
-    mut note_via: impl FnMut(&Path, ViaKind, Option<&Path>) -> io::Result<()>,
+    mut note_via: impl FnMut(&Path, Via) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     let dir = folder_of(to);
     let (via, mut copy) = reserve_temp(dir).map_err(|e| MoveError::Failed(e.into()))?;
@@ -692,9 +685,14 @@ fn copy_across(
         shown(&via)
     );
     let stop_in_copy = opts.stop == Some(Stop::InCopy);
-    let copied = note_via(&via, ViaKind::Copy, Some(from))
-        .map_err(MoveFault::from)
-        .and_then(|()| copy_verified(from, &via, &mut copy, stamp, stop_in_copy));
+    let copied = note_via(
+        &via,
+        Via::Copy {
+            source: from.to_path_buf(),
+        },
+    )
+    .map_err(MoveFault::from)
+    .and_then(|()| copy_verified(from, &via, &mut copy, stamp, stop_in_copy));
     let hash = match copied {
         Ok(hash) => hash,
         Err(e) if stop_in_copy => {
@@ -1002,8 +1000,8 @@ impl Run<'_> {
             planned: m.clone(),
         }))?;
         let journal = &mut self.journal;
-        let moved = move_file(&m.from, &m.to, m.stamp, self.opts, |via, kind, source| {
-            journal.via(index, via, kind, source)
+        let moved = move_file(&m.from, &m.to, m.stamp, self.opts, |path, via| {
+            journal.via(index, path, via)
         });
         match moved {
             Ok(()) => {}
@@ -1321,8 +1319,7 @@ fn locate(from: &Path, to: &Path, stamp: Stamp, had_copy: bool) -> io::Result<Fo
 /// A temporary file and what it is, from a `Via` record.
 struct ViaFile<'a> {
     path: &'a Path,
-    kind: ViaKind,
-    source: Option<&'a Path>,
+    via: &'a Via,
 }
 
 /// Deal with a temporary file left by an interrupted move of a file with `stamp`, without ever
@@ -1337,13 +1334,13 @@ fn clean_up_via(via: &ViaFile, from: &Path, stamp: Stamp, warnings: &mut Vec<Str
         return;
     };
     let unused = meta.len() == 0 && stamp.size != 0;
-    let redundant = via.kind == ViaKind::Copy
-        && via
-            .source
-            .is_some_and(|source| is_prefix_of(via.path, source).unwrap_or(false));
+    let redundant = match via.via {
+        Via::Copy { source } => is_prefix_of(via.path, source).unwrap_or(false),
+        Via::Stop => false,
+    };
     let result = if unused || redundant {
         fs::remove_file(via.path)
-    } else if via.kind == ViaKind::Stop && matches(&meta, stamp) && !exists(from) {
+    } else if *via.via == Via::Stop && matches(&meta, stamp) && !exists(from) {
         fs::rename(via.path, from)
     } else {
         // Next to the temporary file, so on its file system.
@@ -1413,10 +1410,9 @@ fn is_temp_name(path: &Path) -> bool {
 /// name, so a journal must not be able to point them at anything else.
 fn via_belongs_to(via: &ViaFile, from: &Path, to: &Path) -> bool {
     let in_place = [to.parent(), from.parent()].contains(&via.path.parent());
-    let source_ok = match (via.kind, via.source) {
-        (ViaKind::Copy, Some(source)) => source == from || source == to,
-        (ViaKind::Copy, None) => false,
-        (ViaKind::Stop, _) => true,
+    let source_ok = match via.via {
+        Via::Copy { source } => source == from || source == to,
+        Via::Stop => true,
     };
     is_temp_name(via.path) && in_place && source_ok
 }
@@ -1443,13 +1439,12 @@ impl<'a> JournalIndex<'a> {
                 Record::Via {
                     index: move_index,
                     path,
-                    kind,
-                    source,
-                } => index.vias.entry(*move_index).or_default().push(ViaFile {
-                    path,
-                    kind: *kind,
-                    source: source.as_deref(),
-                }),
+                    via,
+                } => index
+                    .vias
+                    .entry(*move_index)
+                    .or_default()
+                    .push(ViaFile { path, via }),
                 Record::Row { index: i, row } => {
                     index.rows.insert(*i, row);
                 }
@@ -1548,7 +1543,7 @@ impl Undo {
             debug!("Move {}: skipped by apply; {} stays", i, shown(from));
             return Ok(());
         }
-        let had_copy = vias.iter().any(|v| v.kind == ViaKind::Copy);
+        let had_copy = vias.iter().any(|v| matches!(v.via, Via::Copy { .. }));
         let found = locate(from, to, planned.stamp, had_copy)
             .unwrap_or_else(|e| Found::Unclear(format!("Cannot check {}: {}", to.display(), e)));
         let at = match &found {
@@ -1574,13 +1569,9 @@ impl Undo {
                 // says, as the roots plans are made from are.
                 let journal = &mut self.journal;
                 let moved = link_free(folder_of(from), &mut self.known).and_then(|()| {
-                    move_file(
-                        to,
-                        from,
-                        m.stamp,
-                        &ApplyOptions::default(),
-                        |via, kind, source| journal.via(index, via, kind, source),
-                    )
+                    move_file(to, from, m.stamp, &ApplyOptions::default(), |path, via| {
+                        journal.via(index, path, via)
+                    })
                 });
                 match moved {
                     Ok(()) => {
@@ -2172,10 +2163,12 @@ mod tests {
             dir.path().join("photo.jpg"),
         );
         fs::write(&via, b"half a pho").unwrap();
+        let copied = Via::Copy {
+            source: source.clone(),
+        };
         let copy = ViaFile {
             path: &via,
-            kind: ViaKind::Copy,
-            source: Some(&source),
+            via: &copied,
         };
         let stamp = Stamp {
             size: 20,
@@ -2200,8 +2193,7 @@ mod tests {
         fs::write(&via, b"").unwrap();
         let stop = ViaFile {
             path: &via,
-            kind: ViaKind::Stop,
-            source: None,
+            via: &Via::Stop,
         };
         clean_up_via(&stop, &from, stamp, &mut warnings);
         assert!(!via.exists() && !from.exists());
@@ -2305,13 +2297,37 @@ mod tests {
         })
     }
 
-    fn via(index: usize, path: &Path, kind: ViaKind, source: Option<&Path>) -> Record {
+    fn via(index: usize, path: &Path, source: Option<&Path>) -> Record {
         Record::Via {
             index,
             path: path.to_path_buf(),
-            kind,
-            source: source.map(Path::to_path_buf),
+            via: source.map_or(Via::Stop, |source| Via::Copy {
+                source: source.to_path_buf(),
+            }),
         }
+    }
+
+    #[test]
+    fn test_via_record_format() {
+        let line = |record: &Record| serde_json::to_string(record).unwrap();
+        let stop = via(2, Path::new("t"), None);
+        let copy = via(2, Path::new("t"), Some(Path::new("s")));
+        assert_eq!(
+            line(&stop),
+            r#"{"event":"via","index":2,"path":"t","kind":"stop"}"#
+        );
+        assert_eq!(
+            line(&copy),
+            r#"{"event":"via","index":2,"path":"t","kind":"copy","source":"s"}"#
+        );
+        for record in [stop, copy] {
+            assert_eq!(
+                serde_json::from_str::<Record>(&line(&record)).unwrap(),
+                record
+            );
+        }
+        let sourceless = r#"{"event":"via","index":2,"path":"t","kind":"copy"}"#;
+        assert!(serde_json::from_str::<Record>(sourceless).is_err());
     }
 
     #[test]
@@ -2345,10 +2361,10 @@ mod tests {
             &[
                 start(&f),
                 intent(0, &from, &to, 8, 0),
-                via(0, &victim, ViaKind::Copy, Some(&victim)),
-                via(0, &empty, ViaKind::Stop, None),
-                via(0, &elsewhere, ViaKind::Stop, None),
-                via(0, &other, ViaKind::Copy, Some(&victim)),
+                via(0, &victim, Some(&victim)),
+                via(0, &empty, None),
+                via(0, &elsewhere, None),
+                via(0, &other, Some(&victim)),
             ],
         );
         let summary = undo(&journal).unwrap();
@@ -2380,7 +2396,7 @@ mod tests {
             &[
                 start(&f),
                 intent(0, &from, &to, stamp.size, stamp.mtime_ns),
-                via(0, &temp, ViaKind::Copy, Some(&from)),
+                via(0, &temp, Some(&from)),
             ],
         );
         // Same bytes, but not the mtime pixrs gives a copy: another file. Both stay.

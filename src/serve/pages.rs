@@ -587,7 +587,7 @@ fn dupe_group(group: &DupeGroup) -> Markup {
     html! {
         section.group {
             h2 {
-                @match group.tier {
+                @match group.tier() {
                     Tier::Exact => {
                         @if let Some(file) = group.files.first() { (HumanBytes(file.size)) }
                         " x " (group.files.len()) " exact copies, "
@@ -596,7 +596,7 @@ fn dupe_group(group: &DupeGroup) -> Markup {
                     Tier::Similar => { (group.files.len()) " similar files, " }
                 }
                 (HumanBytes(group.reclaimable_bytes())) " reclaimable "
-                span.badge.tier { (group.tier.as_str()) }
+                span.badge.tier { (group.tier().as_str()) }
             }
             div.copies {
                 @for f in &group.files {
@@ -608,7 +608,7 @@ fn dupe_group(group: &DupeGroup) -> Markup {
                         figcaption {
                             @if f.role.is_keep() { span.badge.keep { "keep" } }
                             // In an exact group every copy matches exactly; no need to say so.
-                            @if group.tier != Tier::Exact {
+                            @if group.tier() != Tier::Exact {
                                 @if let Role::Copy(matches) = f.role {
                                     span.badge.tier { (matches.as_str()) }
                                 }
@@ -617,7 +617,7 @@ fn dupe_group(group: &DupeGroup) -> Markup {
                             div.path { (f.path) }
                             div.meta {
                                 (human_mtime(f.mtime_ns))
-                                @if group.tier != Tier::Exact { ", " (HumanBytes(f.size)) }
+                                @if group.tier() != Tier::Exact { ", " (HumanBytes(f.size)) }
                             }
                         }
                     }

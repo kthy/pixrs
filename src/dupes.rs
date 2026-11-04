@@ -8,14 +8,14 @@
 use crate::avhash::{
     audio_durations_match, audio_match, frames_match, has_detail, video_durations_match, Frame,
 };
-use crate::catalog::{library_path, one_row_per_file, Catalog, HashedAv, HashedFile, HashedImage};
+use crate::catalog::{extra_rows, library_path, Catalog, HashedAv, HashedFile, HashedImage};
 use crate::imagehash::{distance, fingerprints_match, Visual};
 use crate::library::LibraryId;
 use crate::media::Dimensions;
 use crate::text::shown;
 use indicatif::HumanBytes;
 use log::debug;
-use serde::ser::SerializeStruct;
+use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -34,8 +34,7 @@ use time::OffsetDateTime;
 pub const DEFAULT_THRESHOLD: u32 = 6;
 
 /// How closely files match. A group has the weakest match of any of its files to the kept one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
     /// The same bytes.
     Exact,
@@ -56,6 +55,12 @@ impl Tier {
     }
 }
 
+impl Serialize for Tier {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// A file in a duplicate group.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DupeFile {
@@ -67,10 +72,9 @@ pub struct DupeFile {
     pub path: String,
     /// Size in bytes.
     pub size: u64,
-    /// Modification time, RFC 3339 in UTC.
-    pub mtime: String,
-    /// Modification time in nanoseconds since the Unix epoch.
-    #[serde(skip)]
+    /// Modification time in nanoseconds since the Unix epoch; reported as `mtime`, RFC 3339 in
+    /// UTC.
+    #[serde(rename = "mtime", serialize_with = "serialize_mtime")]
     pub mtime_ns: i64,
     /// Reported as the fields `keep` and `matches`.
     #[serde(flatten)]
@@ -112,19 +116,65 @@ impl Serialize for Role {
     }
 }
 
+/// What the files of a group have in common.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupKind {
+    /// The same bytes, with this SHA-256.
+    Exact { sha256: String },
+    /// The same decoded pixels.
+    SamePixels,
+    /// Similar pictures or sound.
+    Similar,
+}
+
+impl GroupKind {
+    /// How closely the files match.
+    pub const fn tier(&self) -> Tier {
+        match self {
+            Self::Exact { .. } => Tier::Exact,
+            Self::SamePixels => Tier::SamePixels,
+            Self::Similar => Tier::Similar,
+        }
+    }
+
+    /// The SHA-256 the files share, for exact groups.
+    pub fn sha256(&self) -> Option<&str> {
+        match self {
+            Self::Exact { sha256 } => Some(sha256),
+            Self::SamePixels | Self::Similar => None,
+        }
+    }
+}
+
+/// Reports show a kind as the field `tier`, and `sha256` for exact groups.
+impl Serialize for GroupKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = serializer.serialize_map(None)?;
+        fields.serialize_entry("tier", &self.tier())?;
+        if let Some(sha256) = self.sha256() {
+            fields.serialize_entry("sha256", sha256)?;
+        }
+        fields.end()
+    }
+}
+
 /// Files that are copies of each other.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DupeGroup {
-    pub tier: Tier,
-    /// The SHA-256 the files share, for exact groups.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
+    /// Reported as the fields `tier` and `sha256`.
+    #[serde(flatten)]
+    pub kind: GroupKind,
     /// The kept file first, then the others in the order the keeper was chosen by: oldest to
     /// newest, or for similar groups largest to smallest.
     pub files: Vec<DupeFile>,
 }
 
 impl DupeGroup {
+    /// How closely the files match.
+    pub const fn tier(&self) -> Tier {
+        self.kind.tier()
+    }
+
     /// Bytes freed by removing every copy but the kept one.
     pub fn reclaimable_bytes(&self) -> u64 {
         self.files.iter().skip(1).map(|f| f.size).sum()
@@ -199,23 +249,26 @@ impl<'a> Node<'a> {
     }
 }
 
-/// The tier of a group: exact if all its files have the same size and SHA-256, same pixels if
-/// they all have the same pixel hash, otherwise similar.
-fn group_tier(group: &[&Node]) -> Tier {
+/// What a group has in common: exact if all its files have the same size and SHA-256, same
+/// pixels if they all have the same pixel hash, otherwise similar.
+fn group_kind(group: &[&Node]) -> GroupKind {
     let Some(first) = group.first() else {
-        return Tier::Similar;
+        return GroupKind::Similar;
     };
     let all = |same: &dyn Fn(&Node) -> bool| group.iter().all(|n| same(n));
-    if first.file.sha256.is_some()
-        && all(&|n| {
+    if let Some(sha256) = &first.file.sha256 {
+        if all(&|n| {
             n.file.stamp.size == first.file.stamp.size && n.file.sha256 == first.file.sha256
-        })
-    {
-        Tier::Exact
-    } else if first.pixel_hash.is_some() && all(&|n| n.pixel_hash == first.pixel_hash) {
-        Tier::SamePixels
+        }) {
+            return GroupKind::Exact {
+                sha256: sha256.clone(),
+            };
+        }
+    }
+    if first.pixel_hash.is_some() && all(&|n| n.pixel_hash == first.pixel_hash) {
+        GroupKind::SamePixels
     } else {
-        Tier::Similar
+        GroupKind::Similar
     }
 }
 
@@ -441,12 +494,11 @@ pub fn load_dupes(
     let files = input.exact.iter();
     let files = files.chain(input.images.iter().map(|image| &image.file));
     let files = files.chain(input.av.iter().map(|av| &av.file));
-    if let Some(keep) = one_row_per_file(files) {
-        // In the order the files were chained.
-        let mut keep = keep.into_iter();
-        input.exact.retain(|_| keep.next().unwrap_or(true));
-        input.images.retain(|_| keep.next().unwrap_or(true));
-        input.av.retain(|_| keep.next().unwrap_or(true));
+    let extra = extra_rows(files);
+    if !extra.is_empty() {
+        input.exact.retain(|file| !extra.contains(file));
+        input.images.retain(|image| !extra.contains(&image.file));
+        input.av.retain(|av| !extra.contains(&av.file));
     }
     debug!(
         "Loaded {} files that share size and SHA-256, {} decoded images, {} videos and audio",
@@ -690,8 +742,8 @@ impl<'a> Graph<'a> {
                     .first()
                     .map(|f| (f.library.as_str(), f.path.as_str()))
             }
-            a.tier
-                .cmp(&b.tier)
+            a.tier()
+                .cmp(&b.tier())
                 .then_with(|| b.reclaimable_bytes().cmp(&a.reclaimable_bytes()))
                 .then_with(|| kept(a).cmp(&kept(b)))
         });
@@ -744,7 +796,8 @@ fn oldest_copy_of_largest_first(group: &mut [&Node]) {
 
 /// The report's group for linked files, the kept one first.
 fn dupe_group(mut group: Vec<&Node>) -> Option<DupeGroup> {
-    let tier = group_tier(&group);
+    let kind = group_kind(&group);
+    let tier = kind.tier();
     group.sort_by(|a, b| keeper_order(tier, a, b));
     if tier == Tier::Similar {
         oldest_copy_of_largest_first(&mut group);
@@ -757,14 +810,7 @@ fn dupe_group(mut group: Vec<&Node>) -> Option<DupeGroup> {
                 .map(|node| dupe_file(node.file, Role::Copy(match_tier(keeper, node)))),
         )
         .collect();
-    let sha256 = (tier == Tier::Exact)
-        .then(|| keeper.file.sha256.clone())
-        .flatten();
-    Some(DupeGroup {
-        tier,
-        sha256,
-        files,
-    })
+    Some(DupeGroup { kind, files })
 }
 
 /// A file as the report shows it.
@@ -774,7 +820,6 @@ fn dupe_file(file: &HashedFile, role: Role) -> DupeFile {
         library: file.root.to_string(),
         path: file.path.clone(),
         size: file.stamp.size,
-        mtime: format_mtime(file.stamp.mtime_ns),
         mtime_ns: file.stamp.mtime_ns,
         role,
     }
@@ -800,9 +845,12 @@ pub fn group_dupes(
         "{} {}: {} exact, {} same pixels, {} similar",
         groups.len(),
         plural(groups.len(), "group", "groups"),
-        groups.iter().filter(|g| g.tier == Tier::Exact).count(),
-        groups.iter().filter(|g| g.tier == Tier::SamePixels).count(),
-        groups.iter().filter(|g| g.tier == Tier::Similar).count()
+        groups.iter().filter(|g| g.tier() == Tier::Exact).count(),
+        groups
+            .iter()
+            .filter(|g| g.tier() == Tier::SamePixels)
+            .count(),
+        groups.iter().filter(|g| g.tier() == Tier::Similar).count()
     );
     let summary = Summary {
         groups: groups.len(),
@@ -812,6 +860,15 @@ pub fn group_dupes(
         unhashed_media: input.unhashed_media,
     };
     DupeReport { groups, summary }
+}
+
+/// Serialize nanoseconds since the Unix epoch as `format_mtime` writes them.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's serialize_with passes fields by reference"
+)]
+fn serialize_mtime<S: Serializer>(mtime_ns: &i64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format_mtime(*mtime_ns))
 }
 
 /// Nanoseconds since the Unix epoch as RFC 3339 in UTC.
@@ -839,16 +896,16 @@ pub fn human_mtime(mtime_ns: i64) -> String {
 pub fn write_text(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
     for group in &report.groups {
         let n = group.files.len();
-        match (&group.tier, &group.sha256) {
-            (Tier::Exact, Some(sha256)) => writeln!(
+        match &group.kind {
+            GroupKind::Exact { sha256 } => writeln!(
                 out,
                 "{} copies of {} (sha256 {}):",
                 n,
                 HumanBytes(group.files.first().map_or(0, |f| f.size)),
                 sha256.get(..12).unwrap_or(sha256)
             )?,
-            (Tier::SamePixels, _) => writeln!(out, "{n} images with the same pixels:")?,
-            _ => writeln!(out, "{n} similar files:")?,
+            GroupKind::SamePixels => writeln!(out, "{n} images with the same pixels:")?,
+            GroupKind::Similar => writeln!(out, "{n} similar files:")?,
         }
         for file in &group.files {
             write!(
@@ -858,7 +915,7 @@ pub fn write_text(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
                 shown(&library_path(Path::new(&file.library), &file.path)),
                 human_mtime(file.mtime_ns)
             )?;
-            match (group.tier, file.role) {
+            match (group.tier(), file.role) {
                 (Tier::Exact, _) => writeln!(out)?,
                 (_, Role::Copy(matches)) => {
                     writeln!(out, "  {}  {}", HumanBytes(file.size), matches.as_str())?;
@@ -912,14 +969,14 @@ pub fn write_csv(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
                 out,
                 "{},{},{},{},{},{},{},{},{}",
                 i + 1,
-                group.tier.as_str(),
-                group.sha256.as_deref().unwrap_or(""),
+                group.tier().as_str(),
+                group.kind.sha256().unwrap_or(""),
                 file.size,
                 file.role.is_keep(),
                 file.role.matches().map_or("", Tier::as_str),
                 csv_field(&file.library),
                 csv_field(&file.path),
-                file.mtime
+                format_mtime(file.mtime_ns)
             )?;
         }
     }
@@ -1116,7 +1173,7 @@ mod tests {
         let shas: Vec<&str> = report
             .groups
             .iter()
-            .map(|g| g.sha256.as_deref().unwrap())
+            .map(|g| g.kind.sha256().unwrap())
             .collect();
         assert_eq!(shas, vec!["aaa", "bbb"]);
         let keeper = &report.groups[0].files[0];
@@ -1137,7 +1194,7 @@ mod tests {
         let order: Vec<&str> = report
             .groups
             .iter()
-            .map(|g| g.sha256.as_deref().unwrap())
+            .map(|g| g.kind.sha256().unwrap())
             .collect();
         assert_eq!(order, vec!["big", "small"]);
         assert_eq!(report.summary.reclaimable_bytes, 1010);
@@ -1340,7 +1397,7 @@ mod tests {
             .map(|g| {
                 let mut paths: Vec<&str> = g.files.iter().map(|f| f.path.as_str()).collect();
                 paths.sort_unstable();
-                (g.tier, paths)
+                (g.tier(), paths)
             })
             .collect();
         assert_eq!(
@@ -1357,7 +1414,7 @@ mod tests {
 
         // Similar images are only looked for when asked.
         let report = find_dupes(&catalog, &[], Similarity::default()).unwrap();
-        assert!(report.groups.iter().all(|g| g.tier != Tier::Similar));
+        assert!(report.groups.iter().all(|g| g.tier() != Tier::Similar));
         assert_eq!(report.groups.len(), 1);
     }
 
@@ -1381,7 +1438,7 @@ mod tests {
         let report = find_dupes(&fx.catalog, &[], Similarity::with_images(3)).unwrap();
         assert_eq!(report.groups.len(), 1);
         let group = &report.groups[0];
-        assert_eq!((group.tier, group.sha256.as_deref()), (Tier::Similar, None));
+        assert_eq!(group.kind, GroupKind::Similar);
         // Same pixel count: the larger file wins, then the older one, so not the oldest c.jpg.
         assert_eq!(kept_and_others(group)[0], (true, "a.jpg"));
         let matches: Vec<(&str, Option<Tier>)> = group
@@ -1407,7 +1464,7 @@ mod tests {
         // Without the similar link the group is exact, and the oldest copy is kept.
         let report = find_dupes(&fx.catalog, &[], Similarity::with_images(2)).unwrap();
         assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.groups[0].tier, Tier::Exact);
+        assert_eq!(report.groups[0].tier(), Tier::Exact);
         assert_eq!(kept_and_others(&report.groups[0])[0], (true, "a.jpg"));
     }
 
@@ -1541,7 +1598,7 @@ mod tests {
         }
         let report = find_dupes(&fx.catalog, &[], Similarity::with_images(0)).unwrap();
         assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.groups[0].tier, Tier::SamePixels);
+        assert_eq!(report.groups[0].tier(), Tier::SamePixels);
     }
 
     #[test]
@@ -1608,7 +1665,7 @@ mod tests {
         // The re-encoded copy matches; the larger original is kept, not the smaller copy; the
         // unrelated video is not in any group.
         assert_eq!(report.groups.len(), 1);
-        assert_eq!(report.groups[0].tier, Tier::Similar);
+        assert_eq!(report.groups[0].tier(), Tier::Similar);
         let files: Vec<(&str, Option<Tier>)> = report.groups[0]
             .files
             .iter()
