@@ -151,7 +151,7 @@ struct ProbeTimes {
 }
 
 /// A number of seconds, if it is one and finite.
-fn seconds(value: Option<&String>) -> Option<f64> {
+fn seconds(value: Option<&str>) -> Option<f64> {
     value?.parse::<f64>().ok().filter(|x| x.is_finite())
 }
 
@@ -206,15 +206,13 @@ fn span_from_probe(json: &[u8]) -> Result<Span, DecodeError> {
             })
             .and_then(|(_, value)| parse_clock(value))
     };
-    let duration = seconds(stream.and_then(|s| s.times.duration.as_ref()))
-        .filter(|d| *d > 0.0)
-        .or_else(tagged)
-        .filter(|d| *d > 0.0)
-        .or_else(|| seconds(format.duration.as_ref()))
-        .filter(|d| *d > 0.0)
+    let positive = |d: Option<f64>| d.filter(|d| *d > 0.0);
+    let duration = positive(seconds(stream.and_then(|s| s.times.duration.as_deref())))
+        .or_else(|| positive(tagged()))
+        .or_else(|| positive(seconds(format.duration.as_deref())))
         .ok_or(DecodeError::NoDuration)?;
-    let stream_start = seconds(stream.and_then(|s| s.times.start_time.as_ref()));
-    let start = match (stream_start, seconds(format.start_time.as_ref())) {
+    let stream_start = seconds(stream.and_then(|s| s.times.start_time.as_deref()));
+    let start = match (stream_start, seconds(format.start_time.as_deref())) {
         (Some(stream), Some(format)) => (stream - format).max(0.0),
         _ => 0.0,
     };

@@ -61,7 +61,7 @@ struct Variant {
     options: &'static [&'static str],
 }
 
-/// Re-encodings that should still count as the same video.
+/// Re-encodings that should still count as the same video, without the audio.
 const VIDEO_VARIANTS: &[Variant] = &[
     Variant {
         name: "half, mpeg4",
@@ -73,6 +73,7 @@ const VIDEO_VARIANTS: &[Variant] = &[
             "mpeg4",
             "-q:v",
             "8",
+            "-an",
         ],
     },
     Variant {
@@ -87,6 +88,7 @@ const VIDEO_VARIANTS: &[Variant] = &[
             "ultrafast",
             "-crf",
             "28",
+            "-an",
         ],
     },
     Variant {
@@ -101,6 +103,7 @@ const VIDEO_VARIANTS: &[Variant] = &[
             "ultrafast",
             "-crf",
             "33",
+            "-an",
         ],
     },
 ];
@@ -140,7 +143,6 @@ fn encode(ffmpeg: &Path, input: &Path, options: &[&str], output: &Path) -> bool 
         .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
         .arg(input)
         .args(options)
-        .args(std::iter::once(&"-an").filter(|_| options.iter().any(|o| o.starts_with("-c:v"))))
         .arg(output)
         .stdin(Stdio::null())
         .status()
@@ -321,6 +323,12 @@ fn histogram(values: &[usize], max: usize) -> Vec<usize> {
     counts
 }
 
+/// An audio file and its fingerprint.
+struct Printed<'a> {
+    file: &'a PathBuf,
+    print: AudioFingerprint,
+}
+
 fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
     let (Some(Tool { path: ffmpeg, .. }), Some(Tool { path: fpcalc, .. })) =
         (&tools.ffmpeg, &tools.fpcalc)
@@ -334,24 +342,26 @@ fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
         .map(walkdir::DirEntry::into_path)
         .filter(|p| pixrs::media::MediaType::from_path(p) == Some(pixrs::media::MediaType::Audio))
         .collect();
-    let prints: Vec<AudioFingerprint> = files
+    let prints: Vec<Printed> = files
         .iter()
-        .filter_map(|f| audio_fingerprint(fpcalc, f).ok())
+        .filter_map(|file| {
+            Some(Printed {
+                file,
+                print: audio_fingerprint(fpcalc, file).ok()?,
+            })
+        })
         .collect();
     println!();
     println!("{} audio files fingerprinted", prints.len());
     for variant in AUDIO_VARIANTS {
         let mut rates = vec![];
-        for (n, file) in files.iter().enumerate() {
+        for (n, Printed { file, print }) in prints.iter().enumerate() {
             let copy = out.join(format!("audio-{n}.{}", variant.extension));
             if !encode(ffmpeg, file, variant.options, &copy) {
                 continue;
             }
-            if let (Ok(a), Ok(b)) = (
-                audio_fingerprint(fpcalc, file),
-                audio_fingerprint(fpcalc, &copy),
-            ) {
-                rates.push(bit_error_rate(&a.values, &b.values));
+            if let Ok(copied) = audio_fingerprint(fpcalc, &copy) {
+                rates.push(bit_error_rate(&print.values, &copied.values));
             }
             let _ = fs::remove_file(&copy);
         }
@@ -366,8 +376,8 @@ fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
         );
     }
     let mut unrelated = vec![];
-    for (i, a) in prints.iter().enumerate() {
-        for b in prints.iter().skip(i + 1) {
+    for (i, Printed { print: a, .. }) in prints.iter().enumerate() {
+        for Printed { print: b, .. } in prints.iter().skip(i + 1) {
             unrelated.push(Unrelated {
                 bit_error_rate: bit_error_rate(&a.values, &b.values),
                 close_durations: audio_durations_match(a.duration_ms, b.duration_ms),
