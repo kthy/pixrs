@@ -107,19 +107,25 @@ static HELD: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Remove the lock this process holds, if any. For the Ctrl-C handler, which exits without
 /// running destructors; an interrupted `apply` is reversed with `undo`, which needs the lock.
 pub fn release_lock() {
-    if let Some(path) = HELD.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    let held = HELD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(path) = held {
         let _ = fs::remove_file(path);
     }
 }
 
 impl Lock {
-    pub(crate) fn take(catalog: &Path) -> Result<Lock, Error> {
+    pub(crate) fn take(catalog: &Path) -> Result<Self, Error> {
         let path = state_dir(catalog, "pixrs.lock");
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 let _ = writeln!(file, "{}", std::process::id());
-                *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
-                Ok(Lock(path))
+                *HELD
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.clone());
+                Ok(Self(path))
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Usage(format!(
                 "{} exists: another `pixrs apply`, `undo` or `relocate` is running on this \
@@ -133,15 +139,22 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = HELD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if held.as_ref() == Some(&self.0) {
-            held.take();
+            *held = None;
         }
+        drop(held);
         let _ = fs::remove_file(&self.0);
     }
 }
 
 /// Test hooks for `apply`.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "test hooks, to become an enum"
+)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ApplyOptions {
     /// Stop as if interrupted after this many files were moved.
@@ -208,7 +221,7 @@ pub(crate) fn reserve_temp(dir: &Path) -> io::Result<(PathBuf, File)> {
             .open(&path);
         match created {
             Ok(file) => return Ok((path, file)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }
@@ -276,18 +289,18 @@ fn matches(meta: &fs::Metadata, size: u64, mtime_ns: i64) -> bool {
 /// Whether the file `part` is the start of (or all of) the file `whole`: a copy, stopped or
 /// finished, of `whole`.
 fn is_prefix_of(part: &Path, whole: &Path) -> io::Result<bool> {
-    let (mut a, mut b) = (File::open(part)?, File::open(whole)?);
-    if a.metadata()?.len() > b.metadata()?.len() {
+    let (mut part, mut whole) = (File::open(part)?, File::open(whole)?);
+    if part.metadata()?.len() > whole.metadata()?.len() {
         return Ok(false);
     }
-    let (mut x, mut y) = (vec![0; 64 * 1024], vec![0; 64 * 1024]);
+    let (mut ours, mut theirs) = (vec![0; 64 * 1024], vec![0; 64 * 1024]);
     loop {
-        let n = a.read(&mut x)?;
+        let n = part.read(&mut ours)?;
         if n == 0 {
             return Ok(true);
         }
-        b.read_exact(&mut y[..n])?;
-        if x[..n] != y[..n] {
+        whole.read_exact(&mut theirs[..n])?;
+        if ours[..n] != theirs[..n] {
             return Ok(false);
         }
     }
@@ -298,7 +311,7 @@ fn is_prefix_of(part: &Path, whole: &Path) -> io::Result<bool> {
 fn recovered_name(path: &Path) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{}", ext)),
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
         _ => (name.to_string(), String::new()),
     };
     let mut n = 1;
@@ -306,9 +319,9 @@ fn recovered_name(path: &Path) -> PathBuf {
         let number = if n == 1 {
             String::new()
         } else {
-            format!("-{}", n)
+            format!("-{n}")
         };
-        let candidate = path.with_file_name(format!("{}.pixrs-recovered{}{}", stem, number, ext));
+        let candidate = path.with_file_name(format!("{stem}.pixrs-recovered{number}{ext}"));
         if !exists(&candidate) {
             return candidate;
         }
@@ -449,7 +462,7 @@ fn move_file(
     opts: &ApplyOptions,
     mut note_via: impl FnMut(&Path, ViaKind, Option<&Path>) -> io::Result<()>,
 ) -> Result<(), MoveError> {
-    let dir = to.parent().unwrap_or(Path::new("."));
+    let dir = to.parent().unwrap_or_else(|| Path::new("."));
     if spelling_only(from, to) {
         if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
             return Err(MoveError::Taken);
@@ -672,10 +685,10 @@ fn problem(m: &Move, done: &[bool]) -> Option<String> {
     }) = &m.keeper
     {
         if changed(Path::new(path), *size, *mtime_ns).is_some() {
-            return Some(format!("the kept copy {} is gone or changed", path));
+            return Some(format!("the kept copy {path} is gone or changed"));
         }
         if same_file(Path::new(path), Path::new(&m.from)) {
-            return Some(format!("it is the same file as the kept copy {}", path));
+            return Some(format!("it is the same file as the kept copy {path}"));
         }
     }
     changed(Path::new(&m.from), m.size, m.mtime_ns)
@@ -685,14 +698,14 @@ fn problem(m: &Move, done: &[bool]) -> Option<String> {
 fn new_journal(plan_path: &Path, catalog: &Path) -> Result<(Journal, PathBuf), Error> {
     let dir = state_dir(catalog, "journals");
     fs::create_dir_all(&dir)?;
-    let stem = plan_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| String::from("plan"));
-    let mut path = dir.join(format!("{}.jsonl", stem));
+    let stem = plan_path.file_stem().map_or_else(
+        || String::from("plan"),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    let mut path = dir.join(format!("{stem}.jsonl"));
     let mut n = 2;
     while exists(&path) {
-        path = dir.join(format!("{}-{}.jsonl", stem, n));
+        path = dir.join(format!("{stem}-{n}.jsonl"));
         n += 1;
     }
     let file = OpenOptions::new()
@@ -726,6 +739,7 @@ pub fn apply_with(
         .map_err(|error| ApplyError { error, journal })
 }
 
+#[allow(clippy::too_many_lines, reason = "to be split by phase")]
 fn apply_journaled(
     plan_path: &Path,
     plan: &Plan,
@@ -775,7 +789,7 @@ fn apply_journaled(
             continue;
         }
         if let Err(e) = create_folders(to.parent(), &mut journal, &mut known) {
-            skip(&mut journal, format!("cannot create its folder: {}", e))?;
+            skip(&mut journal, format!("cannot create its folder: {e}"))?;
             continue;
         }
         journal.write(&Record::Intent {
@@ -898,20 +912,17 @@ fn update_catalog(
     let Some((library_id, path)) = &m.cataloged else {
         return Ok(());
     };
-    match &m.cataloged_to {
-        // A row at the target is stale: the file there was gone, or the move would not have
-        // happened.
-        Some((new_library_id, new_path)) => {
-            catalog.rename_row(*library_id, path, *new_library_id, new_path, true)?;
+    // A row at the target is stale: the file there was gone, or the move would not have
+    // happened.
+    if let Some((new_library_id, new_path)) = &m.cataloged_to {
+        catalog.rename_row(*library_id, path, *new_library_id, new_path, true)?;
+    } else {
+        // The row is only gone once the journal has it.
+        let tx = catalog.transaction()?;
+        if let Some(row) = catalog.take_row(*library_id, path)? {
+            journal.write(&Record::Row { index, row })?;
         }
-        None => {
-            // The row is only gone once the journal has it.
-            let tx = catalog.transaction()?;
-            if let Some(row) = catalog.take_row(*library_id, path)? {
-                journal.write(&Record::Row { index, row })?;
-            }
-            tx.commit()?;
-        }
+        tx.commit()?;
     }
     Ok(())
 }
@@ -1117,6 +1128,7 @@ fn via_belongs_to(via: &ViaFile, from: &Path, to: &Path) -> bool {
 
 /// Reverse everything the journal at `path` records, as far as it got. Safe to run again, also
 /// after a crash: it looks at where each file actually is, and journals its own steps.
+#[allow(clippy::too_many_lines, reason = "to be split by phase")]
 pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
     let records = read_journal(path)?;
     let Some(Record::Start { catalog, .. }) = records.first() else {
@@ -1241,7 +1253,7 @@ pub fn undo(path: &Path) -> Result<UndoSummary, Error> {
             Found::AtTarget => {
                 // Without a plan, the folder it goes back to must at least be where its path
                 // says, as the roots plans are made from are.
-                let back_to = from.parent().unwrap_or(Path::new("."));
+                let back_to = from.parent().unwrap_or_else(|| Path::new("."));
                 let moved = link_free(back_to, &mut known).and_then(|()| {
                     move_file(to, from, *size, *mtime_ns, &opts, |via, kind, source| {
                         journal.write(&Record::Via {
@@ -1544,7 +1556,7 @@ mod tests {
         assert_eq!(
             moved
                 .keys()
-                .filter(|k| k.starts_with(&format!("lib/{}/", moved_from)))
+                .filter(|k| k.starts_with(&format!("lib/{moved_from}/")))
                 .count(),
             if moved_from == "b" { 2 } else { 1 }
         );
@@ -1675,7 +1687,7 @@ mod tests {
             catalog: String::from("c"),
         })
         .unwrap();
-        fs::write(&path, format!("{}\n{{\"event\":\"int", start)).unwrap();
+        fs::write(&path, format!("{start}\n{{\"event\":\"int")).unwrap();
         assert_eq!(read_journal(&path).unwrap().len(), 1);
     }
     #[cfg(target_os = "linux")]
@@ -2165,8 +2177,7 @@ mod tests {
             reasons
                 .iter()
                 .all(|r| r.contains("symbolic link") || *r == "its media file was not moved"),
-            "{:?}",
-            reasons
+            "{reasons:?}"
         );
         assert!(tree(&elsewhere).is_empty());
     }

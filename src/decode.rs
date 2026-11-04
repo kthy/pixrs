@@ -33,16 +33,16 @@ pub enum DecodeError {
 
 impl DecodeError {
     /// Whether trying again later might succeed.
-    pub fn is_transient(&self) -> bool {
-        !matches!(self, DecodeError::Invalid(_))
+    pub const fn is_transient(&self) -> bool {
+        !matches!(self, Self::Invalid(_))
     }
 }
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DecodeError::Unreadable(msg) | DecodeError::Invalid(msg) => write!(f, "{}", msg),
-            DecodeError::TimedOut => write!(f, "timed out"),
+            Self::Unreadable(msg) | Self::Invalid(msg) => write!(f, "{msg}"),
+            Self::TimedOut => write!(f, "timed out"),
         }
     }
 }
@@ -52,17 +52,17 @@ impl From<ImageError> for DecodeError {
         match e {
             // A file that ends early is broken, not unreadable: trying again will not help.
             ImageError::IoError(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                DecodeError::Invalid(e.to_string())
+                Self::Invalid(e.to_string())
             }
-            ImageError::IoError(e) => DecodeError::Unreadable(e.to_string()),
-            e => DecodeError::Invalid(e.to_string()),
+            ImageError::IoError(e) => Self::Unreadable(e.to_string()),
+            e => Self::Invalid(e.to_string()),
         }
     }
 }
 
 impl From<std::io::Error> for DecodeError {
     fn from(e: std::io::Error) -> Self {
-        DecodeError::Unreadable(e.to_string())
+        Self::Unreadable(e.to_string())
     }
 }
 
@@ -212,7 +212,7 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success());
-    debug!("{} on PATH: {}", name, found);
+    debug!("{name} on PATH: {found}");
     found.then(|| PathBuf::from(name))
 }
 
@@ -227,7 +227,7 @@ pub struct Tools {
 impl Tools {
     /// The tools on `PATH`.
     pub fn find() -> Self {
-        Tools {
+        Self {
             ffmpeg: find_tool("ffmpeg").map(|f| {
                 let version = ffmpeg_version(&f);
                 (f, version)
@@ -277,7 +277,7 @@ pub fn ffmpeg_handles_heic(version: &str) -> bool {
     let mut parts = version
         .trim_start_matches(|c: char| !c.is_ascii_digit())
         .split(|c: char| !c.is_ascii_digit())
-        .map(|part| part.parse::<u32>());
+        .map(str::parse::<u32>);
     match (parts.next(), parts.next()) {
         (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= FFMPEG_FOR_HEIC,
         _ => true,
@@ -287,7 +287,7 @@ pub fn ffmpeg_handles_heic(version: &str) -> bool {
 /// Run a tool and return its standard output, or an error with its standard error. Kills it
 /// after `TOOL_TIMEOUT`.
 pub(crate) fn run_with_timeout(mut command: Command) -> Result<Vec<u8>, DecodeError> {
-    debug!("Running {:?}", command);
+    debug!("Running {command:?}");
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -333,6 +333,10 @@ pub(crate) fn run_with_timeout(mut command: Command) -> Result<Vec<u8>, DecodeEr
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "test fixtures with small values"
+)]
 mod tests {
     use super::*;
 
@@ -372,7 +376,7 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
         let err = decode_in_process(&path).unwrap_err();
-        assert!(!err.is_transient(), "{:?}", err);
+        assert!(!err.is_transient(), "{err:?}");
     }
 
     #[test]
@@ -396,8 +400,8 @@ mod tests {
             run_with_timeout(command)
         };
         let err = decode(64 * 64 - 1).unwrap_err();
-        assert!(!err.is_transient(), "{:?}", err);
-        assert!(!decode(64 * 64).unwrap().is_empty());
+        assert!(!err.is_transient(), "{err:?}");
+        assert_ne!(decode(64 * 64).unwrap(), [] as [u8; 0]);
         let decoded = decode_with_ffmpeg(&ffmpeg, &path).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (64, 64));
         assert!(ffmpeg_input_options().contains(&MAX_FFMPEG_PIXELS.to_string()));
@@ -407,9 +411,9 @@ mod tests {
     fn test_missing_file_is_transient() {
         let err =
             decode_with_ffmpeg(Path::new("ffmpeg"), Path::new("/no/such/file.heic")).unwrap_err();
-        assert!(err.is_transient(), "{:?}", err);
+        assert!(err.is_transient(), "{err:?}");
         let err = decode_in_process(Path::new("/no/such/file.jpg")).unwrap_err();
-        assert!(err.is_transient(), "{:?}", err);
+        assert!(err.is_transient(), "{err:?}");
     }
 
     /// A PNG whose header claims `width` x `height` RGBA pixels, with no pixel data to speak of.
@@ -428,7 +432,7 @@ mod tests {
             }
             !crc
         }
-        fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        fn chunk(png: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
             png.extend_from_slice(&(data.len() as u32).to_be_bytes());
             let mut body = kind.to_vec();
             body.extend_from_slice(data);
@@ -441,9 +445,9 @@ mod tests {
         ihdr.extend_from_slice(&height.to_be_bytes());
         // 8 bits per channel, RGBA, deflate, adaptive filtering, no interlace.
         ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-        chunk(&mut png, b"IHDR", &ihdr);
-        chunk(&mut png, b"IDAT", &[0x78, 0x9c]);
-        chunk(&mut png, b"IEND", &[]);
+        chunk(&mut png, *b"IHDR", &ihdr);
+        chunk(&mut png, *b"IDAT", &[0x78, 0x9c]);
+        chunk(&mut png, *b"IEND", &[]);
         png
     }
 
@@ -454,12 +458,12 @@ mod tests {
         let path = dir.path().join("bomb.png");
         std::fs::write(&path, png_claiming(20_000, 20_000)).unwrap();
         let err = decode_in_process(&path).unwrap_err();
-        assert!(!err.is_transient(), "{:?}", err);
+        assert!(!err.is_transient(), "{err:?}");
         assert_eq!(err.to_string(), "Memory limit exceeded");
         // Beyond the dimension limit: 40 GB, refused before the decoder starts.
         std::fs::write(&path, png_claiming(100_000, 100_000)).unwrap();
         let err = decode_in_process(&path).unwrap_err();
-        assert!(!err.is_transient(), "{:?}", err);
+        assert!(!err.is_transient(), "{err:?}");
         assert_eq!(err.to_string(), "Image size exceeds limit");
         // A file too large to read whole, without looking inside (sparse, so cheap to make).
         let path = dir.path().join("huge.jpg");
@@ -468,7 +472,7 @@ mod tests {
             .set_len(MAX_IMAGE_FILE_BYTES + 1)
             .unwrap();
         let err = decode_in_process(&path).unwrap_err();
-        assert!(!err.is_transient(), "{:?}", err);
+        assert!(!err.is_transient(), "{err:?}");
         assert!(err.to_string().contains("more than"), "{}", err);
         // A small image still decodes.
         let path = dir.path().join("ok.png");

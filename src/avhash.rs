@@ -128,7 +128,7 @@ pub fn video_version(ffmpeg_version: &str) -> String {
 /// The version audio is fingerprinted with: the signature definitions and `fpcalc`'s major and
 /// minor version.
 pub fn audio_version(fpcalc_version: &str) -> String {
-    format!("audio {}; fpcalc {}", AV_VERSION, fpcalc_version)
+    format!("audio {AV_VERSION}; fpcalc {fpcalc_version}")
 }
 
 /// The major and minor version `fpcalc -version` reports, e.g. `1.5`, or `unknown`.
@@ -206,6 +206,10 @@ fn video_span(ffprobe: &Path, source: &Path) -> Result<(f64, f64), DecodeError> 
 }
 
 /// Seconds from a clock time like `01:02:03.500000000`.
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "a fused multiply-add rounds differently, which would change the durations read"
+)]
 fn parse_clock(clock: &str) -> Option<f64> {
     let mut seconds = 0.0;
     for part in clock.split(':') {
@@ -221,7 +225,7 @@ fn frame_at(ffmpeg: &Path, source: &Path, seconds: f64) -> Result<Frame, DecodeE
     command
         .args(ffmpeg_input_options())
         .arg("-ss")
-        .arg(format!("{:.3}", seconds))
+        .arg(format!("{seconds:.3}"))
         .arg("-i")
         .arg(file_url(source))
         .args(["-frames:v", "1", "-vf"])
@@ -238,6 +242,15 @@ fn frame_at(ffmpeg: &Path, source: &Path, seconds: f64) -> Result<Frame, DecodeE
 /// The signature of a video: its picture's duration and its frames at 5%, 15%, ... 85% of it.
 /// `ffmpeg` turns frames upright as the file says. A frame `ffmpeg` cannot decode counts as one
 /// without detail, unless no frame can be decoded at all.
+#[allow(
+    clippy::suboptimal_flops,
+    reason = "a fused multiply-add rounds differently, which would move the frames sampled"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "durations in seconds, frame indices below 10"
+)]
 pub fn video_signature(
     ffmpeg: &Path,
     ffprobe: &Path,
@@ -281,6 +294,11 @@ struct Fpcalc {
 /// The Chromaprint fingerprint of the first `AUDIO_SECONDS` of an audio file, from `fpcalc`.
 /// Clips shorter than about 5 seconds give too few values to compare, and never match; under
 /// about 3 seconds, `fpcalc` gives none.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "fpcalc prints the 32-bit values signed or unsigned depending on its version"
+)]
 pub fn audio_fingerprint(fpcalc: &Path, source: &Path) -> Result<AudioFingerprint, DecodeError> {
     std::fs::File::open(source)?;
     let mut command = Command::new(fpcalc);
@@ -311,7 +329,7 @@ pub fn video_durations_match(a: i64, b: i64) -> bool {
 }
 
 /// Whether two audio durations are close enough for copies: within 2 seconds.
-pub fn audio_durations_match(a: i64, b: i64) -> bool {
+pub const fn audio_durations_match(a: i64, b: i64) -> bool {
     (a - b).abs() <= 2000
 }
 
@@ -335,6 +353,12 @@ pub fn frames_match(a: &[Frame], b: &[Frame], threshold: u32) -> bool {
 /// The share of differing bits between two fingerprints at the offset (within about 2 seconds)
 /// where they agree best, or 1 if they hardly overlap. Offsets are given up on once they differ
 /// in more than `give_up` of the bits they are compared on; 1 compares them all.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "bit counts and offsets far below 2^52"
+)]
 fn best_bit_error_rate(a: &[u32], b: &[u32], give_up: f64) -> f64 {
     let min_overlap = (a.len().min(b.len()) / 2).max(20);
     let mut best = 1.0_f64;
@@ -399,24 +423,23 @@ pub(crate) mod tests {
 
     /// Run `ffmpeg` with `args`, or `None` if it is missing. Panics if it fails, so a broken
     /// fixture does not pass as a skipped test.
-    pub(crate) fn ffmpeg(args: &[&str]) -> Option<()> {
+    pub fn ffmpeg(args: &[&str]) -> Option<()> {
         let ffmpeg = find_tool("ffmpeg")?;
         let mut command = Command::new(ffmpeg);
         command
             .args(["-nostdin", "-y", "-loglevel", "error"])
             .args(args);
         if let Err(e) = run_with_timeout(command) {
-            panic!("ffmpeg {:?} failed: {}", args, e);
+            panic!("ffmpeg {args:?} failed: {e}");
         }
         Some(())
     }
 
     /// Make `path`: `seconds` of a zoom into the Mandelbrot set from `from` seconds on, whose
     /// frames all differ, with `extra` arguments to `ffmpeg` before the output.
-    pub(crate) fn zoom(path: &Path, from: u32, seconds: u32, extra: &[&str]) -> Option<()> {
+    pub fn zoom(path: &Path, from: u32, seconds: u32, extra: &[&str]) -> Option<()> {
         let source = format!(
-            "mandelbrot=size=640x360:rate=25,trim=start={}:duration={},setpts=PTS-STARTPTS",
-            from, seconds
+            "mandelbrot=size=640x360:rate=25,trim=start={from}:duration={seconds},setpts=PTS-STARTPTS"
         );
         let mut args = vec!["-f", "lavfi", "-i", &source];
         args.extend(extra);
@@ -426,7 +449,7 @@ pub(crate) mod tests {
     }
 
     /// A video, its re-encoded half-size copy, and an unrelated video, made with `ffmpeg`.
-    pub(crate) fn videos(dir: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    pub fn videos(dir: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
         let (a, b, c) = (dir.join("a.mp4"), dir.join("b.mp4"), dir.join("c.mp4"));
         let s = |p: &Path| p.to_string_lossy().into_owned();
         zoom(&a, 0, 12, &["-c:v", "mpeg4", "-q:v", "3"])?;
@@ -506,7 +529,8 @@ pub(crate) mod tests {
             .map(|i| i.wrapping_mul(40_503).rotate_left(7))
             .collect();
         assert!(bit_error_rate(&a, &c) > 0.3);
-        assert_eq!(bit_error_rate(&a, &a[..5]), 1.0);
+        // Too short to compare: exactly the "no match" rate.
+        assert!(bit_error_rate(&a, &a[..5]).total_cmp(&1.0).is_eq());
     }
 
     #[test]
@@ -601,7 +625,7 @@ pub(crate) mod tests {
         for container in ["mp4", "mkv"] {
             let dir = tempdir().unwrap();
             let (a, b) = (
-                dir.path().join(format!("a.{}", container)),
+                dir.path().join(format!("a.{container}")),
                 dir.path().join("b.mp4"),
             );
             let s = |p: &Path| p.to_string_lossy().into_owned();

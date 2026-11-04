@@ -40,22 +40,22 @@ impl MediaType {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         let ext = ext.as_str();
         if IMAGE_EXTENSIONS.contains(&ext) {
-            Some(MediaType::Image)
+            Some(Self::Image)
         } else if VIDEO_EXTENSIONS.contains(&ext) {
-            Some(MediaType::Video)
+            Some(Self::Video)
         } else if AUDIO_EXTENSIONS.contains(&ext) {
-            Some(MediaType::Audio)
+            Some(Self::Audio)
         } else {
             None
         }
     }
 
     /// The name used in the catalog and in templates.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            MediaType::Image => "image",
-            MediaType::Video => "video",
-            MediaType::Audio => "audio",
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Audio => "audio",
         }
     }
 }
@@ -71,10 +71,10 @@ impl FromStr for MediaType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "image" => Ok(MediaType::Image),
-            "video" => Ok(MediaType::Video),
-            "audio" => Ok(MediaType::Audio),
-            _ => Err(format!("unknown media type {:?}", s)),
+            "image" => Ok(Self::Image),
+            "video" => Ok(Self::Video),
+            "audio" => Ok(Self::Audio),
+            _ => Err(format!("unknown media type {s:?}")),
         }
     }
 }

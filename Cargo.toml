@@ -57,3 +57,20 @@ features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"]
 [dev-dependencies]
 pretty_assertions = "1.4"
 tempfile = "3.10"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# The library exists for the binary, examples and tests; it has no outside users to document
+# errors for or to warn about ignored results.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Templates and suffixes are plain strings with `{token}` placeholders that pixrs fills itself.
+literal_string_with_formatting_args = "allow"
+# An `if let ... else` chain reads better here than the `map_or_else` closures it asks for.
+option_if_let_else = "allow"
+# Doc comments open with a full paragraph; the crate publishes no rustdoc item summaries.
+too_long_first_doc_paragraph = "allow"
+# Pairs like `moving`/`moved` and `fault`/`faulty` name related things on purpose.
+similar_names = "allow"

@@ -42,7 +42,7 @@ impl Taken {
                 return None;
             }
         }
-        Some(Taken {
+        Some(Self {
             year,
             month,
             day,
@@ -54,13 +54,18 @@ impl Taken {
     /// than a day in the future. Earlier or later dates usually come from broken metadata, like
     /// QuickTime's 1904 epoch or an unset camera clock.
     pub fn is_plausible(&self, now: OffsetDateTime) -> bool {
-        let tomorrow = now.date().next_day().unwrap_or(now.date());
+        let tomorrow = now.date().next_day().unwrap_or_else(|| now.date());
         let (y, m, d) = (tomorrow.year(), tomorrow.month() as u8, tomorrow.day());
         self.year >= 1980 && (self.year, self.month, self.day) <= (y, m, d)
     }
 }
 
 /// The date in a cataloged `taken_at` (`YYYY-MM-DDTHH:MM:SS`, possibly with an offset after it).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "two- and four-digit numbers"
+)]
 pub fn from_taken_at(taken_at: &str) -> Option<Taken> {
     let b = taken_at.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
@@ -125,6 +130,11 @@ fn ends(b: &[u8], len: usize) -> bool {
 }
 
 /// `YYYY-MM-DD` at the start of `b`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "two- and four-digit numbers"
+)]
 fn dashed_date(b: &[u8]) -> Option<Taken> {
     if b.len() < 10 || b[4] != b'-' || b[7] != b'-' || !ends(b, 10) {
         return None;
@@ -138,6 +148,11 @@ fn dashed_date(b: &[u8]) -> Option<Taken> {
 }
 
 /// `YYYY-MM-DD`, one of ` _T-`, then `HH`, `MM` and `SS` separated by one of `.:-`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "two- and four-digit numbers"
+)]
 fn dashed_date_time(b: &[u8]) -> Option<Taken> {
     if b.len() < 19 || !b" _T-".contains(&b[10]) || !ends(b, 19) {
         return None;
@@ -177,6 +192,11 @@ fn dashed_date_at_time(b: &[u8]) -> Option<Taken> {
 }
 
 /// `YYYYMMDD` between non-digits.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "two- and four-digit numbers"
+)]
 fn compact_date(b: &[u8]) -> Option<Taken> {
     if b.len() < 8 || !ends(b, 8) {
         return None;
@@ -190,6 +210,11 @@ fn compact_date(b: &[u8]) -> Option<Taken> {
 }
 
 /// `YYYYMMDD`, `_` or `-`, then `HHMMSS` (more digits may follow, like Pixel's milliseconds).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "two- and four-digit numbers"
+)]
 fn compact_date_time(b: &[u8]) -> Option<Taken> {
     if b.len() < 15 || !b"_-".contains(&b[8]) {
         return None;
@@ -213,6 +238,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use time::macros::datetime;
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "compared with what the parsers return"
+    )]
     fn at(year: i32, month: u8, day: u8, time: Option<(u8, u8, u8)>) -> Option<Taken> {
         Some(Taken {
             year,

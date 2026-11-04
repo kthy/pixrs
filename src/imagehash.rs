@@ -72,7 +72,7 @@ pub fn hash_version(rel: &str, ffmpeg_version: &str) -> Option<String> {
             _ => return Some(base),
         },
     };
-    Some(format!("{}; {}", base, format_decoder))
+    Some(format!("{base}; {format_decoder}"))
 }
 
 /// Hash the image at `source`, whose cataloged path is `rel`. `Ok(None)` if there is no way to
@@ -124,7 +124,7 @@ pub fn hash_image(
 }
 
 /// Number of bits in which two perceptual hashes differ.
-pub fn distance(a: u64, b: u64) -> u32 {
+pub const fn distance(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
 
@@ -145,6 +145,7 @@ pub const FINGERPRINT_LIMIT: u8 = 6;
 ///
 /// The same test as `fingerprint_differences` sorted and indexed at the 99th percentile, without
 /// allocating or sorting: it runs for every pair of images with close perceptual hashes.
+#[allow(clippy::cast_precision_loss, reason = "fingerprints have 1024 pixels")]
 pub fn fingerprints_match(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() || a.is_empty() {
         return false;
@@ -169,6 +170,12 @@ pub fn fingerprints_match(a: &[u8], b: &[u8]) -> bool {
 /// How two fingerprints differ: the absolute differences of their pixels after subtracting each
 /// fingerprint's mean brightness (so slightly different decoders or resizers do not count),
 /// sorted ascending. Empty if the sizes differ.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "fingerprints have 1024 pixels; differences fit in a byte"
+)]
 pub fn fingerprint_differences(a: &[u8], b: &[u8]) -> Vec<u8> {
     if a.len() != b.len() || a.is_empty() {
         return vec![];
@@ -190,7 +197,7 @@ pub fn fingerprint_differences(a: &[u8], b: &[u8]) -> Vec<u8> {
 }
 
 /// Whether an orientation turns the image by 90 degrees, swapping width and height.
-fn quarter_turn(orientation: Orientation) -> bool {
+const fn quarter_turn(orientation: Orientation) -> bool {
     matches!(
         orientation,
         Orientation::Rotate90
@@ -211,6 +218,10 @@ fn shrink(img: &DynamicImage) -> DynamicImage {
 
 /// 64-bit gradient hash and grayscale fingerprint of a shrunk upright image, unless it has
 /// almost no detail.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "images have far fewer than 2^52 pixels"
+)]
 fn hash_small(small: &DynamicImage) -> Option<(u64, Vec<u8>)> {
     let luma = small.to_luma8();
     let n = luma.len().max(1) as f64;
@@ -264,6 +275,12 @@ fn pixel_hash(img: &DynamicImage) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "test fixtures with small values"
+)]
 pub(crate) mod tests {
     use super::*;
 
@@ -275,7 +292,11 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     /// A photo-like test image: smooth gradients and a few shapes, different per `seed`.
-    pub(crate) fn picture(seed: u32, width: u32, height: u32) -> RgbImage {
+    #[allow(
+        clippy::suboptimal_flops,
+        reason = "a fused multiply-add rounds differently, which would change the test images"
+    )]
+    pub fn picture(seed: u32, width: u32, height: u32) -> RgbImage {
         RgbImage::from_fn(width, height, |x, y| {
             let (fx, fy) = (x as f32 / width as f32, y as f32 / height as f32);
             let s = seed as f32;
@@ -288,7 +309,7 @@ pub(crate) mod tests {
     }
 
     /// `img` as JPEG at `quality`.
-    pub(crate) fn jpeg(img: &RgbImage, quality: u8) -> Vec<u8> {
+    pub fn jpeg(img: &RgbImage, quality: u8) -> Vec<u8> {
         let mut out = vec![];
         JpegEncoder::new_with_quality(&mut out, quality)
             .encode_image(img)
@@ -297,7 +318,7 @@ pub(crate) mod tests {
     }
 
     /// The same JPEG with an EXIF segment added after the start-of-image marker.
-    pub(crate) fn with_exif(jpeg: &[u8]) -> Vec<u8> {
+    pub fn with_exif(jpeg: &[u8]) -> Vec<u8> {
         // Little-endian TIFF header and an empty IFD.
         let tiff = b"II*\0\x08\0\0\0\0\0\0\0\0\0";
         let mut out = jpeg[..2].to_vec();
@@ -341,7 +362,7 @@ pub(crate) mod tests {
     #[test]
     fn test_hash_version_names_only_the_format_decoder() {
         let jpeg = hash_version("a/b.JPG", "7.1").unwrap();
-        assert!(jpeg.starts_with(&format!("{}; image 0.", HASH_VERSION)));
+        assert!(jpeg.starts_with(&format!("{HASH_VERSION}; image 0.")));
         assert!(jpeg.contains("; zune-jpeg 0."));
         assert!(!jpeg.contains("png") && !jpeg.contains("ffmpeg"));
         let png = hash_version("c.png", "7.1").unwrap();

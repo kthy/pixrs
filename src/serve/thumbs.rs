@@ -47,18 +47,18 @@ pub enum Size {
 
 impl Size {
     /// Longest side in pixels.
-    fn pixels(self) -> u32 {
+    const fn pixels(self) -> u32 {
         match self {
-            Size::Thumb => 320,
-            Size::Preview => 2048,
+            Self::Thumb => 320,
+            Self::Preview => 2048,
         }
     }
 
     /// Cache subfolder.
-    fn dir(self) -> &'static str {
+    const fn dir(self) -> &'static str {
         match self {
-            Size::Thumb => "320",
-            Size::Preview => "2048",
+            Self::Thumb => "320",
+            Self::Preview => "2048",
         }
     }
 }
@@ -121,8 +121,8 @@ pub struct Thumbnailer {
 
 impl Thumbnailer {
     pub fn new(cache_dir: Option<PathBuf>, ffmpeg: Option<PathBuf>) -> Self {
-        let workers = available_parallelism().map_or(2, |n| n.get());
-        Thumbnailer {
+        let workers = available_parallelism().map_or(2, std::num::NonZero::get);
+        Self {
             cache_dir,
             ffmpeg,
             permits: Semaphore::new(workers),
@@ -143,7 +143,7 @@ impl Thumbnailer {
         let cached = cache_dir
             .join(size.dir())
             .join(&key[..2])
-            .join(format!("{}.jpg", key));
+            .join(format!("{key}.jpg"));
         if let Ok(jpeg) = tokio::fs::read(&cached).await {
             return Some(jpeg);
         }
@@ -250,6 +250,10 @@ fn render_in_process(source: &Path, max: u32) -> Result<Vec<u8>, String> {
 }
 
 /// The image without transparency, on a white background.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a blend of two bytes stays below 256"
+)]
 fn flatten(img: &DynamicImage) -> RgbImage {
     if !img.color().has_alpha() {
         return img.to_rgb8();
@@ -282,8 +286,7 @@ async fn decode_with_ffmpeg(
             .arg(file_url(source))
             .args(["-frames:v", "1", "-vf"])
             .arg(format!(
-                "scale='min({m},iw)':'min({m},ih)':force_original_aspect_ratio=decrease",
-                m = max
+                "scale='min({max},iw)':'min({max},ih)':force_original_aspect_ratio=decrease"
             ))
             .args(["-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "3", "-"]);
         run(command)
@@ -311,7 +314,7 @@ async fn run(mut command: Command) -> Result<Vec<u8>, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    debug!("Running {:?}", command);
+    debug!("Running {command:?}");
     let output = timeout(TOOL_TIMEOUT, command.output())
         .await
         .map_err(|_| String::from(TIMED_OUT))?
@@ -360,8 +363,7 @@ pub fn placeholder(file: &FileRecord) -> String {
         MediaType::Audio => "#dcecd8",
     };
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" width="320" height="320"><rect width="320" height="320" fill="{}"/><text x="160" y="175" font-family="sans-serif" font-size="48" text-anchor="middle" fill="#57606a">{}</text></svg>"##,
-        fill, label
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" width="320" height="320"><rect width="320" height="320" fill="{fill}"/><text x="160" y="175" font-family="sans-serif" font-size="48" text-anchor="middle" fill="#57606a">{label}</text></svg>"##
     )
 }
 

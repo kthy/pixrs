@@ -7,7 +7,7 @@ fn canary_in_the_coalmine() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "at the disco")]
 fn panic_at_the_disco() {
     panic!("at the disco");
 }
