@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
       # A pinned release, checked against install-action's SHA-256: the auditor runs with this
       # job's token, so it must not be whatever PyPI serves today.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: zizmor@1.31.1
       - name: Run zizmor
