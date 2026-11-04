@@ -206,7 +206,7 @@ mod tests {
                         .into_iter()
                         .map(|f| (f.path, f.sha256.is_some()))
                         .collect();
-                    (library.root.to_string(), files)
+                    (String::from(library.root.as_str()), files)
                 })
                 .collect()
         }

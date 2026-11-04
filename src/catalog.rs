@@ -1674,13 +1674,18 @@ mod tests {
         assert!(within(&lib.join("not/yet"), &lib));
         assert!(!within(dir.path(), &lib));
         assert!(!within(&dir.path().join("library"), &lib));
-        // Another spelling of the folder, as a case-insensitive file system has: by identity.
+        // Another path to the folder: by identity.
         #[cfg(unix)]
         {
-            let alias = dir.path().join("LIB");
+            let alias = dir.path().join("alias");
             std::os::unix::fs::symlink(&lib, &alias).unwrap();
             assert!(within(&alias.join("thumbs"), &lib));
             assert!(within(&lib, &alias));
+        }
+        // Another spelling, where the file system ignores letter case (macOS, Windows).
+        let other_case = dir.path().join("LIB");
+        if other_case.is_dir() {
+            assert!(within(&other_case.join("thumbs"), &lib));
         }
     }
 
