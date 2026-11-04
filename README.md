@@ -247,7 +247,7 @@ The viewer only listens on localhost and only answers requests addressed to `loc
 ### Organize a library
 
 ```text
-Usage: pixrs organize [OPTIONS] <LIBRARY>
+Usage: pixrs organize [OPTIONS] <--template <TEMPLATE>|--layout <LAYOUT>> <LIBRARY>
 
 Arguments:
   <LIBRARY>  The scanned library to organize
