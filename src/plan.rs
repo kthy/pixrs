@@ -13,7 +13,8 @@ use crate::error::Error;
 use crate::media::MediaType;
 use crate::names::folded;
 use crate::template::{sanitize, Facts, Template};
-use crate::text::printable;
+use crate::text::{printable, shown};
+use log::debug;
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -515,13 +516,21 @@ pub fn plan_organize(
         let name = file.path.rsplit('/').next().unwrap_or(&file.path);
         let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
         let plausible = |t: &crate::dates::Taken| opts.trust_dates || t.is_plausible(opts.now);
-        let taken = file
-            .meta
-            .taken_at
-            .as_deref()
-            .and_then(from_taken_at)
-            .filter(plausible)
-            .or_else(|| from_name(name).filter(plausible));
+        let from_meta = file.meta.taken_at.as_deref().and_then(from_taken_at);
+        let (taken, date_from) = match from_meta.filter(plausible) {
+            Some(taken) => (Some(taken), "date from metadata"),
+            None => match from_name(name).filter(plausible) {
+                Some(taken) => (Some(taken), "date from the file name"),
+                None => (None, "no date"),
+            },
+        };
+        if let (Some(raw), Some(false)) = (&file.meta.taken_at, from_meta.map(|t| plausible(&t))) {
+            debug!(
+                "{}: metadata date {} is before 1980 or in the future; ignored",
+                printable(&file.path),
+                printable(raw)
+            );
+        }
         if taken.is_none() {
             notes.undated += 1;
         }
@@ -539,10 +548,21 @@ pub fn plan_organize(
         let target = match claims.folder(&base, &segments) {
             Ok(folder) => folder.join(file_name),
             Err(link) => {
+                debug!(
+                    "{} stays: {} is a symbolic link",
+                    printable(&file.path),
+                    shown(&link)
+                );
                 links.note(link);
                 continue;
             }
         };
+        debug!(
+            "{}: {}, wants {}",
+            printable(&file.path),
+            date_from,
+            shown(target.strip_prefix(&base).unwrap_or(&target))
+        );
         targets.push((source, target, file));
     }
     links.warn(&mut notes);
@@ -560,6 +580,7 @@ pub fn plan_organize(
             continue;
         };
         if assigned == source {
+            debug!("{} stays: it is in place", shown(&source));
             notes.unchanged += 1;
             continue;
         }
@@ -649,6 +670,12 @@ pub fn plan_quarantine(
         let Some(keeper_root) = roots.get(&keeper.library_id) else {
             continue;
         };
+        debug!(
+            "{} group of {} files keeps {}",
+            group.tier.as_str(),
+            group.files.len(),
+            shown(&library_path(Path::new(keeper_root), &keeper.path))
+        );
         let keeper = Keeper {
             path: utf8(
                 &library_path(Path::new(keeper_root), &keeper.path),
@@ -657,12 +684,19 @@ pub fn plan_quarantine(
             size: keeper.size,
             mtime_ns: keeper.mtime_ns,
         };
-        let copies = group
-            .files
-            .iter()
-            .filter(|f| matches!(f.matches, Some(Tier::Exact | Tier::SamePixels)));
-        for file in copies {
+        for file in group.files.iter().skip(1) {
+            if !matches!(file.matches, Some(Tier::Exact | Tier::SamePixels)) {
+                debug!(
+                    "{} stays: only similar to the kept file",
+                    printable(&file.path)
+                );
+                continue;
+            }
             if !only.is_empty() && !only.contains(&file.library_id) {
+                debug!(
+                    "{} stays: not in the libraries given",
+                    printable(&file.path)
+                );
                 continue;
             }
             let (Some(root), Some(folder)) =
@@ -688,6 +722,11 @@ pub fn plan_quarantine(
             let target = match taken.folder(dir, &segments) {
                 Ok(folder) => folder.join(name),
                 Err(link) => {
+                    debug!(
+                        "{} stays: {} is a symbolic link",
+                        shown(&source),
+                        shown(&link)
+                    );
                     links.note(link);
                     continue;
                 }

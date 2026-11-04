@@ -14,11 +14,13 @@ use crate::catalog::{
 use crate::imagehash::{distance, fingerprints_match};
 use crate::text::shown;
 use indicatif::HumanBytes;
+use log::debug;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 use std::thread::{self, available_parallelism};
+use std::time::Instant;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -363,6 +365,12 @@ pub fn load_dupes(
         input.images.retain(|image| kept(&image.file));
         input.av.retain(|av| kept(&av.file));
     }
+    debug!(
+        "Loaded {} files that share size and SHA-256, {} decoded images, {} videos and audio",
+        input.exact.len(),
+        input.images.len(),
+        input.av.len()
+    );
     Ok(input)
 }
 
@@ -504,8 +512,18 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similarity: Similarity) 
             visuals.push((hash, node.aspect, fingerprint));
         }
     }
+    let started = Instant::now();
     let pairs = if similarity.images {
-        similar_pairs(&visuals, similarity.threshold)
+        let pairs = similar_pairs(&visuals, similarity.threshold);
+        debug!(
+            "Compared {} images at threshold {}: {} similar {} in {:.1?}",
+            visuals.len(),
+            similarity.threshold,
+            pairs.len(),
+            plural(pairs.len(), "pair", "pairs"),
+            started.elapsed()
+        );
+        pairs
     } else {
         vec![]
     };
@@ -513,7 +531,16 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similarity: Similarity) 
     for (a, b) in pairs {
         sets.union(hashed[a], hashed[b]);
     }
-    for (a, b) in similar_av(&av, similarity.threshold, similarity.images) {
+    let started = Instant::now();
+    let av_pairs = similar_av(&av, similarity.threshold, similarity.images);
+    debug!(
+        "Compared {} videos and audio: {} similar {} in {:.1?}",
+        av.len(),
+        av_pairs.len(),
+        plural(av_pairs.len(), "pair", "pairs"),
+        started.elapsed()
+    );
+    for (a, b) in av_pairs {
         sets.union(a, b);
     }
 
@@ -601,6 +628,14 @@ pub fn group_dupes(input: DupeInput, libraries: &[i64], similarity: Similarity) 
             .then_with(|| a.files[0].path.cmp(&b.files[0].path))
     });
 
+    debug!(
+        "{} {}: {} exact, {} same pixels, {} similar",
+        groups.len(),
+        plural(groups.len(), "group", "groups"),
+        groups.iter().filter(|g| g.tier == Tier::Exact).count(),
+        groups.iter().filter(|g| g.tier == Tier::SamePixels).count(),
+        groups.iter().filter(|g| g.tier == Tier::Similar).count()
+    );
     let summary = Summary {
         groups: groups.len(),
         redundant_files: groups.iter().map(|g| g.files.len() - 1).sum(),
