@@ -314,7 +314,7 @@ fn parse_segment(source: &str, segment: &str) -> Result<Vec<Part>, TemplateError
 /// The segment filled in, or `None` if the file lacks a date or time it needs. `time` stands in
 /// for a missing time of day in `{time}`.
 fn fill(segment: &[Part], facts: &Facts, time: Option<&str>) -> Option<String> {
-    let date = || facts.taken;
+    let date = || facts.taken.map(|taken| taken.date);
     let clock = || facts.taken.and_then(|taken| taken.time);
     let mut out = String::new();
     for part in segment {
@@ -326,19 +326,25 @@ fn fill(segment: &[Part], facts: &Facts, time: Option<&str>) -> Option<String> {
             Part::Token(token) => token,
         };
         let _ = match token {
-            Token::Year => write!(out, "{:04}", date()?.year),
-            Token::Month => write!(out, "{:02}", date()?.month),
-            Token::Day => write!(out, "{:02}", date()?.day),
-            Token::Hour => write!(out, "{:02}", clock()?.0),
-            Token::Minute => write!(out, "{:02}", clock()?.1),
-            Token::Second => write!(out, "{:02}", clock()?.2),
+            Token::Year => write!(out, "{:04}", date()?.year()),
+            Token::Month => write!(out, "{:02}", u8::from(date()?.month())),
+            Token::Day => write!(out, "{:02}", date()?.day()),
+            Token::Hour => write!(out, "{:02}", clock()?.hour()),
+            Token::Minute => write!(out, "{:02}", clock()?.minute()),
+            Token::Second => write!(out, "{:02}", clock()?.second()),
             Token::Date => {
                 let d = date()?;
-                write!(out, "{:04}-{:02}-{:02}", d.year, d.month, d.day)
+                write!(
+                    out,
+                    "{:04}-{:02}-{:02}",
+                    d.year(),
+                    u8::from(d.month()),
+                    d.day()
+                )
             }
             Token::Time => match (clock(), time) {
-                (Some((hour, minute, second)), _) => {
-                    write!(out, "{hour:02}{minute:02}{second:02}")
+                (Some(c), _) => {
+                    write!(out, "{:02}{:02}{:02}", c.hour(), c.minute(), c.second())
                 }
                 (None, Some(time)) => out.write_str(time),
                 (None, None) => return None,
@@ -383,6 +389,7 @@ mod tests {
     use super::*;
 
     use pretty_assertions::assert_eq;
+    use time::macros::{date, time};
 
     /// The folders and the file name `t` gives a file, with `undated` for missing dates.
     fn render(t: &Template, facts: &Facts) -> Vec<String> {
@@ -402,10 +409,8 @@ mod tests {
     }
 
     const MAY_FIRST: Taken = Taken {
-        year: 2023,
-        month: 5,
-        day: 1,
-        time: Some((14, 32, 5)),
+        date: date!(2023 - 05 - 01),
+        time: Some(time!(14:32:05)),
     };
 
     #[test]

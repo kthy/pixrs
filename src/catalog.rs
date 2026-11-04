@@ -9,6 +9,7 @@ use crate::avhash::{
     frames_from_bytes, frames_to_bytes, values_from_bytes, values_to_bytes, AudioFingerprint,
     Frame, VideoSignature,
 };
+use crate::dates::{from_taken_at, Taken};
 use crate::error::Error;
 use crate::imagehash::{ImageHashes, Visual};
 use crate::media::{Dimensions, MediaType};
@@ -107,6 +108,11 @@ pub struct MediaMeta {
 }
 
 impl MediaMeta {
+    /// When the photo or video was taken, if `taken_at` is a valid date and time.
+    pub fn taken(&self) -> Option<Taken> {
+        self.taken_at.as_deref().and_then(from_taken_at)
+    }
+
     /// Camera make and model, without the make twice when the model starts with it.
     pub fn camera(&self) -> Option<String> {
         match (&self.camera_make, &self.camera_model) {
