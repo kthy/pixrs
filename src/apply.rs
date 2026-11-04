@@ -403,8 +403,10 @@ impl fmt::Display for MoveFault {
 
 impl std::error::Error for MoveFault {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `Display` shows the cause, so the chain goes on below it: a reporter that prints
+        // every source shows each message once.
         match self {
-            Self::Io(e) => Some(e),
+            Self::Io(e) => e.source(),
             _ => None,
         }
     }
@@ -1043,7 +1045,8 @@ impl fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
+        // `Display` is the error's own, so the chain goes on below it.
+        self.error.source()
     }
 }
 
@@ -1328,8 +1331,10 @@ impl fmt::Display for JournalError {
 
 impl std::error::Error for JournalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `Display` shows the cause, so the chain goes on below it: a reporter that prints
+        // every source shows each message once.
         match self {
-            Self::BadRecord { source, .. } => Some(source),
+            Self::BadRecord { source, .. } => source.source(),
             Self::NotAJournal(_) | Self::Version { .. } => None,
         }
     }

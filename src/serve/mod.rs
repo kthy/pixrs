@@ -106,10 +106,12 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `Display` shows the cause, so the chain goes on below it: a reporter that prints
+        // every source shows each message once.
         match self {
             Self::NotFound => None,
-            Self::Catalog(e) => Some(e),
-            Self::Task(e) => Some(e),
+            Self::Catalog(e) => e.source(),
+            Self::Task(e) => e.source(),
         }
     }
 }
