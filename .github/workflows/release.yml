@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Build every target, without publishing, when something the release build depends on changes.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .justfile
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+# A tag is released by one run at a time; a pull request's newer run replaces an older one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    env:
+      TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --target "$TARGET"
+      # The bundled SQLite and ring compile C code, which needs a musl C compiler.
+      - name: Install the musl C compiler
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends musl-tools
+      - run: cargo build --locked --release --target "$TARGET"
+      - name: Package the binary with its license, notices and README
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          binary="target/$TARGET/release/pixrs"
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          "$binary" --version
+          if [ "$RUNNER_OS" = Linux ]; then
+            file "$binary" | grep -Eq 'static(-pie)? linked' \
+              || { echo "::error::$binary is not statically linked"; exit 1; }
+          fi
+          name="pixrs-$version-$TARGET"
+          mkdir -p "dist/$name"
+          cp "$binary" LICENSE.md THIRD_PARTY_NOTICES.txt README.md "dist/$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            (cd dist && 7z a -tzip "$name.zip" "$name")
+          else
+            tar -czf "dist/$name.tar.gz" -C dist "$name"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload the archives
+      id-token: write # sign the build attestations through Sigstore
+      attestations: write # store the build attestations
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: just
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - name: Check the tag against Cargo.toml and write the release notes
+        run: |
+          version="${TAG#v}"
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::Tag $TAG does not match version $cargo_version in Cargo.toml"
+            exit 1
+          fi
+          just release-notes "$version" > "$RUNNER_TEMP/notes.md"
+          {
+            echo
+            echo "Check the archives with \`SHA256SUMS\` and their build attestations, as the README describes."
+          } >> "$RUNNER_TEMP/notes.md"
+      # Releases are immutable once published: never publish a tag twice. A draft with the tag is
+      # left by a run that failed before publishing; nobody can download it, so it is replaced.
+      - name: Refuse a published release of this tag, remove a draft one
+        run: |
+          releases=$(gh api "repos/$GH_REPO/releases" --paginate \
+            --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"')
+          while read -r id draft; do
+            [ -n "$id" ] || continue
+            if [ "$draft" != true ]; then
+              echo "::error::$TAG is already released"
+              exit 1
+            fi
+            gh api --method DELETE "repos/$GH_REPO/releases/$id"
+            echo "Deleted the draft release $id of $TAG"
+          done <<< "$releases"
+      - name: Write SHA256SUMS
+        run: |
+          cd dist
+          sha256sum pixrs-* > SHA256SUMS
+          cat SHA256SUMS
+      # Records that this workflow built each archive in SHA256SUMS from this commit. Fails the
+      # run, before anything is published, if the repository cannot store attestations.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Publish the release
+        run: |
+          gh release create "$TAG" dist/pixrs-* dist/SHA256SUMS --verify-tag \
+            --title "PixRS ${TAG#v}" --notes-file "$RUNNER_TEMP/notes.md"

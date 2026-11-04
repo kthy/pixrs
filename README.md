@@ -5,6 +5,38 @@ A command-line utility to present a bunch of media files in a reasonable manner.
 [![Continuous Integration workflow status badge][badge-ci-svg]][badge-ci-href]
 [![Security Audit workflow status badge][badge-audit-svg]][badge-audit-href]
 
+## Download
+
+Releases after 0.2.0 come with an archive per system on the [releases page][releases]. Each
+holds the `pixrs` binary, `LICENSE.md`, `THIRD_PARTY_NOTICES.txt` and this README:
+
+| System                           | Archive                                            |
+| -------------------------------- | -------------------------------------------------- |
+| Linux, x86_64 (any distribution) | `pixrs-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Windows, x86_64                  | `pixrs-<version>-x86_64-pc-windows-msvc.zip`       |
+| macOS, Apple silicon             | `pixrs-<version>-aarch64-apple-darwin.tar.gz`      |
+
+Unpack the archive and run `pixrs` (`pixrs.exe` on Windows) from its folder, or move it to a
+folder on your `PATH`. Nothing else needs to be installed; `ffmpeg`, `ffprobe` and `fpcalc` are
+optional (see below) and not included. The macOS binary is not notarized: if macOS refuses to
+run a binary downloaded with a browser, remove the quarantine flag with
+`xattr -d com.apple.quarantine pixrs`.
+
+On other systems, such as an Intel Mac, build a release from source with the tools listed under
+[Building](#building):
+`cargo install --locked --git https://github.com/kthy/pixrs --tag v<version>`.
+
+Releases are immutable: once published, their files and tag cannot change. To check that an
+archive is the release's file and that the Release workflow built it from the tagged commit:
+
+```bash
+gh release download v<version> -R kthy/pixrs -p '*-x86_64-unknown-linux-musl.tar.gz' -p SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS # shasum -a 256 --ignore-missing -c SHA256SUMS on macOS
+gh release verify-asset v<version> pixrs-<version>-x86_64-unknown-linux-musl.tar.gz -R kthy/pixrs
+gh attestation verify pixrs-<version>-x86_64-unknown-linux-musl.tar.gz -R kthy/pixrs \
+  --signer-workflow kthy/pixrs/.github/workflows/release.yml
+```
+
 ## Usage
 
 ```text
@@ -340,4 +372,5 @@ prints. After changing dependencies, regenerate it with `just notices` (needs
 [chromaprint]: https://acoustid.org/chromaprint
 [ffmpeg]: https://ffmpeg.org/
 [git-lfs]: https://git-lfs.com/
+[releases]: https://github.com/kthy/pixrs/releases
 [rustup]: https://rustup.rs/
