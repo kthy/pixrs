@@ -1461,9 +1461,9 @@ mod tests {
             OffsetDateTime::now_utc(),
         )
         .unwrap();
-        let moved: Vec<&str> = plan.moves.iter().map(|m| m.from.as_str()).collect();
+        let moved: Vec<&Path> = plan.moves.iter().map(|m| m.from.as_path()).collect();
         let copy = crate::scan::resolve(&copy).unwrap();
-        assert_eq!(moved, vec![copy.to_str().unwrap()]);
+        assert_eq!(moved, vec![copy.as_path()]);
     }
 
     #[test]

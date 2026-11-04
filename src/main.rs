@@ -38,7 +38,7 @@ use pixrs::structs::{
     ApplyOpt, Cli, Command, DupesOpt, Format, OrganizeOpt, RelocateOpt, ScanOpt, ServeOpt, UndoOpt,
 };
 use pixrs::template::Template;
-use pixrs::text::{printable, printable_lines};
+use pixrs::text::{printable, printable_lines, shown};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -251,8 +251,12 @@ fn apply(opt: &ApplyOpt) -> Result<(), Error> {
         }
         e.error
     })?;
-    for (file, reason) in &summary.skipped {
-        println!("Skipped {}: {}", printable(file), printable(reason));
+    for skipped in &summary.skipped {
+        println!(
+            "Skipped {}: {}",
+            shown(&skipped.file),
+            printable(&skipped.reason.to_string())
+        );
     }
     println!(
         "Moved {} {}, skipped {}, removed {} empty {}.",

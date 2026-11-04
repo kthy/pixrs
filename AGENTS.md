@@ -107,8 +107,9 @@ Decided details:
   input like any other file: `Plan::check` (run by `read_plan` and `apply`, before the lock is
   taken) refuses a plan unless every source is inside one of the plan's libraries, every target
   is below the plan's `destination` (the library root, the `--to` folder or the quarantine
-  folder, which must not overlap a library), sidecar moves point at earlier media moves, and
-  the library ids and kept copies are the plan's. Plan format version 2 added `destination`.
+  folder, which must not overlap a library), every move is of the plan's kind (an organize
+  move, a quarantine move with its kept copy, or a sidecar move pointing at an earlier media
+  move), and the library ids and kept copies are the plan's.
 - Organize details: moves never overwrite (collisions get the suffix; compared case-insensitively
   and in Unicode NFC on every OS (`names::folded`), so plans are the same everywhere; a rename
   that only changes letter case or normalization is refused if another file has exactly the new
@@ -267,9 +268,9 @@ on the LFS files.
   regenerate `THIRD_PARTY_NOTICES.txt`; CI fails if it is out of date.
 - Catalog schema changes bump `SCHEMA_VERSION` in `src/catalog.rs` and must migrate existing
   catalogs (`MIGRATIONS`, run when any `Catalog::open*` finds an older version); users'
-  catalogs hold hours of hashing. Schema v1 shipped in 0.2.0. Likewise, a
-  change to the plan or journal format bumps `PLAN_VERSION` in `src/plan.rs`, and `pixrs undo`
-  must still read journals written by released versions.
+  catalogs hold hours of hashing. Schema v1 shipped in 0.2.0. A change to the plan or journal
+  format bumps `PLAN_VERSION` in `src/plan.rs`; before 1.0, plans and journals of another
+  version are refused (by the version, read first), not migrated.
 - Conventional Commits: `feat`, `fix`, `chore`, `chore(deps)`, `docs`, `ci`, `test`.
 - Add user-visible changes to `[Unreleased]` in `CHANGELOG.md` (Keep a Changelog format).
 - Keep the usage block in `README.md` identical to `pixrs --help` output.
