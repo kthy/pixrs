@@ -268,56 +268,65 @@ impl Tools {
     pub fn find() -> Self {
         Self {
             ffmpeg: find_tool("ffmpeg").map(|path| Tool {
-                version: ffmpeg_version(&path),
+                version: tool_version(&path),
                 path,
             }),
             ffprobe: find_tool("ffprobe"),
             fpcalc: find_tool("fpcalc").map(|path| Tool {
-                version: crate::avhash::fpcalc_version(&path),
+                version: tool_version(&path),
                 path,
             }),
         }
     }
 }
 
-/// The major and minor version `ffmpeg -version` reports, e.g. `7.1` for `7.1.5-0+deb13u1`, or
-/// the whole version if it does not start with numbers (git builds), or `unknown`. Patch
-/// releases and distribution updates do not change decoded pixels on purpose.
-pub fn ffmpeg_version(ffmpeg: &Path) -> String {
-    let mut command = Command::new(ffmpeg);
+/// The major and minor version `TOOL -version` reports, as `major_minor` gives it: `7.1` for
+/// `ffmpeg version 7.1.5-0+deb13u1 ...`, `1.5` for `fpcalc version 1.5.1`, or `unknown`.
+/// Patch releases and distribution updates do not change decoded pixels on purpose.
+pub fn tool_version(tool: &Path) -> String {
+    let mut command = Command::new(tool);
     command.arg("-version");
     run_with_timeout(command)
         .ok()
         .and_then(|out| {
-            // "ffmpeg version 7.1.5-0+deb13u1 Copyright (c) ..."
-            let out = String::from_utf8_lossy(&out).into_owned();
-            out.split_whitespace().nth(2).map(major_minor)
+            String::from_utf8_lossy(&out)
+                .split_whitespace()
+                .nth(2)
+                .map(major_minor)
         })
         .unwrap_or_else(|| String::from("unknown"))
 }
 
-/// `7.1` for `7.1.5-0+deb13u1` or `n7.1.2`; other versions unchanged.
-pub(crate) fn major_minor(version: &str) -> String {
+/// The major and minor numbers of a release version like `7.1.5-0+deb13u1` or `n7.1.2`, as
+/// written; `None` for other versions, like git builds.
+fn release(version: &str) -> Option<(&str, &str)> {
+    let (major, rest) = version.trim_start_matches('n').split_once('.')?;
+    let minor_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let minor = rest.get(..minor_end)?;
     let numeric = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
-    if let Some((major, rest)) = version.trim_start_matches('n').split_once('.') {
-        let minor: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        if numeric(major) && !minor.is_empty() {
-            return format!("{major}.{minor}");
-        }
-    }
-    String::from(version)
+    (numeric(major) && numeric(minor)).then_some((major, minor))
 }
 
-/// Whether `ffmpeg` of `version` (as `ffmpeg_version` returns it) is new enough for HEIC.
-/// Versions that do not parse, like git builds, are assumed to be new.
+/// `7.1` for `7.1.5-0+deb13u1` or `n7.1.2`; other versions unchanged.
+pub(crate) fn major_minor(version: &str) -> String {
+    release(version).map_or_else(
+        || String::from(version),
+        |(major, minor)| format!("{major}.{minor}"),
+    )
+}
+
+/// Whether `ffmpeg` of `version` (as `tool_version` returns it) is new enough for HEIC.
+/// Versions that are not releases, like git builds, are assumed to be new.
 pub fn ffmpeg_handles_heic(version: &str) -> bool {
-    let mut parts = version
-        .trim_start_matches(|c: char| !c.is_ascii_digit())
-        .split(|c: char| !c.is_ascii_digit())
-        .map(str::parse::<u32>);
-    match (parts.next(), parts.next()) {
-        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= FFMPEG_FOR_HEIC,
-        _ => true,
+    let number = |part: &str| part.parse::<u32>().ok();
+    match release(version) {
+        Some((major, minor)) => match (number(major), number(minor)) {
+            (Some(major), Some(minor)) => (major, minor) >= FFMPEG_FOR_HEIC,
+            _ => true,
+        },
+        None => true,
     }
 }
 

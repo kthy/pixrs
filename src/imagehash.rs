@@ -5,7 +5,9 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::decode::{decode_in_process, decode_with_ffmpeg, image_decoder, DecodeError, Decoder};
+use crate::decode::{
+    decode_in_process, decode_with_ffmpeg, image_decoder, DecodeError, Decoder, Tool,
+};
 use crate::media::Dimensions;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
@@ -54,65 +56,89 @@ const PERCEPTUAL_SIZE: u32 = 256;
 /// perceptual hash.
 const MIN_DETAIL: f64 = 3.0;
 
-/// The version an image at `rel` is hashed with, if it can be decoded: the hash definitions and
-/// the major and minor versions of the crates that decode its format and, for images `ffmpeg`
-/// decodes, of `ffmpeg`. An image hashed with another version is hashed again, since a
-/// different decoder can produce slightly different pixels.
-pub fn hash_version(rel: &str, ffmpeg_version: &str) -> Option<String> {
-    let base = format!(
-        "{}; image {}; image_hasher {}",
-        HASH_VERSION,
-        env!("PIXRS_CRATE_image"),
-        env!("PIXRS_CRATE_image_hasher")
-    );
-    let format_decoder = match image_decoder(rel)? {
-        Decoder::Ffmpeg => format!("ffmpeg {}; png {}", ffmpeg_version, env!("PIXRS_CRATE_png")),
-        Decoder::InProcess(Some(format_crate)) => String::from(format_crate),
-        Decoder::InProcess(None) => return Some(base),
-    };
-    Some(format!("{base}; {format_decoder}"))
+/// How an image is decoded for hashing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageDecoder<'t> {
+    /// By the `image` crate, with the crate that decodes the format as `Decoder::InProcess`
+    /// names it.
+    InProcess(Option<&'static str>),
+    /// By `ffmpeg` (HEIC, AVIF).
+    Ffmpeg(&'t Tool),
 }
 
-/// Hash the image at `source`, whose cataloged path is `rel`. `Ok(None)` if there is no way to
-/// decode it: RAW formats, or HEIC and AVIF without `ffmpeg`.
-///
-/// The pixel hash covers the pixels as stored, before EXIF orientation, so a copy that only
-/// changed its rotation tag has the same pixel hash. Images decoded by `ffmpeg` come out upright
-/// already. The perceptual hash is of the upright image, so it matches copies with the rotation
-/// applied to the pixels.
-pub fn hash_image(
-    source: &Path,
-    rel: &str,
-    ffmpeg: Option<&Path>,
-) -> Result<Option<ImageHashes>, DecodeError> {
-    let (pixels, small, width, height) = match image_decoder(rel) {
-        None => return Ok(None),
-        Some(Decoder::InProcess(_)) => {
-            let (img, orientation) = decode_in_process(source)?;
-            let pixels = pixel_hash(&img);
-            let (mut width, mut height) = (img.width(), img.height());
-            if quarter_turn(orientation) {
-                (width, height) = (height, width);
+impl<'t> ImageDecoder<'t> {
+    /// The decoder for the image at `rel`, or `None` if there is no way to decode it: RAW
+    /// formats, or HEIC and AVIF without `ffmpeg`.
+    pub fn for_path(rel: &str, ffmpeg: Option<&'t Tool>) -> Option<Self> {
+        match image_decoder(rel)? {
+            Decoder::InProcess(format_crate) => Some(Self::InProcess(format_crate)),
+            Decoder::Ffmpeg => ffmpeg.map(Self::Ffmpeg),
+        }
+    }
+
+    /// The version images decoded so are hashed with: the hash definitions and the major and
+    /// minor versions of the crates that decode the format and, for `ffmpeg`, of `ffmpeg`. An
+    /// image hashed with another version is hashed again, since a different decoder can
+    /// produce slightly different pixels.
+    pub fn version(self) -> String {
+        let base = format!(
+            "{}; image {}; image_hasher {}",
+            HASH_VERSION,
+            env!("PIXRS_CRATE_image"),
+            env!("PIXRS_CRATE_image_hasher")
+        );
+        match self {
+            Self::Ffmpeg(ffmpeg) => format!(
+                "{base}; ffmpeg {}; png {}",
+                ffmpeg.version,
+                env!("PIXRS_CRATE_png")
+            ),
+            Self::InProcess(Some(format_crate)) => format!("{base}; {format_crate}"),
+            Self::InProcess(None) => base,
+        }
+    }
+
+    /// Hash the image at `source`.
+    ///
+    /// The pixel hash covers the pixels as stored, before EXIF orientation, so a copy that only
+    /// changed its rotation tag has the same pixel hash. Images decoded by `ffmpeg` come out
+    /// upright already. The perceptual hash is of the upright image, so it matches copies with
+    /// the rotation applied to the pixels.
+    pub fn hash(self, source: &Path) -> Result<ImageHashes, DecodeError> {
+        let (pixels, small, dimensions) = match self {
+            Self::InProcess(_) => {
+                let (img, orientation) = decode_in_process(source)?;
+                let pixels = pixel_hash(&img);
+                let dimensions = Dimensions {
+                    width: img.width(),
+                    height: img.height(),
+                };
+                // Shrink before turning upright, so the full-size image is never copied.
+                let mut small = shrink(&img);
+                drop(img);
+                small.apply_orientation(orientation);
+                let dimensions = if quarter_turn(orientation) {
+                    dimensions.transposed()
+                } else {
+                    dimensions
+                };
+                (pixels, small, dimensions)
             }
-            // Shrink before turning upright, so the full-size image is never copied.
-            let mut small = shrink(&img);
-            drop(img);
-            small.apply_orientation(orientation);
-            (pixels, small, width, height)
-        }
-        Some(Decoder::Ffmpeg) => {
-            let Some(ffmpeg) = ffmpeg else {
-                return Ok(None);
-            };
-            let img = decode_with_ffmpeg(ffmpeg, source)?;
-            (pixel_hash(&img), shrink(&img), img.width(), img.height())
-        }
-    };
-    Ok(Some(ImageHashes {
-        pixels,
-        visual: hash_small(&small),
-        dimensions: Dimensions { width, height },
-    }))
+            Self::Ffmpeg(ffmpeg) => {
+                let img = decode_with_ffmpeg(&ffmpeg.path, source)?;
+                let dimensions = Dimensions {
+                    width: img.width(),
+                    height: img.height(),
+                };
+                (pixel_hash(&img), shrink(&img), dimensions)
+            }
+        };
+        Ok(ImageHashes {
+            pixels,
+            visual: hash_small(&small),
+            dimensions,
+        })
+    }
 }
 
 /// Number of bits in which two perceptual hashes differ.
@@ -329,7 +355,10 @@ pub(crate) mod tests {
     fn hashes(dir: &Path, name: &str, bytes: &[u8]) -> ImageHashes {
         let path = dir.join(name);
         fs::write(&path, bytes).unwrap();
-        hash_image(&path, name, None).unwrap().unwrap()
+        ImageDecoder::for_path(name, None)
+            .unwrap()
+            .hash(&path)
+            .unwrap()
     }
 
     #[test]
@@ -357,16 +386,20 @@ pub(crate) mod tests {
 
     #[test]
     fn test_hash_version_names_only_the_format_decoder() {
-        let jpeg = hash_version("a/b.JPG", "7.1").unwrap();
+        let ffmpeg = Tool {
+            path: std::path::PathBuf::from("ffmpeg"),
+            version: String::from("7.1"),
+        };
+        let hash_version =
+            |rel| ImageDecoder::for_path(rel, Some(&ffmpeg)).map(ImageDecoder::version);
+        let jpeg = hash_version("a/b.JPG").unwrap();
         assert!(jpeg.starts_with(&format!("{HASH_VERSION}; image 0.")));
         assert!(jpeg.contains("; zune-jpeg 0."));
         assert!(!jpeg.contains("png") && !jpeg.contains("ffmpeg"));
-        let png = hash_version("c.png", "7.1").unwrap();
+        let png = hash_version("c.png").unwrap();
         assert!(png.contains("; png 0.") && !png.contains("zune"));
-        assert!(hash_version("d.heic", "7.1")
-            .unwrap()
-            .contains("; ffmpeg 7.1; "));
-        assert_eq!(hash_version("e.nef", "7.1"), None);
+        assert!(hash_version("d.heic").unwrap().contains("; ffmpeg 7.1; "));
+        assert_eq!(hash_version("e.nef"), None);
     }
 
     #[test]
@@ -444,8 +477,9 @@ pub(crate) mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("x.heic");
         fs::write(&path, b"whatever").unwrap();
-        assert!(matches!(hash_image(&path, "x.heic", None), Ok(None)));
-        assert!(matches!(hash_image(&path, "x.nef", None), Ok(None)));
-        assert!(hash_image(&path, "x.jpg", None).is_err());
+        assert_eq!(ImageDecoder::for_path("x.heic", None), None);
+        assert_eq!(ImageDecoder::for_path("x.nef", None), None);
+        let jpeg = ImageDecoder::for_path("x.jpg", None).unwrap();
+        assert!(jpeg.hash(&path).is_err());
     }
 }
