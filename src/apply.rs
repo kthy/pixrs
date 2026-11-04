@@ -211,7 +211,107 @@ pub struct ApplySummary {
 #[derive(Debug, Default)]
 pub struct UndoSummary {
     pub moved_back: usize,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<UndoWarning>,
+}
+
+/// Something `undo` left for the user to look at.
+#[derive(Debug)]
+pub enum UndoWarning {
+    /// The moved file is at neither place.
+    Missing { from: PathBuf, to: PathBuf },
+    /// Two different files are at the two places.
+    BothExist { from: PathBuf, to: PathBuf },
+    /// The file at the target is not the one moved there.
+    NotTheMovedFile { target: PathBuf, changed: bool },
+    /// Where the file is could not be checked.
+    CannotCheck { target: PathBuf, error: io::Error },
+    /// A temporary file was kept under another name.
+    KeptTemp { temp: PathBuf, kept: PathBuf },
+    /// A temporary file could not be cleaned up.
+    CannotCleanUp { temp: PathBuf, error: io::Error },
+    /// A journaled temporary file is none pixrs makes for the move of `from`.
+    NotATemp { temp: PathBuf, from: PathBuf },
+    /// A removed folder no moved file came from.
+    NotRecreated { folder: PathBuf },
+    /// A removed folder could not be made again.
+    CannotRecreate { folder: PathBuf, error: io::Error },
+    /// Something is at the old place of the file at `at`.
+    Taken { at: PathBuf, place: PathBuf },
+    /// The file at `at` could not be moved back.
+    CannotMoveBack { at: PathBuf, fault: MoveFault },
+    /// The copy of a file that is back could not be removed.
+    CannotRemoveCopy { copy: PathBuf, error: io::Error },
+}
+
+impl fmt::Display for UndoWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { from, to } => write!(
+                f,
+                "{} is neither at {} nor back at its old place",
+                from.display(),
+                to.display()
+            ),
+            Self::BothExist { from, to } => write!(
+                f,
+                "{} and {} both exist; left as they are",
+                from.display(),
+                to.display()
+            ),
+            Self::NotTheMovedFile {
+                target,
+                changed: false,
+            } => write!(
+                f,
+                "{} is not the file that was moved there; left there",
+                target.display()
+            ),
+            Self::NotTheMovedFile {
+                target,
+                changed: true,
+            } => write!(
+                f,
+                "{} is not the file that was moved there (it changed, or is another file); left \
+                 there",
+                target.display()
+            ),
+            Self::CannotCheck { target, error } => {
+                write!(f, "Cannot check {}: {}", target.display(), error)
+            }
+            Self::KeptTemp { temp, kept } => write!(
+                f,
+                "Kept {} as {}: check it by hand",
+                temp.display(),
+                kept.display()
+            ),
+            Self::CannotCleanUp { temp, error } => {
+                write!(f, "Cannot clean up {}: {}", temp.display(), error)
+            }
+            Self::NotATemp { temp, from } => write!(
+                f,
+                "{} is not a temporary file of the move of {}; left alone",
+                temp.display(),
+                from.display()
+            ),
+            Self::NotRecreated { folder } => write!(
+                f,
+                "{} is not a folder a moved file came from; not recreated",
+                folder.display()
+            ),
+            Self::CannotRecreate { folder, error } => {
+                write!(f, "Cannot recreate {}: {}", folder.display(), error)
+            }
+            Self::Taken { at, place } => {
+                write!(f, "{} stays: {} is taken", at.display(), place.display())
+            }
+            Self::CannotMoveBack { at, fault } => {
+                write!(f, "Cannot move {} back: {}", at.display(), fault)
+            }
+            Self::CannotRemoveCopy { copy, error } => {
+                write!(f, "Cannot remove the copy {}: {}", copy.display(), error)
+            }
+        }
+    }
 }
 
 /// Why a move did not happen.
@@ -1255,7 +1355,7 @@ enum Found {
     /// before the source was removed.
     Copied,
     /// Something else; leave it alone and say why.
-    Unclear(String),
+    Unclear(UndoWarning),
 }
 
 /// Where the file of a journaled move is, a file with `stamp`. Only a copy pixrs made itself (a
@@ -1263,27 +1363,28 @@ enum Found {
 /// same contents) counts as a copy that may be removed.
 fn locate(from: &Path, to: &Path, stamp: Stamp, had_copy: bool) -> io::Result<Found> {
     let neither = || {
-        Found::Unclear(format!(
-            "{} is neither at {} nor back at its old place",
-            from.display(),
-            to.display()
-        ))
+        Found::Unclear(UndoWarning::Missing {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        })
     };
     let both = || {
-        Found::Unclear(format!(
-            "{} and {} both exist; left as they are",
-            from.display(),
-            to.display()
-        ))
+        Found::Unclear(UndoWarning::BothExist {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        })
+    };
+    let not_moved = |changed| {
+        Found::Unclear(UndoWarning::NotTheMovedFile {
+            target: to.to_path_buf(),
+            changed,
+        })
     };
     if spelling_only(from, to) {
         // One file under two spellings on Windows and macOS: look at the exact names.
         return Ok(match (exactly_there(to)?, exactly_there(from)?) {
             (true, false) if fs::metadata(to).is_ok_and(|m| matches(&m, stamp)) => Found::AtTarget,
-            (true, false) => Found::Unclear(format!(
-                "{} is not the file that was moved there; left there",
-                to.display()
-            )),
+            (true, false) => not_moved(false),
             // Two names for one file (Windows, macOS), or two different files (Linux).
             (true, true) if same_file(from, to) => Found::AtSource,
             (true, true) => both(),
@@ -1308,11 +1409,7 @@ fn locate(from: &Path, to: &Path, stamp: Stamp, had_copy: bool) -> io::Result<Fo
         }
         // Moves keep the mtime, so a file there with another one is not the moved file.
         (Some(meta), false) if matches(&meta, stamp) => Found::AtTarget,
-        (Some(_), false) => Found::Unclear(format!(
-            "{} is not the file that was moved there (it changed, or is another file); left \
-             there",
-            to.display()
-        )),
+        (Some(_), false) => not_moved(true),
     })
 }
 
@@ -1329,7 +1426,7 @@ struct ViaFile<'a> {
 /// goes. A stopped rename is the file itself: it goes back to `from` if it is the moved file
 /// and `from` is free. A copy is removed only if its source still has every byte of it.
 /// Anything else is kept next to the temporary file, as `name.pixrs-recovered.ext`.
-fn clean_up_via(via: &ViaFile, from: &Path, stamp: Stamp, warnings: &mut Vec<String>) {
+fn clean_up_via(via: &ViaFile, from: &Path, stamp: Stamp, warnings: &mut Vec<UndoWarning>) {
     let Ok(meta) = fs::symlink_metadata(via.path) else {
         return;
     };
@@ -1349,15 +1446,17 @@ fn clean_up_via(via: &ViaFile, from: &Path, stamp: Stamp, warnings: &mut Vec<Str
                 .with_file_name(from.file_name().unwrap_or_default()),
         );
         fs::rename(via.path, &keep).map(|()| {
-            warnings.push(format!(
-                "Kept {} as {}: check it by hand",
-                via.path.display(),
-                keep.display()
-            ));
+            warnings.push(UndoWarning::KeptTemp {
+                temp: via.path.to_path_buf(),
+                kept: keep,
+            });
         })
     };
     if let Err(e) = result {
-        warnings.push(format!("Cannot clean up {}: {}", via.path.display(), e));
+        warnings.push(UndoWarning::CannotCleanUp {
+            temp: via.path.to_path_buf(),
+            error: e,
+        });
     }
 }
 
@@ -1506,16 +1605,16 @@ impl Undo {
                 .iter()
                 .any(|intent| below(&intent.planned.from, dir));
             if !came_from {
-                self.summary.warnings.push(format!(
-                    "{} is not a folder a moved file came from; not recreated",
-                    dir.display()
-                ));
+                self.summary.warnings.push(UndoWarning::NotRecreated {
+                    folder: dir.to_path_buf(),
+                });
                 continue;
             }
-            if let Err(e) = fs::create_dir_all(dir) {
-                self.summary
-                    .warnings
-                    .push(format!("Cannot recreate {}: {}", dir.display(), e));
+            if let Err(error) = fs::create_dir_all(dir) {
+                self.summary.warnings.push(UndoWarning::CannotRecreate {
+                    folder: dir.to_path_buf(),
+                    error,
+                });
             }
         }
     }
@@ -1529,11 +1628,10 @@ impl Undo {
             if via_belongs_to(via, from, to) {
                 vias.push(via);
             } else {
-                self.summary.warnings.push(format!(
-                    "{} is not a temporary file of the move of {}; left alone",
-                    via.path.display(),
-                    from.display()
-                ));
+                self.summary.warnings.push(UndoWarning::NotATemp {
+                    temp: via.path.to_path_buf(),
+                    from: from.to_path_buf(),
+                });
             }
         }
         for via in &vias {
@@ -1544,8 +1642,12 @@ impl Undo {
             return Ok(());
         }
         let had_copy = vias.iter().any(|v| matches!(v.via, Via::Copy { .. }));
-        let found = locate(from, to, planned.stamp, had_copy)
-            .unwrap_or_else(|e| Found::Unclear(format!("Cannot check {}: {}", to.display(), e)));
+        let found = locate(from, to, planned.stamp, had_copy).unwrap_or_else(|error| {
+            Found::Unclear(UndoWarning::CannotCheck {
+                target: to.to_path_buf(),
+                error,
+            })
+        });
         let at = match &found {
             Found::AtTarget => "at the target, moving it back",
             Found::Copied => "copied, removing the copy",
@@ -1579,31 +1681,28 @@ impl Undo {
                         true
                     }
                     Err(MoveError::Taken) => {
-                        self.summary.warnings.push(format!(
-                            "{} stays: {} is taken",
-                            to.display(),
-                            from.display()
-                        ));
+                        self.summary.warnings.push(UndoWarning::Taken {
+                            at: to.to_path_buf(),
+                            place: from.to_path_buf(),
+                        });
                         false
                     }
-                    Err(MoveError::Failed(e) | MoveError::Partial(e)) => {
-                        self.summary.warnings.push(format!(
-                            "Cannot move {} back: {}",
-                            to.display(),
-                            e
-                        ));
+                    Err(MoveError::Failed(fault) | MoveError::Partial(fault)) => {
+                        self.summary.warnings.push(UndoWarning::CannotMoveBack {
+                            at: to.to_path_buf(),
+                            fault,
+                        });
                         false
                     }
                 }
             }
             Found::Copied => match remove_source(to) {
                 Ok(()) => true,
-                Err(e) => {
-                    self.summary.warnings.push(format!(
-                        "Cannot remove the copy {}: {}",
-                        to.display(),
-                        e
-                    ));
+                Err(error) => {
+                    self.summary.warnings.push(UndoWarning::CannotRemoveCopy {
+                        copy: to.to_path_buf(),
+                        error,
+                    });
                     false
                 }
             },
@@ -1765,7 +1864,7 @@ mod tests {
                 .any(|r| r.path == "video/undated/DSC0047.mp4"));
 
             let undone = undo(&summary.journal).unwrap();
-            assert_eq!(undone.warnings, Vec::<String>::new());
+            assert!(undone.warnings.is_empty(), "{:?}", undone.warnings);
             assert_eq!(tree(&f.root), before, "force_copy {}", force_copy);
             assert_eq!(rows(&f), catalog_before);
             // Running it again changes nothing.
@@ -2052,7 +2151,7 @@ mod tests {
         assert_eq!(summary.skipped.len(), 1);
         for _ in 0..2 {
             let undone = undo(&summary.journal).unwrap();
-            assert_eq!(undone.warnings, Vec::<String>::new());
+            assert!(undone.warnings.is_empty(), "{:?}", undone.warnings);
             assert_eq!(
                 fs::read(f.root.join("video/DSC0047.mp4")).unwrap(),
                 b"three"
@@ -2228,7 +2327,10 @@ mod tests {
         let (plan, notes) = plan_for(&f);
         assert_eq!(plan.moves, vec![]);
         assert!(
-            notes.warnings[0].contains("same file as the kept copy"),
+            matches!(
+                notes.warnings[0],
+                crate::plan::PlanWarning::SameAsKeeper { .. }
+            ),
             "{:?}",
             notes.warnings
         );
@@ -2376,7 +2478,7 @@ mod tests {
         let left_alone = summary
             .warnings
             .iter()
-            .filter(|w| w.ends_with("left alone"))
+            .filter(|w| matches!(w, UndoWarning::NotATemp { .. }))
             .count();
         assert_eq!(left_alone, 4, "{:?}", summary.warnings);
     }
@@ -2419,7 +2521,7 @@ mod tests {
             .unwrap();
         let summary = undo(&journal).unwrap();
         assert!(!to.exists() && from.exists());
-        assert_eq!(summary.warnings, Vec::<String>::new());
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
     }
 
     #[test]
@@ -2444,7 +2546,10 @@ mod tests {
         let summary = undo(&journal).unwrap();
         assert!(!unrelated.exists());
         assert!(from.parent().unwrap().is_dir());
-        assert!(summary.warnings.iter().any(|w| w.contains("not recreated")));
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|w| matches!(w, UndoWarning::NotRecreated { .. })));
     }
 
     #[test]
@@ -2575,7 +2680,13 @@ mod tests {
         let undone = undo(&summary.journal).unwrap();
         assert_eq!(undone.moved_back, 0);
         assert!(
-            undone.warnings.iter().any(|w| w.contains("symbolic link")),
+            undone.warnings.iter().any(|w| matches!(
+                w,
+                UndoWarning::CannotMoveBack {
+                    fault: MoveFault::ThroughLink(_),
+                    ..
+                }
+            )),
             "{:?}",
             undone.warnings
         );
