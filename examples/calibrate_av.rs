@@ -24,7 +24,7 @@ use pixrs::avhash::{
 };
 use pixrs::catalog::{library_path, Catalog, HashedAv};
 use pixrs::decode::Tools;
-use pixrs::dupes::{aspect, aspects_match, DEFAULT_THRESHOLD};
+use pixrs::dupes::{aspects_match, DEFAULT_THRESHOLD};
 use pixrs::imagehash::distance;
 use pixrs::scan::resolve;
 use std::fs;
@@ -230,7 +230,7 @@ fn main() {
             all_pairs += 1;
             any_matched += usize::from(matched);
             if !video_durations_match(a.signature.duration_ms(), b.signature.duration_ms())
-                || !aspects_match(aspect(a.dimensions), aspect(b.dimensions))
+                || !aspects_match(a.dimensions, b.dimensions)
             {
                 continue;
             }

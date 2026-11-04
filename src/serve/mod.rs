@@ -184,7 +184,7 @@ impl AppState {
             .await?;
         let state = Arc::clone(self);
         let report = tokio::task::spawn_blocking(move || {
-            Arc::new(group_dupes(input, &state.libraries, state.similarity))
+            Arc::new(group_dupes(&input, &state.libraries, state.similarity))
         })
         .await?;
         *cached = Some(CachedDupes {

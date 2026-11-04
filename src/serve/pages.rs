@@ -9,7 +9,7 @@ use super::thumbs::{self, ViewSource};
 use super::{AppError, AppState};
 use crate::catalog::{display_root, FileRecord, FileRef, Filter, Page};
 use crate::dates::from_taken_at;
-use crate::dupes::{human_mtime, plural, DupeGroup, Tier};
+use crate::dupes::{human_mtime, plural, DupeGroup, Role, Tier};
 use crate::media::MediaType;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -550,13 +550,13 @@ fn dupe_group(group: &DupeGroup) -> Markup {
             }
             div.copies {
                 @for f in &group.files {
-                    figure.copy.keep[f.keep] {
+                    figure.copy.keep[f.role.is_keep()] {
                         a href=(context.view_url(f.library_id, &f.path)) {
                             img loading="lazy" alt="" src=(thumb_url(f.library_id, &f.path, f.mtime_ns));
                         }
                         figcaption {
-                            @if f.keep { span.badge.keep { "keep" } }
-                            @if let (Some(matches), true) = (f.matches, group.tier != Tier::Exact) {
+                            @if f.role.is_keep() { span.badge.keep { "keep" } }
+                            @if let (Role::Copy(matches), true) = (f.role, group.tier != Tier::Exact) {
                                 span.badge.tier { (matches.as_str()) }
                             }
                             div.library { (f.library) }

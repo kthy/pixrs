@@ -146,12 +146,10 @@ pub const FINGERPRINT_LIMIT: u8 = 6;
 ///
 /// The same test as `fingerprint_differences` sorted and indexed at the 99th percentile, without
 /// allocating or sorting: it runs for every pair of images with close perceptual hashes.
-#[allow(clippy::cast_precision_loss, reason = "fingerprints have 1024 pixels")]
 pub fn fingerprints_match(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() || a.is_empty() {
         return false;
     }
-    let mean = |f: &[u8]| f.iter().map(|&v| f64::from(v)).sum::<f64>() / f.len() as f64;
     let shift = mean(a) - mean(b);
     // The 99th percentile is at most the limit when no more pixels than lie above it in sorted
     // order exceed the limit.
@@ -168,20 +166,24 @@ pub fn fingerprints_match(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
+/// The mean brightness of a fingerprint.
+#[allow(clippy::cast_precision_loss, reason = "fingerprints have 1024 pixels")]
+fn mean(fingerprint: &[u8]) -> f64 {
+    fingerprint.iter().map(|&v| f64::from(v)).sum::<f64>() / fingerprint.len() as f64
+}
+
 /// How two fingerprints differ: the absolute differences of their pixels after subtracting each
 /// fingerprint's mean brightness (so slightly different decoders or resizers do not count),
 /// sorted ascending. Empty if the sizes differ.
 #[allow(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
     clippy::cast_sign_loss,
-    reason = "fingerprints have 1024 pixels; differences fit in a byte"
+    reason = "differences fit in a byte"
 )]
 pub fn fingerprint_differences(a: &[u8], b: &[u8]) -> Vec<u8> {
     if a.len() != b.len() || a.is_empty() {
         return vec![];
     }
-    let mean = |f: &[u8]| f.iter().map(|&v| f64::from(v)).sum::<f64>() / f.len() as f64;
     let shift = mean(a) - mean(b);
     let mut diffs: Vec<u8> = a
         .iter()
@@ -240,8 +242,7 @@ fn hash_small(small: &DynamicImage) -> Option<Visual> {
         .hash_size(8, 8)
         .to_hasher();
     let hash = hasher.hash_image(small);
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    let bytes = *hash.as_bytes().first_chunk::<8>()?;
     let fingerprint = small
         .resize_exact(FINGERPRINT_SIDE, FINGERPRINT_SIDE, FilterType::Triangle)
         .to_luma8()

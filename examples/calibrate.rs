@@ -28,7 +28,7 @@ use image::imageops::FilterType;
 use image::DynamicImage;
 use pixrs::catalog::{library_path, Catalog, HashedImage};
 use pixrs::decode::{decode_in_process, decode_with_ffmpeg, find_tool, image_decoder, Decoder};
-use pixrs::dupes::{aspect, aspects_match};
+use pixrs::dupes::aspects_match;
 use pixrs::imagehash::{distance, fingerprint_differences, perceptual_hash};
 use pixrs::scan::resolve;
 use serde::Deserialize;
@@ -191,12 +191,11 @@ fn metrics(diffs: &[u8]) -> [f64; 5] {
 }
 
 fn find_candidates(images: &[HashedImage], max_distance: u32) -> Vec<Candidate> {
-    let aspects: Vec<f64> = images.iter().map(|i| aspect(i.dimensions)).collect();
     let mut candidates = vec![];
     for a in 0..images.len() {
         for b in a + 1..images.len() {
             let (x, y) = (&images[a], &images[b]);
-            if x.pixel_hash == y.pixel_hash || !aspects_match(aspects[a], aspects[b]) {
+            if x.pixel_hash == y.pixel_hash || !aspects_match(x.dimensions, y.dimensions) {
                 continue;
             }
             let (Some(xv), Some(yv)) = (&x.visual, &y.visual) else {
