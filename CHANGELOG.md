@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drive letter or parent folder), keeping its hashes, instead of scanning it again as a new
   library. It checks a sample of the files at the new place first, with a progress bar;
   `--force` skips that check.
+- `pixrs scan --allow-empty` removes the cataloged files of a library, or of the scanned folder
+  inside one, that holds no media files any more. Without it a scan that finds no media where
+  the catalog lists some is still refused, since an unmounted drive looks the same. The folder
+  must exist and be readable, and the library stays in the catalog with no files.
 
 ### Changed
 

@@ -64,6 +64,11 @@ pub struct ScanOpt {
     /// Disable progress bars
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Remove the cataloged files of LIBRARY if it holds no media files now. Without it such a
+    /// scan is refused, since an unmounted drive looks the same
+    #[arg(long)]
+    pub allow_empty: bool,
 }
 
 /// Options for `pixrs dupes`.

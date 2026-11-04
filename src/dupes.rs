@@ -1092,8 +1092,13 @@ mod tests {
         write("white.jpg", &jpeg(&blank(255, 255, 255), 85));
         write("navy.jpg", &jpeg(&blank(20, 20, 90), 80));
         let catalog_path = dir.path().join("catalog.sqlite");
-        crate::scan::scan_with(&lib, &catalog_path, true, &crate::decode::Tools::default())
-            .unwrap();
+        crate::scan::scan_with(
+            &lib,
+            &catalog_path,
+            crate::scan::ScanOptions::QUIET,
+            &crate::decode::Tools::default(),
+        )
+        .unwrap();
 
         let catalog = Catalog::open_existing(&catalog_path).unwrap();
         let report =
@@ -1375,7 +1380,8 @@ mod tests {
             .set_modified(later)
             .unwrap();
         let catalog_path = dir.path().join("catalog.sqlite");
-        crate::scan::scan_with(&lib, &catalog_path, true, &tools).unwrap();
+        crate::scan::scan_with(&lib, &catalog_path, crate::scan::ScanOptions::QUIET, &tools)
+            .unwrap();
         let catalog = Catalog::open_existing(&catalog_path).unwrap();
         let report =
             find_dupes(&catalog, &[], Similarity::with_images(DEFAULT_THRESHOLD)).unwrap();
@@ -1429,8 +1435,13 @@ mod tests {
         std::fs::write(lib.join("backup/a.jpg"), b"same").unwrap();
         std::fs::write(lib.join("other.jpg"), b"diff").unwrap();
         let catalog_path = dir.path().join("catalog.sqlite");
-        crate::scan::scan_with(&lib, &catalog_path, true, &crate::decode::Tools::default())
-            .unwrap();
+        crate::scan::scan_with(
+            &lib,
+            &catalog_path,
+            crate::scan::ScanOptions::QUIET,
+            &crate::decode::Tools::default(),
+        )
+        .unwrap();
 
         let catalog = Catalog::open_existing(&catalog_path).unwrap();
         let report =

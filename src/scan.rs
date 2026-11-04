@@ -77,6 +77,24 @@ pub struct ScanSummary {
     pub folded: Vec<String>,
 }
 
+/// How a scan runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanOptions {
+    /// Hide the progress bars.
+    pub quiet: bool,
+    /// Accept a walk that finds no media files where the catalog lists some, and remove those
+    /// rows. Without it such a scan is refused, since an unmounted drive looks the same.
+    pub allow_empty: bool,
+}
+
+impl ScanOptions {
+    /// No progress bars, and an empty walk is refused.
+    pub const QUIET: Self = ScanOptions {
+        quiet: true,
+        allow_empty: false,
+    };
+}
+
 /// A media file that is new or changed since the last scan.
 struct Pending {
     rel: String,
@@ -101,18 +119,27 @@ struct Pending {
 /// A folder inside a cataloged library is scanned as that part of the library. Libraries inside
 /// the scanned one are folded into it first, keeping their hashes.
 ///
+/// A walk that finds no media files where the catalog lists some is refused, unless
+/// `options.allow_empty` is set: then those rows are removed, and the library keeps its entry
+/// with no files. The scanned folder must exist and be readable either way.
+///
 /// The library itself is only read.
-pub fn scan(library: &Path, catalog_path: &Path, quiet: bool) -> Result<ScanSummary, Error> {
-    scan_with(library, catalog_path, quiet, &Tools::find())
+pub fn scan(
+    library: &Path,
+    catalog_path: &Path,
+    options: ScanOptions,
+) -> Result<ScanSummary, Error> {
+    scan_with(library, catalog_path, options, &Tools::find())
 }
 
 /// `scan`, with the external tools given instead of looked up on `PATH`.
 pub fn scan_with(
     library: &Path,
     catalog_path: &Path,
-    quiet: bool,
+    options: ScanOptions,
     tools: &Tools,
 ) -> Result<ScanSummary, Error> {
+    let quiet = options.quiet;
     let start = library
         .canonicalize()
         .ok()
@@ -231,13 +258,27 @@ pub fn scan_with(
         );
     }
 
+    // An unmounted drive or share often leaves an empty folder behind, so an empty walk only
+    // removes rows when the user says the folder really is empty, and never when it could not
+    // be listed.
     if seen.is_empty() && !known.is_empty() {
-        return Err(Error::Usage(format!(
-            "Found no media files in {}, but the catalog lists {} for it. If it is on a drive, \
-             is the drive mounted? Nothing was removed from the catalog.",
-            start.display(),
-            known.len()
-        )));
+        if unreadable.contains(&part) {
+            return Err(Error::Usage(format!(
+                "Cannot list the files in {}, which the catalog lists {} files for. Nothing was \
+                 removed from the catalog.",
+                start.display(),
+                known.len()
+            )));
+        }
+        if !options.allow_empty {
+            return Err(Error::Usage(format!(
+                "Found no media files in {}, but the catalog lists {} for it. If it is on a \
+                 drive, is the drive mounted? Nothing was removed from the catalog. If the \
+                 folder really is empty now, scan it with --allow-empty to remove them.",
+                start.display(),
+                known.len()
+            )));
+        }
     }
 
     // Pass 1: record new and changed files. A changed file loses its hash until pass 2.
@@ -821,7 +862,13 @@ mod tests {
         }
 
         fn scan(&self) -> ScanSummary {
-            scan_with(&self.lib(), &self.catalog(), true, &Tools::default()).unwrap()
+            scan_with(
+                &self.lib(),
+                &self.catalog(),
+                ScanOptions::QUIET,
+                &Tools::default(),
+            )
+            .unwrap()
         }
 
         fn files(&self) -> Vec<FileRecord> {
@@ -1170,10 +1217,10 @@ mod tests {
         write(one.join("x.jpg"), b"same").unwrap();
         write(two.join("y.jpg"), b"size").unwrap();
 
-        assert_eq!(scan(&one, &catalog, true).unwrap().hashed, 0);
+        assert_eq!(scan(&one, &catalog, ScanOptions::QUIET).unwrap().hashed, 0);
         // Only files in the library being scanned are hashed; the other library may be offline.
-        assert_eq!(scan(&two, &catalog, true).unwrap().hashed, 1);
-        assert_eq!(scan(&one, &catalog, true).unwrap().hashed, 1);
+        assert_eq!(scan(&two, &catalog, ScanOptions::QUIET).unwrap().hashed, 1);
+        assert_eq!(scan(&one, &catalog, ScanOptions::QUIET).unwrap().hashed, 1);
     }
 
     #[test]
@@ -1186,7 +1233,12 @@ mod tests {
         fx.write("a/new.jpg", b"new");
         remove_file(fx.lib().join("b/two.jpg")).unwrap();
 
-        let part = scan_with(&fx.lib().join("a"), &fx.catalog(), true, &Tools::default());
+        let part = scan_with(
+            &fx.lib().join("a"),
+            &fx.catalog(),
+            ScanOptions::QUIET,
+            &Tools::default(),
+        );
         let summary = part.unwrap();
         assert_eq!((summary.added, summary.updated, summary.removed), (1, 1, 0));
         let root = fx.lib().canonicalize().unwrap();
@@ -1211,7 +1263,7 @@ mod tests {
         let sub = scan_with(
             &fx.lib().join("sub"),
             &fx.catalog(),
-            true,
+            ScanOptions::QUIET,
             &Tools::default(),
         );
         assert_eq!(sub.unwrap().hashed, 2);
@@ -1316,8 +1368,112 @@ mod tests {
         fx.scan();
         remove_file(fx.lib().join("a.jpg")).unwrap();
 
-        let result = scan(&fx.lib(), &fx.catalog(), true);
+        let result = scan(&fx.lib(), &fx.catalog(), ScanOptions::QUIET);
+        assert!(
+            matches!(&result, Err(Error::Usage(m)) if m.contains("--allow-empty")),
+            "{:?}",
+            result
+        );
+        assert_eq!(paths(&fx.files()), vec!["a.jpg"]);
+    }
+
+    const ALLOW_EMPTY: ScanOptions = ScanOptions {
+        quiet: true,
+        allow_empty: true,
+    };
+
+    #[test]
+    fn test_allow_empty_prunes_an_emptied_library() {
+        let fx = Fixture::new();
+        fx.write("a.jpg", b"a");
+        fx.write("b/c.mp4", b"c");
+        fx.write("notes.txt", b"not media");
+        fx.scan();
+        remove_file(fx.lib().join("a.jpg")).unwrap();
+        remove_file(fx.lib().join("b/c.mp4")).unwrap();
+
+        let summary = scan_with(&fx.lib(), &fx.catalog(), ALLOW_EMPTY, &Tools::default());
+        assert_eq!(summary.unwrap().removed, 2);
+        assert_eq!(fx.files(), vec![]);
+        // The library stays, with no files, as a library scanned while empty does.
+        let catalog = Catalog::open(&fx.catalog()).unwrap();
+        let libraries = catalog.libraries().unwrap();
+        assert_eq!(libraries.len(), 1);
+        assert_eq!(libraries[0].files, 0);
+        assert!(libraries[0].scanned_at.is_some());
+        // Nothing is left to protect, so the next scan needs no flag.
+        assert_eq!(fx.scan(), ScanSummary::default());
+    }
+
+    #[test]
+    fn test_allow_empty_prunes_only_the_scanned_part() {
+        let fx = Fixture::new();
+        fx.write("a/one.jpg", b"1");
+        fx.write("b/two.jpg", b"22");
+        fx.scan();
+        remove_file(fx.lib().join("a/one.jpg")).unwrap();
+        let part = fx.lib().join("a");
+
+        let refused = scan_with(&part, &fx.catalog(), ScanOptions::QUIET, &Tools::default());
+        assert!(matches!(refused, Err(Error::Usage(_))));
+        assert_eq!(paths(&fx.files()), vec!["a/one.jpg", "b/two.jpg"]);
+
+        let summary = scan_with(&part, &fx.catalog(), ALLOW_EMPTY, &Tools::default()).unwrap();
+        assert_eq!(summary.removed, 1);
+        let root = fx.lib().canonicalize().unwrap();
+        assert_eq!(summary.part_of, Some(display_root(root.to_str().unwrap())));
+        assert_eq!(paths(&fx.files()), vec!["b/two.jpg"]);
+    }
+
+    #[test]
+    fn test_allow_empty_changes_nothing_when_media_is_found() {
+        let fx = Fixture::new();
+        fx.write("a.jpg", b"a");
+        fx.write("b.jpg", b"b");
+        fx.scan();
+        remove_file(fx.lib().join("a.jpg")).unwrap();
+
+        let summary = scan_with(&fx.lib(), &fx.catalog(), ALLOW_EMPTY, &Tools::default());
+        let summary = summary.unwrap();
+        assert_eq!((summary.removed, summary.unchanged), (1, 1));
+        assert_eq!(paths(&fx.files()), vec!["b.jpg"]);
+    }
+
+    #[test]
+    fn test_allow_empty_refuses_a_missing_folder() {
+        let fx = Fixture::new();
+        fx.write("a/one.jpg", b"1");
+        fx.scan();
+        remove_file(fx.lib().join("a/one.jpg")).unwrap();
+        std::fs::remove_dir(fx.lib().join("a")).unwrap();
+
+        let result = scan(&fx.lib().join("a"), &fx.catalog(), ALLOW_EMPTY);
         assert!(matches!(result, Err(Error::Usage(_))));
+        assert_eq!(paths(&fx.files()), vec!["a/one.jpg"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_allow_empty_refuses_an_unreadable_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = Fixture::new();
+        fx.write("a.jpg", b"a");
+        fx.scan();
+        let lib = fx.lib();
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::read_dir(&lib).is_ok() {
+            // Running as root: permissions do not apply.
+            std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let result = scan(&lib, &fx.catalog(), ALLOW_EMPTY);
+        std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(&result, Err(Error::Usage(m)) if m.starts_with("Cannot list")),
+            "{:?}",
+            result
+        );
         assert_eq!(paths(&fx.files()), vec!["a.jpg"]);
     }
 
@@ -1330,7 +1486,7 @@ mod tests {
         let result = scan(
             &fx.lib().join("sub").join(".."),
             &fx.lib().join("catalog.sqlite"),
-            true,
+            ScanOptions::QUIET,
         );
         assert!(matches!(result, Err(Error::Usage(_))));
         assert!(!fx.lib().join("catalog.sqlite").exists());
@@ -1345,7 +1501,7 @@ mod tests {
             .join("..")
             .join("deeper")
             .join("catalog.sqlite");
-        let result = scan(&fx.lib(), &nested, true);
+        let result = scan(&fx.lib(), &nested, ScanOptions::QUIET);
         assert!(matches!(result, Err(Error::Usage(_))));
         assert!(!fx.lib().join("deeper").exists());
     }
@@ -1356,7 +1512,7 @@ mod tests {
         let fx = Fixture::new();
         let link = fx.dir.path().join("link");
         std::os::unix::fs::symlink(fx.lib(), &link).unwrap();
-        let result = scan(&fx.lib(), &link.join("catalog.sqlite"), true);
+        let result = scan(&fx.lib(), &link.join("catalog.sqlite"), ScanOptions::QUIET);
         assert!(matches!(result, Err(Error::Usage(_))));
         assert!(!fx.lib().join("catalog.sqlite").exists());
     }
@@ -1364,7 +1520,11 @@ mod tests {
     #[test]
     fn test_catalog_inside_library_is_refused() {
         let fx = Fixture::new();
-        let result = scan(&fx.lib(), &fx.lib().join("catalog.sqlite"), true);
+        let result = scan(
+            &fx.lib(),
+            &fx.lib().join("catalog.sqlite"),
+            ScanOptions::QUIET,
+        );
         assert!(matches!(result, Err(Error::Usage(_))));
         assert!(!fx.lib().join("catalog.sqlite").exists());
     }
@@ -1372,7 +1532,7 @@ mod tests {
     #[test]
     fn test_missing_library_is_refused() {
         let fx = Fixture::new();
-        let result = scan(&fx.lib().join("nope"), &fx.catalog(), true);
+        let result = scan(&fx.lib().join("nope"), &fx.catalog(), ScanOptions::QUIET);
         assert!(matches!(result, Err(Error::Usage(_))));
     }
 

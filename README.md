@@ -40,6 +40,9 @@ Options:
       --catalog <CATALOG>  The catalog file [default: catalog.sqlite in the OS
                            data directory]
   -q, --quiet              Disable progress bars
+      --allow-empty        Remove the cataloged files of LIBRARY if it holds no
+                           media files now. Without it such a scan is refused,
+                           since an unmounted drive looks the same
   -h, --help               Print help
 ```
 
@@ -55,6 +58,12 @@ WebP, BMP and TIFF are decoded in-process; HEIC and AVIF need [FFmpeg][ffmpeg] 7
 Without these tools, those files are cataloged but not compared. Rescanning only reads files that
 are new or whose size or modification time changed, and decodes media again only if an update
 changed the decoders. The library itself is never modified.
+
+Files that are gone are removed from the catalog, but a scan that finds no media files at all
+where the catalog lists some is refused, since an unmounted drive or network share often leaves
+an empty folder behind. If the folder really is empty now, scan it with `--allow-empty` to
+remove its files from the catalog. The library stays in the catalog, with no files. The folder
+must still exist and be readable.
 
 Scanning a folder inside a scanned library scans only that part of the library. Scanning a
 folder that contains scanned libraries makes them part of it, keeping their hashes, so a scan

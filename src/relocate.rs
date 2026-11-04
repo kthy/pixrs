@@ -180,7 +180,12 @@ mod tests {
                 write(path, contents).unwrap();
             }
             let fx = Fixture { dir };
-            crate::scan::scan(&fx.path("old"), &fx.catalog(), true).unwrap();
+            crate::scan::scan(
+                &fx.path("old"),
+                &fx.catalog(),
+                crate::scan::ScanOptions::QUIET,
+            )
+            .unwrap();
             fx
         }
 
@@ -245,7 +250,12 @@ mod tests {
             )]
         );
         // A scan at the new place finds nothing to do.
-        let scan = crate::scan::scan(&fx.path("data/k"), &fx.catalog(), true).unwrap();
+        let scan = crate::scan::scan(
+            &fx.path("data/k"),
+            &fx.catalog(),
+            crate::scan::ScanOptions::QUIET,
+        )
+        .unwrap();
         assert_eq!((scan.unchanged, scan.added, scan.hashed), (2, 0, 0));
         assert!(relocate(&fx.catalog(), Path::new(&old_root), &old, false).is_err());
     }
@@ -270,7 +280,12 @@ mod tests {
         let fx = Fixture::new(&[("a.jpg", b"same"), ("b.jpg", b"size")]);
         create_dir_all(fx.path("data")).unwrap();
         write(fx.path("data/c.jpg"), b"c").unwrap();
-        crate::scan::scan(&fx.path("data"), &fx.catalog(), true).unwrap();
+        crate::scan::scan(
+            &fx.path("data"),
+            &fx.catalog(),
+            crate::scan::ScanOptions::QUIET,
+        )
+        .unwrap();
         rename(fx.path("old"), fx.path("data/k")).unwrap();
 
         let summary = relocate(&fx.catalog(), &fx.path("old"), &fx.path("data/k"), false);
