@@ -50,14 +50,14 @@ The planned shape, tracked in GitHub issues #32 to #37 (one per step):
   entries only go when folded into another library. Paths are stored as the file system spells
   them, but file names are matched to rows in Unicode NFC (#51; `src/names.rs`): macOS may
   decompose accents (NFD) where Linux and Windows compose them, so a library copied or read
-  across systems would otherwise look new. A scan looks a walked name up as spelled, then in NFC (in memory, no schema change:
-  the rows not spelled in NFC are collected once per scan, usually none); a row found so keeps
-  its hashes and takes the name on disk, unless its own spelling is another file on disk (Linux
-  keeps both forms apart) or another file already matched it. `relocate` compares a sampled file
-  it does not find as spelled under a name in its folder that is the same in NFC, and matches
-  OLD to the roots in NFC after spelling. Library roots are matched by identity as before, with
-  `on_disk_name` ignoring normalization too. Rows that `fold_nested` merges are still compared
-  as spelled; the next scan respells them.
+  across systems would otherwise look new. A scan looks a walked name up as spelled, then in NFC
+  (in memory, no schema change: the rows not spelled in NFC are collected once per scan, usually
+  none); a row found so keeps its hashes and takes the name on disk, unless its own spelling is
+  another file on disk (Linux keeps both forms apart) or another file already matched it.
+  `relocate` compares a sampled file it does not find as spelled under a name in its folder that
+  is the same in NFC, and matches OLD to the roots in NFC after spelling. Library roots are
+  matched by identity as before, with `on_disk_name` ignoring normalization too. Rows that
+  `fold_nested` merges are still compared as spelled; the next scan respells them.
 - `dupes`: tiered matching. Group by size, then content hash, then hash of decoded pixels
   (same image, different metadata), then perceptual hash (resized or recompressed copies).
   Fuzzy video and audio matching comes last.
