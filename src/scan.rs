@@ -52,6 +52,12 @@ const MAX_DECODERS: usize = 8;
 /// read on a share waits for round trips); many would make a spinning disk seek between them.
 const MAX_HASHERS: usize = 4;
 
+/// Most files whose metadata is read at once, however many cores there are. Reading the metadata
+/// takes a few small reads near the start of the file, so a reader mostly waits for the disk or,
+/// on a network share, for round trips. On WSL's `/mnt/c`, 2,000 files took 5.5 s with one reader,
+/// 1.2 s with 4 and 0.85 s with 8 to 64; a share with longer round trips gains from more.
+const MAX_READERS: usize = 16;
+
 /// What a scan did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ScanSummary {
@@ -437,21 +443,25 @@ impl<'c> Scan<'c> {
             self.catalog.respell(self.library_id, old, new)?;
         }
         self.summary.respelled = respelled.len();
-        for file in pending {
-            batch.tick()?;
+        let read = |file: &Pending| {
             pb.set_message(printable(&file.rel).into_owned());
             // A parser bug on one broken file should not end the scan, or keep the file out of
             // the catalog: it is cataloged without metadata, like a file whose metadata cannot be
             // parsed.
-            let read = catch_unwind(AssertUnwindSafe(|| read_meta(&file.path)));
+            catch_unwind(AssertUnwindSafe(|| read_meta(&file.path)))
+        };
+        let (catalog, library_id, root) = (self.catalog, self.library_id, &self.root);
+        let summary = &mut self.summary;
+        in_parallel(&pending, MAX_READERS, read, |file, read| {
+            batch.tick()?;
+            pb.inc(1);
             let meta = match read {
                 Ok(Ok(meta)) => meta,
                 Ok(Err(e)) => {
                     pb.suspend(|| warn(&file.path, &e));
-                    stop_if_gone(&self.root, &pb, &mut batch)?;
-                    self.summary.skipped += 1;
-                    pb.inc(1);
-                    continue;
+                    stop_if_gone(root, &pb, &mut batch)?;
+                    summary.skipped += 1;
+                    return Ok(());
                 }
                 Err(_) => {
                     pb.suspend(|| {
@@ -464,20 +474,20 @@ impl<'c> Scan<'c> {
                 }
             };
             let record = FileRecord {
-                path: file.rel,
+                path: file.rel.clone(),
                 stamp: file.stamp,
                 media_type: file.media_type,
                 sha256: None,
                 meta,
             };
-            self.catalog.upsert(self.library_id, &record)?;
+            catalog.upsert(library_id, &record)?;
             if file.new {
-                self.summary.added += 1;
+                summary.added += 1;
             } else {
-                self.summary.updated += 1;
+                summary.updated += 1;
             }
-            pb.inc(1);
-        }
+            Ok(())
+        })?;
         finish_step(&pb, &format!("Read {} files", HumanCount(pb.position())));
 
         for rel in known.keys() {
@@ -503,7 +513,7 @@ impl<'c> Scan<'c> {
             pb.set_message(printable(&file.path).into_owned());
             hash_file(&library_path(root, &file.path), &pb)
         };
-        in_parallel(&to_hash, MAX_HASHERS, hash, |file, hashed| {
+        in_parallel(&to_hash, per_core(MAX_HASHERS), hash, |file, hashed| {
             batch.tick()?;
             match hashed {
                 Ok(sha256) => {
@@ -760,23 +770,26 @@ fn hash_files(
         }))
         .unwrap_or_else(|_| Err(DecodeError::Crashed))
     };
-    in_parallel(files, MAX_DECODERS, work, record)
+    in_parallel(files, per_core(MAX_DECODERS), work, record)
 }
 
-/// `work` on each of `items` on up to `max_workers` threads (no more than there are cores),
-/// passing each item with its result to `record` on this thread, in the order they finish.
-/// `record` is where the catalog is written: it has one connection, and one writer. Stops at the
-/// first error from `record`.
+/// Up to `max` threads, but no more than there are cores: for work that keeps a core busy.
+fn per_core(max: usize) -> usize {
+    available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(max)
+}
+
+/// `work` on each of `items` on up to `workers` threads, passing each item with its result to
+/// `record` on this thread, in the order they finish. `record` is where the catalog is written:
+/// it has one connection, and one writer. Stops at the first error from `record`.
 fn in_parallel<T: Sync, R: Send>(
     items: &[T],
-    max_workers: usize,
+    workers: usize,
     work: impl Fn(&T) -> R + Sync,
     mut record: impl FnMut(&T, R) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let workers = available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(max_workers)
-        .min(items.len().max(1));
+    let workers = workers.clamp(1, items.len().max(1));
     let next = AtomicUsize::new(0);
     let (tx, rx) = mpsc::sync_channel(workers * 2);
     thread::scope(|scope| {
@@ -1608,6 +1621,35 @@ mod tests {
     }
 
     #[test]
+    fn test_many_files_are_read_in_parallel_each_with_its_own_metadata() {
+        let fx = Fixture::new();
+        // More files than readers and than one commit holds, each with its own camera and date.
+        let n = COMMIT_EVERY + MAX_READERS + 3;
+        for i in 0..n {
+            let taken = format!("2019:07:14 12:{:02}:{:02}", i / 60 % 60, i % 60);
+            fx.write(
+                &format!("d{}/{i:05}.jpg", i % 7),
+                &jpeg_with_exif("Canon", &format!("Model {i}"), &taken),
+            );
+        }
+        let summary = fx.scan();
+        assert_eq!((summary.added, summary.skipped), (n, 0));
+        let files = fx.files();
+        assert_eq!(files.len(), n);
+        for file in files {
+            let name = file.path.rsplit('/').next().unwrap();
+            let i: usize = name.trim_end_matches(".jpg").parse().unwrap();
+            let taken = format!("2019-07-14T12:{:02}:{:02}", i / 60 % 60, i % 60);
+            assert_eq!(file.meta.camera_model, Some(format!("Model {i}")), "{name}");
+            assert_eq!(
+                file.meta.taken_at.as_deref(),
+                Some(taken.as_str()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn test_reads_quicktime_creation_time_as_ffmpeg_does() {
         use crate::dates::QUICKTIME_EPOCH_OFFSET;
         let unix = time::macros::datetime!(2014-05-12 18:18:27 UTC).unix_timestamp();
@@ -1913,6 +1955,27 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(paths(&fx.files()), vec!["a.jpg"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_file_that_cannot_be_read_is_skipped_and_the_rest_are_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = Fixture::new();
+        for i in 0..MAX_READERS * 2 {
+            fx.write(&format!("{i:02}.jpg"), format!("{i:02}").as_bytes());
+        }
+        let locked = fx.lib().join("05.jpg");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&locked).is_ok() {
+            // Running as root: permissions do not apply.
+            return;
+        }
+
+        let summary = fx.scan();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!((summary.added, summary.skipped), (MAX_READERS * 2 - 1, 1));
+        assert!(!paths(&fx.files()).contains(&"05.jpg"));
     }
 
     #[test]

@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `pixrs scan` reads the metadata of new and changed files on 16 threads instead of one, so
+  the "Reading" step no longer waits for each file's round trips in turn on a network share. On
+  WSL's `/mnt/c` it read 2,000 photos in 0.85 s instead of 5.5 s.
 - Exit codes follow the cause of an error, after `sysexits.h`: 64 for a bad argument (as all
   errors were before), 65 for a plan, journal or catalog file pixrs cannot use, 74 for a file
   or folder that cannot be read or written (a library that disappears during a scan, a folder
