@@ -26,7 +26,7 @@ use pixrs::catalog::{cataloged_spelling, Catalog, Library, LibraryRoot};
 use pixrs::dupes::{
     find_dupes, plural, write_csv, write_json, write_text, DupeReport, Role, Tier,
 };
-use pixrs::error::{utf8, Error};
+use pixrs::error::{utf8, AtPath, Error};
 use pixrs::library::{LibraryId, Root};
 use pixrs::plan::{
     outside_libraries, plan_organize, plan_quarantine, read_plan, write_plan, write_summary,
@@ -38,7 +38,6 @@ use pixrs::statics::{LICENSE, THIRD_PARTY_NOTICES};
 use pixrs::structs::{
     ApplyOpt, Cli, Command, DupesOpt, Format, OrganizeOpt, RelocateOpt, ScanOpt, ServeOpt, UndoOpt,
 };
-use pixrs::template::Template;
 use pixrs::text::{printable, printable_lines, shown};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -213,12 +212,12 @@ fn organize(opt: OrganizeOpt) -> Result<(), Error> {
     let catalog_path = opt.catalog.path_or_default()?;
     let catalog = Catalog::open_existing(&catalog_path)?;
     let library = cataloged_library(&catalog, &catalog.libraries()?, &opt.library)?;
-    let template = match (&opt.template, &opt.layout) {
-        (Some(template), _) => Template::parse(template),
-        (None, Some(layout)) => Template::from_layout(layout),
-        (None, None) => unreachable!("clap requires --template or --layout"),
-    }?;
-    let to = opt.to.as_deref().map(pixrs::scan::resolve).transpose()?;
+    let template = opt.naming.template()?;
+    let to = opt
+        .to
+        .as_deref()
+        .map(|to| pixrs::scan::resolve(to).at(to))
+        .transpose()?;
     let now = OffsetDateTime::now_utc();
     let opts = OrganizeOptions {
         template: &template,

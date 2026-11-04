@@ -9,6 +9,7 @@ use crate::catalog::Catalog;
 use crate::dupes::{Similarity, DEFAULT_THRESHOLD};
 use crate::error::Error;
 use crate::statics::{ABOUT, AFTER_HELP};
+use crate::template::{Template, TemplateError};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -104,15 +105,8 @@ pub struct OrganizeOpt {
     /// The scanned library to organize
     pub library: PathBuf,
 
-    /// Where files go, e.g. "{type}/{year}/{month}/{date}_{time}.{ext}". Tokens: {year}
-    /// {month} {day} {hour} {minute} {second} {date} {time} {type} {camera} {name} {ext}
-    #[arg(long, conflicts_with = "layout", required_unless_present = "layout")]
-    pub template: Option<String>,
-
-    /// Preset folders, combined in order: flat, year, year-month, type (e.g. "type,year-month").
-    /// Files are named "{date}_{time}.{ext}"
-    #[arg(long)]
-    pub layout: Option<String>,
+    #[command(flatten)]
+    pub naming: Naming,
 
     /// Put the files below this folder instead of the library root
     #[arg(long, value_name = "DIR")]
@@ -139,6 +133,32 @@ pub struct OrganizeOpt {
 
     #[command(flatten)]
     pub catalog: CatalogArg,
+}
+
+/// How `pixrs organize` names files: by a template or by layout presets, exactly one of them.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct Naming {
+    /// Where files go, e.g. "{type}/{year}/{month}/{date}_{time}.{ext}". Tokens: {year}
+    /// {month} {day} {hour} {minute} {second} {date} {time} {type} {camera} {name} {ext}
+    #[arg(long)]
+    pub template: Option<String>,
+
+    /// Preset folders, combined in order: flat, year, year-month, type (e.g. "type,year-month").
+    /// Files are named "{date}_{time}.{ext}"
+    #[arg(long)]
+    pub layout: Option<String>,
+}
+
+impl Naming {
+    /// The template given, or the one the layout presets stand for.
+    pub fn template(&self) -> Result<Template, TemplateError> {
+        match (&self.template, &self.layout) {
+            (_, Some(layout)) => Template::from_layout(layout),
+            // Clap requires one of them; without either, the empty template is refused.
+            (template, None) => Template::parse(template.as_deref().unwrap_or_default()),
+        }
+    }
 }
 
 /// Options for `pixrs apply`.
