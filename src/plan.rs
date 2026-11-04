@@ -369,7 +369,60 @@ pub struct PlanNotes {
     /// Files whose target was taken and that got a suffix.
     pub collisions: Vec<Collision>,
     /// Warnings to show, e.g. sidecars that cannot follow their media file.
-    pub warnings: Vec<String>,
+    pub warnings: Vec<PlanWarning>,
+}
+
+/// A file that stays where it is, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanWarning {
+    /// `files` files would have been moved through the symbolic link `link`.
+    ThroughLink { link: PathBuf, files: usize },
+    /// A sidecar stays with the media file `media` in its folder, which does not move.
+    StaysWithMedia { sidecar: PathBuf, media: String },
+    /// The new name of a sidecar is taken.
+    SidecarTargetTaken { sidecar: PathBuf, target: PathBuf },
+    /// The target folder cannot be read, so any name in it could be taken.
+    FolderUnreadable { file: PathBuf, folder: PathBuf },
+    /// A copy is the same file as the kept one, under another name.
+    SameAsKeeper { file: PathBuf, keeper: PathBuf },
+}
+
+impl fmt::Display for PlanWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ThroughLink { link, files } => write!(
+                f,
+                "{} {} stay: {} is a symbolic link, and files are never moved through links",
+                files,
+                plural(*files, "file", "files"),
+                link.display()
+            ),
+            Self::StaysWithMedia { sidecar, media } => write!(
+                f,
+                "{} stays with {}, which does not move",
+                sidecar.display(),
+                media
+            ),
+            Self::SidecarTargetTaken { sidecar, target } => write!(
+                f,
+                "{} stays: {} is taken",
+                sidecar.display(),
+                target.display()
+            ),
+            Self::FolderUnreadable { file, folder } => write!(
+                f,
+                "{} stays: the folder {} cannot be read",
+                file.display(),
+                folder.display()
+            ),
+            Self::SameAsKeeper { file, keeper } => write!(
+                f,
+                "{} stays: it is the same file as the kept copy {}",
+                file.display(),
+                keeper.display()
+            ),
+        }
+    }
 }
 
 /// How `pixrs organize` lays out files.
@@ -545,13 +598,11 @@ impl Links {
     }
 
     fn warn(&self, notes: &mut PlanNotes) {
-        for (link, n) in &self.0 {
-            notes.warnings.push(format!(
-                "{} {} stay: {} is a symbolic link, and files are never moved through links",
-                n,
-                plural(*n, "file", "files"),
-                link.display()
-            ));
+        for (link, &files) in &self.0 {
+            notes.warnings.push(PlanWarning::ThroughLink {
+                link: link.clone(),
+                files,
+            });
         }
     }
 }
@@ -663,21 +714,19 @@ fn add_sidecars(moves: &mut Vec<Move>, claims: &mut Claims, notes: &mut PlanNote
                             && !moving.contains(&Claims::key(&dir.join(other.as_str())))
                     });
                 if let Some(staying) = staying {
-                    notes.warnings.push(format!(
-                        "{} stays with {}, which does not move",
-                        source.display(),
-                        staying
-                    ));
+                    notes.warnings.push(PlanWarning::StaysWithMedia {
+                        sidecar: source,
+                        media: staying.clone(),
+                    });
                     continue;
                 }
             }
             let target = to_dir.join(&sidecar.new_name);
             if !claims.is_free(&target, &source) {
-                notes.warnings.push(format!(
-                    "{} stays: {} is taken",
-                    source.display(),
-                    target.display()
-                ));
+                notes.warnings.push(PlanWarning::SidecarTargetTaken {
+                    sidecar: source,
+                    target,
+                });
                 continue;
             }
             let Ok(stamp) = fs::metadata(&source).and_then(|m| crate::scan::stamp(&m)) else {
@@ -837,11 +886,10 @@ fn organize_moves(
     } in wanted
     {
         let Some(assigned) = claims.claim_free(&target, &source, suffix) else {
-            notes.warnings.push(format!(
-                "{} stays: the folder {} cannot be read",
-                source.display(),
-                target.parent().unwrap_or(&target).display()
-            ));
+            notes.warnings.push(PlanWarning::FolderUnreadable {
+                folder: target.parent().unwrap_or(&target).to_path_buf(),
+                file: source,
+            });
             continue;
         };
         if assigned == source {
@@ -1019,11 +1067,10 @@ impl Quarantine<'_> {
         // One file under two names (a hard link, or one folder cataloged under two spellings)
         // is no copy: moving it would leave nothing behind.
         if is_same_file(&source, &keeper.path).unwrap_or(false) {
-            self.notes.warnings.push(format!(
-                "{} stays: it is the same file as the kept copy {}",
-                source.display(),
-                keeper.path.display()
-            ));
+            self.notes.warnings.push(PlanWarning::SameAsKeeper {
+                file: source,
+                keeper: keeper.path.clone(),
+            });
             return Ok(());
         }
         let mut folders: Vec<&str> = std::iter::once(folder.as_str())
@@ -1043,11 +1090,10 @@ impl Quarantine<'_> {
             }
         };
         let Some(assigned) = self.claims.claim_free(&target, &source, "_{n}") else {
-            self.notes.warnings.push(format!(
-                "{} stays: the folder {} cannot be read",
-                source.display(),
-                target.parent().unwrap_or(&target).display()
-            ));
+            self.notes.warnings.push(PlanWarning::FolderUnreadable {
+                folder: target.parent().unwrap_or(&target).to_path_buf(),
+                file: source,
+            });
             return Ok(());
         };
         if assigned != target {
@@ -1248,7 +1294,7 @@ pub fn write_summary(
         )?;
     }
     for warning in &notes.warnings {
-        writeln!(out, "Warning: {}", printable(warning))?;
+        writeln!(out, "Warning: {}", printable(&warning.to_string()))?;
     }
     writeln!(
         out,
@@ -1489,7 +1535,10 @@ mod tests {
             wanted: PathBuf::from("x\u{7}.jpg"),
             got: PathBuf::from("x\u{7}_2.jpg"),
         });
-        notes.warnings.push(String::from("b.jpg\rDone. stays"));
+        notes.warnings.push(PlanWarning::SameAsKeeper {
+            file: PathBuf::from("b.jpg\rDone."),
+            keeper: PathBuf::from("a.jpg"),
+        });
         let mut out = vec![];
         write_summary(&plan, &notes, Path::new("plan.json"), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
@@ -1700,17 +1749,20 @@ mod tests {
         assert_eq!(plan.moves, vec![]);
         assert_eq!(notes.warnings.len(), 1, "{:?}", notes.warnings);
         assert!(
-            notes.warnings[0].starts_with("2 files stay:"),
-            "{}",
-            notes.warnings[0]
+            matches!(&notes.warnings[0], PlanWarning::ThroughLink { link, files: 2 } if link.ends_with("2023")),
+            "{:?}",
+            notes.warnings
         );
-        assert!(notes.warnings[0].contains("2023"), "{}", notes.warnings[0]);
         // A link under another letter case is that folder on Windows and macOS, so it counts
         // everywhere.
         symlink(&outside, f.root.join("Image")).unwrap();
         let (plan, notes) = organize(&f, "{type}/{name}.{ext}", false);
         assert_eq!(plan.moves, vec![]);
-        assert!(notes.warnings[0].contains("Image"), "{:?}", notes.warnings);
+        assert!(
+            matches!(&notes.warnings[0], PlanWarning::ThroughLink { link, .. } if link.ends_with("Image")),
+            "{:?}",
+            notes.warnings
+        );
         // A link elsewhere in the library is no concern.
         symlink(&outside, f.root.join("elsewhere")).unwrap();
         let (plan, _) = organize(&f, "{name}.{ext}", false);

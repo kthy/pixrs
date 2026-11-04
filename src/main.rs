@@ -281,7 +281,7 @@ fn apply(opt: &ApplyOpt) -> Result<(), Error> {
 fn undo(opt: &UndoOpt) -> Result<(), Error> {
     let summary = pixrs::apply::undo(&opt.journal)?;
     for warning in &summary.warnings {
-        println!("Warning: {}", printable(warning));
+        println!("Warning: {}", printable(&warning.to_string()));
     }
     println!(
         "Moved {} {} back.",
