@@ -31,6 +31,7 @@ use pixrs::plan::{
     outside_libraries, plan_organize, plan_quarantine, read_plan, write_plan, write_summary,
     OrganizeOptions,
 };
+use pixrs::scan::ScanOptions;
 use pixrs::serve::{default_cache_dir, Config};
 use pixrs::statics::{LICENSE, THIRD_PARTY_NOTICES};
 use pixrs::structs::{
@@ -326,7 +327,11 @@ fn relocate(opt: RelocateOpt) {
 /// Scan a media library into the catalog and print a summary.
 fn scan(opt: ScanOpt, now: Instant) {
     let catalog = catalog_path(opt.catalog);
-    match pixrs::scan::scan(&opt.library, &catalog, opt.quiet) {
+    let options = ScanOptions {
+        quiet: opt.quiet,
+        allow_empty: opt.allow_empty,
+    };
+    match pixrs::scan::scan(&opt.library, &catalog, options) {
         Ok(s) => {
             for root in &s.folded {
                 println!(

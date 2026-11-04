@@ -1314,8 +1314,13 @@ mod tests {
         }
         let root = root.canonicalize().unwrap();
         let catalog_path = dir.path().join("catalog.sqlite");
-        crate::scan::scan_with(&root, &catalog_path, true, &crate::decode::Tools::default())
-            .unwrap();
+        crate::scan::scan_with(
+            &root,
+            &catalog_path,
+            crate::scan::ScanOptions::QUIET,
+            &crate::decode::Tools::default(),
+        )
+        .unwrap();
         Fixture {
             dir,
             root,
@@ -1831,7 +1836,7 @@ mod tests {
             crate::scan::scan_with(
                 &f.root,
                 &f.catalog_path,
-                true,
+                crate::scan::ScanOptions::QUIET,
                 &crate::decode::Tools::default(),
             )
             .unwrap();

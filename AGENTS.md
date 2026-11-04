@@ -43,7 +43,11 @@ The planned shape, tracked in GitHub issues #32 to #37 (one per step):
   stored roots (it need not exist), up to 100 files spread over the library must be at NEW with
   the same size and mtime (at least 90%, unless `--force`), and NEW follows the overlap rules
   above (merged into a library containing it, folding libraries inside it). It takes the
-  `apply`/`undo` lock.
+  `apply`/`undo` lock. A scan whose walk finds no media where the catalog lists some (for the
+  library, or the scanned part of it) is refused, since an unmounted drive often leaves an empty
+  mount point; `--allow-empty` (#49) removes those rows instead. The folder must still exist and
+  be listable. The library's entry stays, with no files, as for a library first scanned empty;
+  entries only go when folded into another library.
 - `dupes`: tiered matching. Group by size, then content hash, then hash of decoded pixels
   (same image, different metadata), then perceptual hash (resized or recompressed copies).
   Fuzzy video and audio matching comes last.
