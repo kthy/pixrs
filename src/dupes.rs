@@ -8,7 +8,9 @@
 use crate::avhash::{
     audio_durations_match, audio_match, frames_match, has_detail, video_durations_match, Frame,
 };
-use crate::catalog::{extra_rows, library_path, Catalog, HashedAv, HashedFile, HashedImage};
+use crate::catalog::{
+    extra_rows, library_path, AvSignature, Catalog, HashedAv, HashedFile, HashedImage,
+};
 use crate::imagehash::{distance, fingerprints_match, Visual};
 use crate::library::LibraryId;
 use crate::media::Dimensions;
@@ -421,29 +423,28 @@ fn similar_images(images: &[ImageKey], threshold: u32) -> Vec<(usize, usize)> {
 /// Audio is the costly part: an audio pair takes tens of microseconds, and music libraries have
 /// many tracks of similar length.
 fn similar_av(items: &[AvItem], threshold: u32, short_videos: bool) -> Vec<(usize, usize)> {
-    let mut videos: Vec<VideoKey> = items
-        .iter()
-        .filter(|item| short_videos || item.av.signature.duration_ms() >= SHORT_VIDEO_MS)
-        .filter_map(|item| {
-            Some(VideoKey {
-                node: item.node,
-                duration_ms: item.av.signature.duration_ms(),
-                dimensions: item.av.dimensions,
-                frames: item.av.signature.frames()?,
-            })
-        })
-        .collect();
-    let mut audio: Vec<AudioKey> = items
-        .iter()
-        .filter_map(|item| {
-            Some(AudioKey {
-                node: item.node,
-                duration_ms: item.av.signature.duration_ms(),
-                values: item.av.signature.chromaprint()?,
-            })
-        })
-        .filter(|key| has_detail(key.values))
-        .collect();
+    let (mut videos, mut audio): (Vec<VideoKey>, Vec<AudioKey>) = (vec![], vec![]);
+    for item in items {
+        let duration_ms = item.av.signature.duration_ms();
+        match &item.av.signature {
+            AvSignature::Video(video) if short_videos || duration_ms >= SHORT_VIDEO_MS => {
+                videos.push(VideoKey {
+                    node: item.node,
+                    duration_ms,
+                    dimensions: item.av.dimensions,
+                    frames: &video.frames,
+                });
+            }
+            AvSignature::Audio(fingerprint) if has_detail(&fingerprint.values) => {
+                audio.push(AudioKey {
+                    node: item.node,
+                    duration_ms,
+                    values: &fingerprint.values,
+                });
+            }
+            AvSignature::Video(_) | AvSignature::Audio(_) => {}
+        }
+    }
     videos.sort_by_key(|key| key.duration_ms);
     audio.sort_by_key(|key| key.duration_ms);
     let mut pairs = pairs_by_row(videos.len(), |n, pairs| {

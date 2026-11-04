@@ -158,6 +158,15 @@ impl Dimensions {
         (width > 0 && height > 0).then_some(Self { width, height })
     }
 
+    /// The dimensions turned a quarter: width and height swapped.
+    #[must_use]
+    pub const fn transposed(self) -> Self {
+        Self {
+            width: self.height,
+            height: self.width,
+        }
+    }
+
     /// Width times height.
     pub fn pixels(self) -> u64 {
         u64::from(self.width) * u64::from(self.height)

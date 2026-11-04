@@ -6,7 +6,7 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::decode::{ffmpeg_input_options, file_url, major_minor, run_with_timeout, DecodeError};
+use crate::decode::{ffmpeg_input_options, file_url, run_with_timeout, DecodeError};
 use crate::imagehash::{distance, perceptual_hash, HASH_VERSION};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -121,20 +121,6 @@ pub fn video_version(ffmpeg_version: &str) -> String {
 /// minor version.
 pub fn audio_version(fpcalc_version: &str) -> String {
     format!("audio {AV_VERSION}; fpcalc {fpcalc_version}")
-}
-
-/// The major and minor version `fpcalc -version` reports, e.g. `1.5`, or `unknown`.
-pub fn fpcalc_version(fpcalc: &Path) -> String {
-    let mut command = Command::new(fpcalc);
-    command.arg("-version");
-    run_with_timeout(command)
-        .ok()
-        .and_then(|out| {
-            // "fpcalc version 1.5.1"
-            let out = String::from_utf8_lossy(&out);
-            out.split_whitespace().nth(2).map(major_minor)
-        })
-        .unwrap_or_else(|| String::from("unknown"))
 }
 
 /// What `ffprobe -of json` prints for the entries `video_span` asks for. Times are strings of
