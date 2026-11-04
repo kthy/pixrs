@@ -5,7 +5,9 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::dupes::DEFAULT_THRESHOLD;
+use crate::catalog::Catalog;
+use crate::dupes::{Similarity, DEFAULT_THRESHOLD};
+use crate::error::Error;
 use crate::statics::{ABOUT, AFTER_HELP};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -61,9 +63,8 @@ pub struct ScanOpt {
     /// The media library to scan
     pub library: PathBuf,
 
-    /// The catalog file [default: catalog.sqlite in the OS data directory]
-    #[arg(long)]
-    pub catalog: Option<PathBuf>,
+    #[command(flatten)]
+    pub catalog: CatalogArg,
 
     /// Disable progress bars
     #[arg(short, long)]
@@ -81,23 +82,15 @@ pub struct DupesOpt {
     /// Only report duplicates of files in these libraries [default: all scanned libraries]
     pub libraries: Vec<PathBuf>,
 
-    /// The catalog file [default: catalog.sqlite in the OS data directory]
-    #[arg(long)]
-    pub catalog: Option<PathBuf>,
+    #[command(flatten)]
+    pub catalog: CatalogArg,
 
     /// Output format
     #[arg(long, value_enum, default_value_t = Format::Text)]
     pub format: Format,
 
-    /// Also find similar images (resized or recompressed copies) and videos under 4 seconds.
-    /// Expect burst shots among them. Longer similar videos and similar audio are always found
-    #[arg(long)]
-    pub similar: bool,
-
-    /// How many of the 64 perceptual hash bits two images or video frames may differ in to
-    /// count as similar (at most 16)
-    #[arg(long, default_value_t = DEFAULT_THRESHOLD, value_parser = clap::value_parser!(u32).range(0..=16))]
-    pub threshold: u32,
+    #[command(flatten)]
+    pub similarity: SimilarArgs,
 
     /// Plan moving every exact and same-pixel copy of a kept file to this folder (similar files
     /// are never quarantined). Nothing moves until `pixrs apply`
@@ -144,9 +137,8 @@ pub struct OrganizeOpt {
     #[arg(long)]
     pub prune_empty: bool,
 
-    /// The catalog file [default: catalog.sqlite in the OS data directory]
-    #[arg(long)]
-    pub catalog: Option<PathBuf>,
+    #[command(flatten)]
+    pub catalog: CatalogArg,
 }
 
 /// Options for `pixrs apply`.
@@ -172,9 +164,8 @@ pub struct RelocateOpt {
     /// Where the library is now
     pub new: PathBuf,
 
-    /// The catalog file [default: catalog.sqlite in the OS data directory]
-    #[arg(long)]
-    pub catalog: Option<PathBuf>,
+    #[command(flatten)]
+    pub catalog: CatalogArg,
 
     /// Move the library even if most of its files are not found unchanged at NEW
     #[arg(long)]
@@ -187,23 +178,15 @@ pub struct ServeOpt {
     /// Only show files in these libraries [default: all scanned libraries]
     pub libraries: Vec<PathBuf>,
 
-    /// The catalog file [default: catalog.sqlite in the OS data directory]
-    #[arg(long)]
-    pub catalog: Option<PathBuf>,
+    #[command(flatten)]
+    pub catalog: CatalogArg,
 
     /// The thumbnail cache folder [default: thumbnails in the OS cache directory]
     #[arg(long)]
     pub cache: Option<PathBuf>,
 
-    /// Also find similar images (resized or recompressed copies) and videos under 4 seconds.
-    /// Expect burst shots among them. Longer similar videos and similar audio are always found
-    #[arg(long)]
-    pub similar: bool,
-
-    /// How many of the 64 perceptual hash bits two images or video frames may differ in to
-    /// count as similar (at most 16)
-    #[arg(long, default_value_t = DEFAULT_THRESHOLD, value_parser = clap::value_parser!(u32).range(0..=16))]
-    pub threshold: u32,
+    #[command(flatten)]
+    pub similarity: SimilarArgs,
 
     /// The port to listen on, on localhost only
     #[arg(long, default_value_t = 2635)]
@@ -212,6 +195,50 @@ pub struct ServeOpt {
     /// Open the viewer in the default browser
     #[arg(short, long)]
     pub open: bool,
+}
+
+/// The `--catalog` option of the commands that read or write the catalog.
+#[derive(Debug, Args)]
+pub struct CatalogArg {
+    /// The catalog file [default: catalog.sqlite in the OS data directory]
+    #[arg(long = "catalog", id = "catalog", value_name = "CATALOG")]
+    pub path: Option<PathBuf>,
+}
+
+impl CatalogArg {
+    /// The catalog given, or the default one.
+    pub fn path_or_default(self) -> Result<PathBuf, Error> {
+        self.path
+            .or_else(Catalog::default_path)
+            .ok_or(Error::NoDataDir)
+    }
+}
+
+/// The options of the commands that look for similar files.
+#[derive(Clone, Copy, Debug, Args)]
+pub struct SimilarArgs {
+    /// Also find similar images (resized or recompressed copies) and videos under 4 seconds.
+    /// Expect burst shots among them. Longer similar videos and similar audio are always found
+    #[arg(long)]
+    pub similar: bool,
+
+    /// How many of the 64 perceptual hash bits two images or video frames may differ in to
+    /// count as similar (at most 16)
+    #[arg(
+        long,
+        default_value_t = DEFAULT_THRESHOLD,
+        value_parser = clap::value_parser!(u32).range(0..=16)
+    )]
+    pub threshold: u32,
+}
+
+impl From<SimilarArgs> for Similarity {
+    fn from(args: SimilarArgs) -> Self {
+        Self {
+            threshold: args.threshold,
+            images: args.similar,
+        }
+    }
 }
 
 /// Report output formats.

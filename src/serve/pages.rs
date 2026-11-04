@@ -6,15 +6,15 @@
  *************************************************************************************************/
 
 use super::thumbs::{self, ViewSource};
-use super::{AppError, AppState};
-use crate::catalog::{display_root, FileRecord, FileRef, Filter, Page};
+use super::{AppError, AppState, Located};
+use crate::catalog::{display_root, FileRecord, Filter, HashedFile, Neighbors, Page, Tally};
 use crate::dupes::{human_mtime, plural, DupeGroup, Role, Tier};
 use crate::media::MediaType;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use indicatif::HumanBytes;
 use maud::{html, Markup, DOCTYPE};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::sync::Arc;
 use time::{Month, OffsetDateTime};
 
@@ -28,42 +28,55 @@ const MAX_PAGE: usize = 1_000_000;
 const DUBIOUS_DATE: &str = "Probably wrong: before 1980 or in the future, as broken metadata \
      often is. pixrs organize ignores it unless --trust-dates is given.";
 
-/// Query parameters shared by the pages.
+/// Query parameters shared by the pages. A media type or listing the viewer does not know counts
+/// as none given, so a hand-edited link still shows a page.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQuery {
     /// Only show this media type.
-    #[serde(rename = "type")]
-    kind: Option<String>,
+    #[serde(rename = "type", default, deserialize_with = "known_media_type")]
+    media_type: Option<MediaType>,
     /// Page number, from 1.
     page: Option<usize>,
-    /// `1` for just the next page of items, for HTMX to append.
-    partial: Option<u8>,
-    /// The listing a file was opened from, for prev/next: `folder` (default) or `date`.
-    from: Option<String>,
+    /// Just the next page of items, for HTMX to append: `partial=1`.
+    #[serde(default, deserialize_with = "one")]
+    partial: bool,
+    /// The listing a file was opened from, for prev/next.
+    #[serde(default)]
+    from: Listing,
+}
+
+/// A media type by name, or `None` for a name that is no media type.
+fn known_media_type<'de, D: Deserializer<'de>>(d: D) -> Result<Option<MediaType>, D::Error> {
+    Ok(String::deserialize(d)?.parse().ok())
+}
+
+/// Whether a number is 1.
+fn one<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(u8::deserialize(d)? == 1)
 }
 
 impl ListQuery {
-    fn media_type(&self) -> Option<MediaType> {
-        self.kind.as_deref().and_then(|kind| kind.parse().ok())
-    }
-
     fn page(&self) -> usize {
         self.page.unwrap_or(1).clamp(1, MAX_PAGE)
     }
+}
 
-    fn partial(&self) -> bool {
-        self.partial == Some(1)
-    }
-
-    fn opened_from_date(&self) -> bool {
-        self.from.as_deref() == Some("date")
-    }
+/// The listings a file can be opened from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Listing {
+    /// A month, newest first.
+    Date,
+    /// A folder, in path order; also for any listing name the viewer does not know.
+    #[default]
+    #[serde(other)]
+    Folder,
 }
 
 /// The listing a page belongs to, so links into the viewer keep their context.
 #[derive(Clone, Copy)]
 struct Context {
-    from_date: bool,
+    listing: Listing,
     media_type: Option<MediaType>,
 }
 
@@ -72,7 +85,7 @@ impl Context {
         with_query(
             &file_url("view", library_id, path),
             &[
-                ("from", self.from_date.then_some("date")),
+                ("from", (self.listing == Listing::Date).then_some("date")),
                 ("type", self.media_type.map(MediaType::as_str)),
             ],
         )
@@ -123,6 +136,22 @@ fn with_query(base: &str, params: &[(&str, Option<&str>)]) -> String {
     }
 }
 
+/// `base` showing only `media_type`, if there is one.
+fn with_type(base: &str, media_type: Option<MediaType>) -> String {
+    with_query(base, &[("type", media_type.map(MediaType::as_str))])
+}
+
+/// The page after `page` of the listing at `here`.
+fn next_page(here: &str, media_type: Option<MediaType>, page: usize) -> String {
+    with_query(
+        here,
+        &[
+            ("type", media_type.map(MediaType::as_str)),
+            ("page", Some(&(page + 1).to_string())),
+        ],
+    )
+}
+
 /// The last part of a path.
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -166,7 +195,7 @@ fn layout(
                     @if let Some(here) = here {
                         nav.types {
                             @for (label, kind) in types {
-                                a href=(with_query(here, &[("type", kind.map(MediaType::as_str))]))
+                                a href=(with_type(here, kind))
                                     class=[(kind == media_type).then_some("active")] { (label) }
                             }
                         }
@@ -199,7 +228,8 @@ fn tile(library_id: i64, file: &FileRecord, context: Context) -> Markup {
 fn more(next: Option<String>) -> Markup {
     html! {
         @if let Some(next) = next {
-            a.more href=(next) hx-get=(format!("{}{}partial=1", next, if next.contains('?') { "&" } else { "?" }))
+            @let separator = if next.contains('?') { "&" } else { "?" };
+            a.more href=(next) hx-get=(format!("{next}{separator}partial=1"))
                 hx-trigger="revealed" hx-swap="outerHTML" { "Next page" }
         }
     }
@@ -207,7 +237,7 @@ fn more(next: Option<String>) -> Markup {
 
 /// Answer either the whole page or, for HTMX, only the items and the next-page link.
 fn respond(query: &ListQuery, items: Markup, page: impl FnOnce(Markup) -> Markup) -> Response {
-    if query.partial() {
+    if query.partial {
         Html(items.into_string()).into_response()
     } else {
         Html(page(items).into_string()).into_response()
@@ -231,7 +261,7 @@ pub async fn libraries(
     let libraries = state
         .query(super::super::catalog::Catalog::libraries)
         .await?;
-    let media_type = query.media_type();
+    let media_type = query.media_type;
     let content = html! {
         h1 { "Libraries" }
         @let shown: Vec<_> = libraries.iter().filter(|l| state.shows(l.id)).collect();
@@ -241,7 +271,7 @@ pub async fn libraries(
         ul.folders {
             @for library in shown {
                 li {
-                    a href=(with_query(&folder_url(library.id, ""), &[("type", media_type.map(MediaType::as_str))])) {
+                    a href=(with_type(&folder_url(library.id, ""), media_type)) {
                         (display_root(&library.root))
                     }
                     span.count { (library.files) " files" }
@@ -283,7 +313,7 @@ async fn folder_page(
     if !state.shows(library_id) {
         return Err(AppError::NotFound);
     }
-    let media_type = query.media_type();
+    let media_type = query.media_type;
     let page = query.page();
     let queried_dir = dir.clone();
     let (root, subfolders, mut files) = state
@@ -312,17 +342,9 @@ async fn folder_page(
     let here = folder_url(library_id, &dir);
     let has_more = files.len() > PAGE_SIZE;
     files.truncate(PAGE_SIZE);
-    let next = has_more.then(|| {
-        with_query(
-            &here,
-            &[
-                ("type", media_type.map(MediaType::as_str)),
-                ("page", Some(&(page + 1).to_string())),
-            ],
-        )
-    });
+    let next = has_more.then(|| next_page(&here, media_type, page));
     let context = Context {
-        from_date: false,
+        listing: Listing::Folder,
         media_type,
     };
     let items = html! {
@@ -336,38 +358,21 @@ async fn folder_page(
         String::from(file_name(&dir))
     };
     Ok(respond(&query, items, |items| {
-        let crumbs: Vec<(String, &str)> = if dir.is_empty() {
-            vec![]
-        } else {
-            dir.split('/')
-                .enumerate()
-                .map(|(i, part)| {
-                    let prefix: Vec<&str> = dir.split('/').take(i + 1).collect();
-                    (folder_url(library_id, &prefix.join("/")), part)
-                })
-                .collect()
-        };
         let content = html! {
-            nav.crumbs {
-                a href="/" { "Libraries" }
-                " / "
-                a href=(with_query(&folder_url(library_id, ""), &[("type", media_type.map(MediaType::as_str))])) {
-                    (display_root(&root))
-                }
-                @for (url, part) in &crumbs {
-                    " / "
-                    a href=(with_query(url, &[("type", media_type.map(MediaType::as_str))])) { (part) }
-                }
-            }
+            (crumbs(library_id, &root, &dir, media_type))
             @if !subfolders.is_empty() {
                 ul.folders {
-                    @for (name, count) in &subfolders {
-                        @let sub = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                    @for sub in &subfolders {
+                        @let path = if dir.is_empty() {
+                            sub.name.clone()
+                        } else {
+                            format!("{dir}/{}", sub.name)
+                        };
                         li {
-                            a href=(with_query(&folder_url(library_id, &sub), &[("type", media_type.map(MediaType::as_str))])) {
-                                (name)
+                            a href=(with_type(&folder_url(library_id, &path), media_type)) {
+                                (sub.name)
                             }
-                            span.count { (count) }
+                            span.count { (sub.files) }
                         }
                     }
                 }
@@ -381,23 +386,45 @@ async fn folder_page(
     }))
 }
 
+/// The links from the libraries to the folder `dir` of a library, one per folder on the way.
+fn crumbs(library_id: i64, root: &str, dir: &str, media_type: Option<MediaType>) -> Markup {
+    // Each folder on the way, as its path in the library and its name.
+    let folders: Vec<(&str, &str)> = if dir.is_empty() {
+        vec![]
+    } else {
+        let ends = dir.match_indices('/').map(|(end, _)| end);
+        let paths = ends.filter_map(|end| dir.get(..end)).chain([dir]);
+        paths.zip(dir.split('/')).collect()
+    };
+    html! {
+        nav.crumbs {
+            a href="/" { "Libraries" }
+            " / "
+            a href=(with_type(&folder_url(library_id, ""), media_type)) {
+                (display_root(root))
+            }
+            @for (path, name) in folders {
+                " / "
+                a href=(with_type(&folder_url(library_id, path), media_type)) { (name) }
+            }
+        }
+    }
+}
+
 /// `/dates`: the newest month.
 pub async fn dates_latest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
-    let media_type = query.media_type();
+    let media_type = query.media_type;
     let filter = Filter {
         libraries: state.libraries.clone(),
         media_type,
     };
     let months = state.query(move |catalog| catalog.months(&filter)).await?;
-    if let Some((month, _)) = months.first() {
-        Ok(Redirect::to(&with_query(
-            &format!("/dates/{month}"),
-            &[("type", media_type.map(MediaType::as_str))],
-        ))
-        .into_response())
+    if let Some(latest) = months.first() {
+        let url = with_type(&format!("/dates/{}", latest.name), media_type);
+        Ok(Redirect::to(&url).into_response())
     } else {
         let content = html! { h1 { "Dates" } p { "No files." } };
         Ok(
@@ -417,6 +444,33 @@ fn month_label(month: &str) -> Option<String> {
     Some(format!("{name} {year}"))
 }
 
+/// A year in the dates sidebar: its months, newest first, and the files in them.
+struct Year<'a> {
+    name: &'a str,
+    files: usize,
+    months: Vec<&'a Tally>,
+}
+
+/// The months, newest first, by year.
+fn years(months: &[Tally]) -> Vec<Year<'_>> {
+    let mut years: Vec<Year> = vec![];
+    for month in months {
+        let year = month.name.get(..4).unwrap_or(&month.name);
+        match years.last_mut() {
+            Some(last) if last.name == year => {
+                last.files += month.files;
+                last.months.push(month);
+            }
+            _ => years.push(Year {
+                name: year,
+                files: month.files,
+                months: vec![month],
+            }),
+        }
+    }
+    years
+}
+
 /// `/dates/{month}`: the files dated in a month, newest first, with all months alongside.
 pub async fn dates(
     State(state): State<Arc<AppState>>,
@@ -424,14 +478,14 @@ pub async fn dates(
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
     let label = month_label(&month).ok_or(AppError::NotFound)?;
-    let media_type = query.media_type();
+    let media_type = query.media_type;
     let page = query.page();
     let filter = Filter {
         libraries: state.libraries.clone(),
         media_type,
     };
     let queried_month = month.clone();
-    let partial = query.partial();
+    let partial = query.partial;
     let (months, mut files) = state
         .query(move |catalog| {
             // The sidebar and the month's count, for whole pages.
@@ -449,17 +503,9 @@ pub async fn dates(
     let here = format!("/dates/{month}");
     let has_more = files.len() > PAGE_SIZE;
     files.truncate(PAGE_SIZE);
-    let next = has_more.then(|| {
-        with_query(
-            &here,
-            &[
-                ("type", media_type.map(MediaType::as_str)),
-                ("page", Some(&(page + 1).to_string())),
-            ],
-        )
-    });
+    let next = has_more.then(|| next_page(&here, media_type, page));
     let context = Context {
-        from_date: true,
+        listing: Listing::Date,
         media_type,
     };
     let items = html! {
@@ -468,35 +514,23 @@ pub async fn dates(
     };
 
     Ok(respond(&query, items, |items| {
-        // Year, files in it, and its months with their file counts.
-        type Year<'a> = (&'a str, usize, Vec<(&'a str, usize)>);
-        let mut years: Vec<Year> = vec![];
-        for (m, count) in &months {
-            let year = m.get(..4).unwrap_or(m);
-            match years.last_mut() {
-                Some((y, total, list)) if *y == year => {
-                    *total += count;
-                    list.push((m, *count));
-                }
-                _ => years.push((year, *count, vec![(m, *count)])),
-            }
-        }
         let count = months
             .iter()
-            .find(|(m, _)| *m == month)
-            .map_or(0, |(_, n)| *n);
+            .find(|m| m.name == month)
+            .map_or(0, |m| m.files);
         let content = html! {
             div.dates {
                 aside.months {
-                    @for (year, total, list) in &years {
-                        h3 { (year) " " span.count { (total) } }
+                    @for year in years(&months) {
+                        h3 { (year.name) " " span.count { (year.files) } }
                         ul {
-                            @for (m, n) in list {
-                                li class=[(*m == month).then_some("active")] {
-                                    a href=(with_query(&format!("/dates/{}", urlencoding::encode(m)), &[("type", media_type.map(MediaType::as_str))])) {
-                                        (month_label(m).unwrap_or_else(|| String::from(*m)))
+                            @for m in year.months {
+                                li class=[(m.name == month).then_some("active")] {
+                                    @let url = format!("/dates/{}", urlencoding::encode(&m.name));
+                                    a href=(with_type(&url, media_type)) {
+                                        (month_label(&m.name).unwrap_or_else(|| m.name.clone()))
                                     }
-                                    " " span.count { (n) }
+                                    " " span.count { (m.files) }
                                 }
                             }
                         }
@@ -516,7 +550,7 @@ pub async fn dates(
 /// One duplicate group, copies side by side.
 fn dupe_group(group: &DupeGroup) -> Markup {
     let context = Context {
-        from_date: false,
+        listing: Listing::Folder,
         media_type: None,
     };
     html! {
@@ -524,7 +558,8 @@ fn dupe_group(group: &DupeGroup) -> Markup {
             h2 {
                 @match group.tier {
                     Tier::Exact => {
-                        (HumanBytes(group.files[0].size)) " x " (group.files.len()) " exact copies, "
+                        @if let Some(file) = group.files.first() { (HumanBytes(file.size)) }
+                        " x " (group.files.len()) " exact copies, "
                     }
                     Tier::SamePixels => { (group.files.len()) " images with the same pixels, " }
                     Tier::Similar => { (group.files.len()) " similar files, " }
@@ -536,12 +571,16 @@ fn dupe_group(group: &DupeGroup) -> Markup {
                 @for f in &group.files {
                     figure.copy.keep[f.role.is_keep()] {
                         a href=(context.view_url(f.library_id, &f.path)) {
-                            img loading="lazy" alt="" src=(thumb_url(f.library_id, &f.path, f.mtime_ns));
+                            img loading="lazy" alt=""
+                                src=(thumb_url(f.library_id, &f.path, f.mtime_ns));
                         }
                         figcaption {
                             @if f.role.is_keep() { span.badge.keep { "keep" } }
-                            @if let (Role::Copy(matches), true) = (f.role, group.tier != Tier::Exact) {
-                                span.badge.tier { (matches.as_str()) }
+                            // In an exact group every copy matches exactly; no need to say so.
+                            @if group.tier != Tier::Exact {
+                                @if let Role::Copy(matches) = f.role {
+                                    span.badge.tier { (matches.as_str()) }
+                                }
                             }
                             div.library { (f.library) }
                             div.path { (f.path) }
@@ -566,11 +605,10 @@ pub async fn dupes(
     let report = state.dupes(page == 1).await?;
     let start = (page - 1) * DUPE_PAGE_SIZE;
     let groups = report.groups.get(start..).unwrap_or_default();
-    let has_more = groups.len() > DUPE_PAGE_SIZE;
-    let groups = &groups[..groups.len().min(DUPE_PAGE_SIZE)];
-    let next = has_more.then(|| with_query("/dupes", &[("page", Some(&(page + 1).to_string()))]));
+    let next = (groups.len() > DUPE_PAGE_SIZE)
+        .then(|| with_query("/dupes", &[("page", Some(&(page + 1).to_string()))]));
     let items = html! {
-        @for group in groups { (dupe_group(group)) }
+        @for group in groups.iter().take(DUPE_PAGE_SIZE) { (dupe_group(group)) }
         (more(next))
     };
 
@@ -586,17 +624,17 @@ pub async fn dupes(
             }
             @if summary.unhashed_candidates > 0 {
                 p.note {
-                    (summary.unhashed_candidates) " files share their size with another file but are \
-                     not hashed yet, so there may be more duplicates. Scan their libraries again \
-                     to hash them."
+                    (summary.unhashed_candidates) " files share their size with another file but \
+                     are not hashed yet, so there may be more duplicates. Scan their libraries \
+                     again to hash them."
                 }
             }
             @if summary.unhashed_media > 0 {
                 p.note {
                     (summary.unhashed_media) " files have no image hash, video signature or audio \
                      fingerprint yet (not scanned since they changed, or no decoder: RAW, \
-                     HEIC/AVIF without ffmpeg 7.1, video without ffmpeg, audio without fpcalc), so \
-                     there may be more same-pixel or similar files."
+                     HEIC/AVIF without ffmpeg 7.1, video without ffmpeg, audio without fpcalc), \
+                     so there may be more same-pixel or similar files."
                 }
             }
             @if !state.similarity.images {
@@ -611,88 +649,116 @@ pub async fn dupes(
     }))
 }
 
+/// What the viewer shows around a file.
+struct Surroundings {
+    /// The files before and after it in the listing it was opened from.
+    neighbors: Neighbors,
+    /// When it was taken, or its mtime, as `YYYY-MM-DDTHH:MM:SS`.
+    date: Option<String>,
+    /// Every file with its contents, itself included, oldest first.
+    copies: Vec<HashedFile>,
+}
+
+impl Surroundings {
+    async fn of(
+        state: &Arc<AppState>,
+        library_id: i64,
+        file: &FileRecord,
+        context: Context,
+    ) -> Result<Self, AppError> {
+        let filter = Filter {
+            libraries: state.libraries.clone(),
+            media_type: context.media_type,
+        };
+        let path = file.path.clone();
+        let (size, sha256) = (file.stamp.size, file.sha256.clone());
+        let mut found = state
+            .query(move |catalog| {
+                let neighbors = match context.listing {
+                    Listing::Date => catalog.date_neighbors(&filter, library_id, &path)?,
+                    Listing::Folder => {
+                        catalog.folder_neighbors(library_id, &path, context.media_type)?
+                    }
+                };
+                let copies = match sha256 {
+                    Some(sha256) => catalog.copies(size, &sha256)?,
+                    None => vec![],
+                };
+                Ok(Self {
+                    neighbors,
+                    date: catalog.date(library_id, &path)?,
+                    copies,
+                })
+            })
+            .await?;
+        found
+            .copies
+            .sort_by(|a, b| (a.mtime_ns, &a.root, &a.path).cmp(&(b.mtime_ns, &b.root, &b.path)));
+        Ok(found)
+    }
+}
+
 /// `/view/{lib}/{*path}`: one file, full size, with its details and prev/next links.
-#[allow(clippy::too_many_lines, reason = "to be split into page parts")]
 pub async fn view(
     State(state): State<Arc<AppState>>,
     UrlPath((library_id, path)): UrlPath<(i64, String)>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
-    let located = state.locate(library_id, path.clone()).await?;
-    let file = located.file.clone();
-    let media_type = query.media_type();
-    let from_date = query.opened_from_date();
-    let filter = Filter {
-        libraries: state.libraries.clone(),
-        media_type,
+    let Located {
+        root,
+        full_path,
+        file,
+    } = state.locate(library_id, path).await?;
+    let context = Context {
+        listing: query.from,
+        media_type: query.media_type,
     };
-    let hashed = file.sha256.clone().map(|sha256| (file.stamp.size, sha256));
-    let (prev, next, date, mut copies) = state
-        .query(move |catalog| {
-            let (prev, next) = if from_date {
-                catalog.date_neighbors(&filter, library_id, &path)?
-            } else {
-                let (prev, next) = catalog.folder_neighbors(library_id, &path, media_type)?;
-                let at = |path| FileRef { library_id, path };
-                (prev.map(at), next.map(at))
-            };
-            let date = catalog.date(library_id, &path)?;
-            let copies = match hashed {
-                Some((size, sha256)) => catalog.copies(size, &sha256)?,
-                None => vec![],
-            };
-            Ok((prev, next, date, copies))
-        })
-        .await?;
-    copies.sort_by(|a, b| (a.mtime_ns, &a.root, &a.path).cmp(&(b.mtime_ns, &b.root, &b.path)));
-
+    let around = Surroundings::of(&state, library_id, &file, context).await?;
     let codec = match (&state.ffprobe, file.media_type) {
-        (Some(ffprobe), MediaType::Video) => {
-            state.thumbs.video_codec(ffprobe, &located.full_path).await
-        }
+        (Some(ffprobe), MediaType::Video) => state.thumbs.video_codec(ffprobe, &full_path).await,
         _ => None,
     };
-
-    let dubious_date = file
-        .meta
-        .taken()
-        .is_some_and(|taken| !taken.is_plausible(OffsetDateTime::now_utc()));
-
-    let context = Context {
-        from_date,
-        media_type,
-    };
-    let media_url = file_url("media", library_id, &file.path);
+    let codec = codec.as_deref();
     let content = html! {
+        (pager(&file.path, &around.neighbors, context))
+        (stage(library_id, &file, codec))
+        (details(&file, &root, around.date.as_deref(), codec))
+        (copies_list(library_id, &file.path, &around.copies, context))
+        p { a href=(file_url("media", library_id, &file.path)) { "Open original" } }
+    };
+    Ok(Html(layout(file_name(&file.path), None, None, &content).into_string()).into_response())
+}
+
+/// The links to the previous and next file, around the file's path.
+fn pager(path: &str, neighbors: &Neighbors, context: Context) -> Markup {
+    html! {
         nav.pager {
-            @if let Some(p) = &prev {
+            @if let Some(p) = &neighbors.prev {
                 a rel="prev" href=(context.view_url(p.library_id, &p.path)) { "< Prev" }
             } @else { span {} }
-            span.path { (file.path) }
-            @if let Some(n) = &next {
+            span.path { (path) }
+            @if let Some(n) = &neighbors.next {
                 a rel="next" href=(context.view_url(n.library_id, &n.path)) { "Next >" }
             } @else { span {} }
         }
+    }
+}
+
+/// The file itself: an image, or a player.
+fn stage(library_id: i64, file: &FileRecord, codec: Option<&str>) -> Markup {
+    let media_url = file_url("media", library_id, &file.path);
+    html! {
         div.stage {
             @match file.media_type {
                 MediaType::Image => {
-                    @let src = match thumbs::view_source(&file) {
-                        ViewSource::Original => media_url.clone(),
-                        ViewSource::Preview => format!(
-                            "{}?v={}",
-                            file_url("preview", library_id, &file.path),
-                            file.stamp.mtime_ns
-                        ),
-                        ViewSource::Placeholder => thumb_url(library_id, &file.path, file.stamp.mtime_ns),
-                    };
-                    img src=(src) alt=(file_name(&file.path));
+                    img src=(image_source(library_id, file)) alt=(file_name(&file.path));
                 }
                 MediaType::Video => {
                     video controls preload="metadata" src=(media_url)
                         poster=(thumb_url(library_id, &file.path, file.stamp.mtime_ns)) {}
                     p.unplayable hidden {
                         "This browser cannot play this video"
-                        @if let Some(codec) = &codec { " (" (codec) ")" }
+                        @if let Some(codec) = codec { " (" (codec) ")" }
                         ". Open the original to play it in another program."
                     }
                 }
@@ -701,8 +767,31 @@ pub async fn view(
                 }
             }
         }
+    }
+}
+
+/// What the viewer shows of an image: the original, a preview, or the placeholder.
+fn image_source(library_id: i64, file: &FileRecord) -> String {
+    match thumbs::view_source(file) {
+        ViewSource::Original => file_url("media", library_id, &file.path),
+        ViewSource::Preview => format!(
+            "{}?v={}",
+            file_url("preview", library_id, &file.path),
+            file.stamp.mtime_ns
+        ),
+        ViewSource::Placeholder => thumb_url(library_id, &file.path, file.stamp.mtime_ns),
+    }
+}
+
+/// What the catalog knows about the file in the library at `root`.
+fn details(file: &FileRecord, root: &str, date: Option<&str>, codec: Option<&str>) -> Markup {
+    let dubious_date = file
+        .meta
+        .taken()
+        .is_some_and(|taken| !taken.is_plausible(OffsetDateTime::now_utc()));
+    html! {
         dl.details {
-            @if let Some(date) = &date {
+            @if let Some(date) = date {
                 dt { @if file.meta.taken_at.is_some() { "Taken" } @else { "Modified" } }
                 dd {
                     (date.replacen('T', " ", 1))
@@ -716,17 +805,23 @@ pub async fn view(
                 dt { "Dimensions" } dd { (w) " x " (h) }
             }
             dt { "Size" } dd { (HumanBytes(file.stamp.size)) }
-            @if let Some(codec) = &codec { dt { "Codec" } dd { (codec) } }
-            dt { "Library" } dd { (display_root(&located.root)) }
+            @if let Some(codec) = codec { dt { "Codec" } dd { (codec) } }
+            dt { "Library" } dd { (display_root(root)) }
             dt { "Path" } dd { (file.path) }
             @if let Some(sha256) = &file.sha256 { dt { "SHA-256" } dd.hash { (sha256) } }
         }
+    }
+}
+
+/// The file's identical copies, oldest (the one `dupes` keeps) first, if it has any.
+fn copies_list(library_id: i64, path: &str, copies: &[HashedFile], context: Context) -> Markup {
+    html! {
         @if copies.len() > 1 {
             h2 { "Identical copies" }
             ul.copies-list {
                 @for (i, copy) in copies.iter().enumerate() {
                     li {
-                        @if copy.library_id == library_id && copy.path == file.path {
+                        @if copy.library_id == library_id && copy.path == path {
                             "This file"
                         } @else {
                             a href=(context.view_url(copy.library_id, &copy.path)) {
@@ -738,9 +833,7 @@ pub async fn view(
                 }
             }
         }
-        p { a href=(media_url) { "Open original" } }
-    };
-    Ok(Html(layout(file_name(&file.path), None, None, &content).into_string()).into_response())
+    }
 }
 
 #[cfg(test)]

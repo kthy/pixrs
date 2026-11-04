@@ -2576,10 +2576,11 @@ mod tests {
             let intent = r#"{"event":"intent","index":0,"from":"a","to":"b","size":1}"#;
             fs::write(&path, format!("{start}\n{intent}\n")).unwrap();
             let error = undo(&path).unwrap_err();
-            assert!(
-                matches!(&error, Error::Journal(JournalError::Version { found: f, .. }) if *f == found),
-                "{error}"
-            );
+            let version = match &error {
+                Error::Journal(JournalError::Version { found, .. }) => Some(*found),
+                _ => None,
+            };
+            assert_eq!(version, Some(found), "{error}");
             assert_eq!(error.exit_code(), exitcode::DATAERR);
         }
         fs::write(&path, "{\"event\":\"done\",\"index\":0}\n").unwrap();

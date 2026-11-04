@@ -22,11 +22,11 @@
 use clap::{CommandFactory, Parser};
 use indicatif::{HumanCount, HumanDuration};
 use log::{debug, error};
-use pixrs::catalog::{cataloged_spelling, Catalog};
+use pixrs::catalog::{cataloged_spelling, Catalog, Library, LibraryRoot};
 use pixrs::dupes::{
-    find_dupes, plural, write_csv, write_json, write_text, DupeReport, Role, Similarity, Tier,
+    find_dupes, plural, write_csv, write_json, write_text, DupeReport, Role, Tier,
 };
-use pixrs::error::Error;
+use pixrs::error::{utf8, Error};
 use pixrs::plan::{
     outside_libraries, plan_organize, plan_quarantine, read_plan, write_plan, write_summary,
     OrganizeOptions,
@@ -102,11 +102,6 @@ const fn context(command: &Command) -> &'static str {
     }
 }
 
-/// The catalog path given on the command line, or the default one.
-fn catalog_path(given: Option<PathBuf>) -> Result<PathBuf, Error> {
-    given.or_else(Catalog::default_path).ok_or(Error::NoDataDir)
-}
-
 /// Print an error and exit with its exit code. The message can quote names from a library.
 fn fail(context: &str, e: &Error) -> ! {
     debug!("{e:?}");
@@ -117,46 +112,64 @@ fn fail(context: &str, e: &Error) -> ! {
 /// The catalog IDs of the given libraries, which must have been scanned.
 fn library_ids(catalog: &Catalog, libraries: &[PathBuf]) -> Result<Vec<i64>, Error> {
     let known = catalog.libraries()?;
-    let mut ids: Vec<i64> = vec![];
-    for library in libraries {
-        // Canonical, and spelled as the catalog spells it on a case-insensitive file system.
-        let path = library
-            .canonicalize()
-            .ok()
-            .map(|path| cataloged_spelling(&known, &path));
-        let root = path.as_deref().and_then(|p| p.to_str().map(String::from));
-        let id = root
-            .map(|root| catalog.find_library(&root))
-            .transpose()?
-            .flatten();
-        if let Some(id) = id {
-            ids.push(id);
-        } else {
-            let containing = path
-                .as_deref()
-                .and_then(|path| catalog.containing_library(path).ok().flatten());
-            if let Some(containing) = containing {
-                return Err(Error::PartOfLibrary {
-                    path: library.clone(),
-                    root: containing.root,
-                });
-            }
-            return Err(Error::NotScanned(library.clone()));
+    libraries
+        .iter()
+        .map(|library| cataloged_library(catalog, &known, library).map(|found| found.id))
+        .collect()
+}
+
+/// The library at the folder `library`, which must have been scanned, with its root as the
+/// catalog spells it. `known` are the cataloged libraries.
+fn cataloged_library(
+    catalog: &Catalog,
+    known: &[Library],
+    library: &Path,
+) -> Result<LibraryRoot, Error> {
+    let not_scanned = || Error::NotScanned(library.to_path_buf());
+    let path = match library.canonicalize() {
+        Ok(path) => path,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Err(not_scanned());
+        }
+        Err(source) => {
+            return Err(Error::File {
+                path: library.to_path_buf(),
+                source,
+            })
+        }
+    };
+    // Spelled as the catalog spells it on a case-insensitive file system.
+    let path = cataloged_spelling(known, &path);
+    if let Some(root) = path.to_str() {
+        if let Some(id) = catalog.find_library(root)? {
+            return Ok(LibraryRoot {
+                id,
+                root: String::from(root),
+            });
         }
     }
-    Ok(ids)
+    if let Some(containing) = catalog.containing_library(&path)? {
+        return Err(Error::PartOfLibrary {
+            path: library.to_path_buf(),
+            root: containing.root,
+        });
+    }
+    // The catalog holds only roots that are valid UTF-8.
+    utf8(&path, "Library")?;
+    Err(not_scanned())
 }
 
 /// Report exact duplicates in the catalog.
 fn dupes(opt: DupesOpt) -> Result<(), Error> {
-    let catalog_path = catalog_path(opt.catalog)?;
+    let catalog_path = opt.catalog.path_or_default()?;
     let catalog = Catalog::open_existing(&catalog_path)?;
     let libraries = library_ids(&catalog, &opt.libraries)?;
-    let similarity = Similarity {
-        threshold: opt.threshold,
-        images: opt.similar,
-    };
-    let report = find_dupes(&catalog, &libraries, similarity)?;
+    let report = find_dupes(&catalog, &libraries, opt.similarity.into())?;
     if let Some(dir) = &opt.quarantine {
         return quarantine(&catalog, &catalog_path, &report, &libraries, dir);
     }
@@ -212,10 +225,9 @@ fn quarantine(
 
 /// Plan how to organize a library and print the plan.
 fn organize(opt: OrganizeOpt) -> Result<(), Error> {
-    let catalog_path = catalog_path(opt.catalog)?;
+    let catalog_path = opt.catalog.path_or_default()?;
     let catalog = Catalog::open_existing(&catalog_path)?;
-    let library_id = library_ids(&catalog, std::slice::from_ref(&opt.library))?[0];
-    let root = opt.library.canonicalize()?;
+    let library = cataloged_library(&catalog, &catalog.libraries()?, &opt.library)?;
     let template = match (&opt.template, &opt.layout) {
         (Some(template), _) => Template::parse(template),
         (None, Some(layout)) => Template::from_layout(layout),
@@ -232,7 +244,8 @@ fn organize(opt: OrganizeOpt) -> Result<(), Error> {
         prune_empty: opt.prune_empty,
         now,
     };
-    let (plan, notes) = plan_organize(&catalog, &catalog_path, library_id, &root, &opts)?;
+    let root = PathBuf::from(library.root);
+    let (plan, notes) = plan_organize(&catalog, &catalog_path, library.id, &root, &opts)?;
     let path = write_plan(&plan, now)?;
     write_summary(&plan, &notes, &path, &mut io::stdout().lock())?;
     Ok(())
@@ -246,7 +259,7 @@ fn apply(opt: &ApplyOpt) -> Result<(), Error> {
             eprintln!(
                 "Stopped before the plan was done. To reverse what was done, run:\n  pixrs \
                  undo \"{}\"",
-                journal.display()
+                shown(journal)
             );
         }
         e.error
@@ -268,8 +281,8 @@ fn apply(opt: &ApplyOpt) -> Result<(), Error> {
     );
     println!(
         "Journal: {}\nTo reverse it, run:\n  pixrs undo \"{}\"",
-        summary.journal.display(),
-        summary.journal.display()
+        shown(&summary.journal),
+        shown(&summary.journal)
     );
     Ok(())
 }
@@ -290,48 +303,44 @@ fn undo(opt: &UndoOpt) -> Result<(), Error> {
 
 /// Point a library at the folder it was moved to and print a summary.
 fn relocate(opt: RelocateOpt) -> Result<(), Error> {
-    let catalog = catalog_path(opt.catalog)?;
+    let catalog = opt.catalog.path_or_default()?;
     let s = pixrs::relocate::relocate(&catalog, &opt.old, &opt.new, opt.force)?;
     println!(
         "{} of {} files compared are at {} unchanged.",
         s.matching,
         s.compared,
-        opt.new.display()
+        shown(&opt.new)
     );
-    for root in &s.folded {
-        println!("Folded the library {root} into this one, with its hashes.");
-    }
+    print_folded(&s.folded);
     println!(
         "The catalog lists the {} {} in the library {} now. Scan it to pick up any changes.",
-        HumanCount(s.files as u64),
+        HumanCount(u64::try_from(s.files).unwrap_or(u64::MAX)),
         plural(s.files, "file", "files"),
-        s.library
+        printable(&s.library)
     );
     Ok(())
 }
 
 /// Scan a media library into the catalog and print a summary.
 fn scan(opt: ScanOpt, now: Instant) -> Result<(), Error> {
-    let catalog = catalog_path(opt.catalog)?;
+    let catalog = opt.catalog.path_or_default()?;
     let options = ScanOptions {
         quiet: opt.quiet,
         allow_empty: opt.allow_empty,
     };
     let s = pixrs::scan::scan(&opt.library, &catalog, options)?;
-    for root in &s.folded {
-        println!("Folded the library {root} into this one, with its hashes.");
-    }
+    print_folded(&s.folded);
     if let Some(root) = &s.part_of {
         println!(
             "{} is part of the library {}; scanned only that part.",
-            opt.library.display(),
-            root
+            shown(&opt.library),
+            printable(root)
         );
     }
     println!(
         "Scanned {} in {}: {} added, {} updated, {} removed, {} unchanged, {} hashed, \
          {} decoded, {} skipped",
-        opt.library.display(),
+        shown(&opt.library),
         HumanDuration(now.elapsed()),
         s.added,
         s.updated,
@@ -364,13 +373,23 @@ fn scan(opt: ScanOpt, now: Instant) -> Result<(), Error> {
             s.media_without_decoder
         );
     }
-    println!("Catalog: {}", catalog.display());
+    println!("Catalog: {}", shown(&catalog));
     Ok(())
+}
+
+/// Report the libraries a scan or relocation folded into the one it worked on.
+fn print_folded(roots: &[String]) {
+    for root in roots {
+        println!(
+            "Folded the library {} into this one, with its hashes.",
+            printable(root)
+        );
+    }
 }
 
 /// Browse the catalog in the local viewer until stopped.
 fn serve(opt: ServeOpt) -> Result<(), Error> {
-    let catalog_path = catalog_path(opt.catalog)?;
+    let catalog_path = opt.catalog.path_or_default()?;
     let catalog = Catalog::open_existing(&catalog_path)?;
     let libraries = library_ids(&catalog, &opt.libraries)?;
     let cache_dir = opt.cache.or_else(default_cache_dir);
@@ -382,10 +401,7 @@ fn serve(opt: ServeOpt) -> Result<(), Error> {
         libraries,
         cache_dir,
         port: opt.port,
-        similarity: Similarity {
-            threshold: opt.threshold,
-            images: opt.similar,
-        },
+        similarity: opt.similarity.into(),
     };
     let ready = |url: &str| {
         println!("Serving the catalog at {url}");
@@ -408,4 +424,43 @@ fn set_ctrlc_handler() {
         exit(pixrs::error::INTERRUPTED);
     })
     .expect("Error setting Ctrl-C handler");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_cataloged_library_is_spelled_as_cataloged() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("lib");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+        let id = catalog.library_id(root.to_str().unwrap()).unwrap();
+        let known = catalog.libraries().unwrap();
+        let find = |path: &Path| cataloged_library(&catalog, &known, path);
+
+        let found = find(&root.join("sub").join("..")).unwrap();
+        assert_eq!(
+            found,
+            LibraryRoot {
+                id,
+                root: String::from(root.to_str().unwrap())
+            }
+        );
+        assert!(matches!(
+            find(&root.join("sub")),
+            Err(Error::PartOfLibrary { root: r, .. }) if r == found.root
+        ));
+        assert!(matches!(
+            find(&dir.path().join("missing")),
+            Err(Error::NotScanned(_))
+        ));
+        assert!(matches!(find(dir.path()), Err(Error::NotScanned(_))));
+    }
 }
