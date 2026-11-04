@@ -8,9 +8,9 @@
 mod pages;
 mod thumbs;
 
-use crate::catalog::{library_path, Catalog, FileRecord};
+use crate::catalog::{library_path, within, Catalog, FileRecord};
 use crate::dupes::{group_dupes, load_dupes, DupeReport, Similarity};
-use crate::error::Error;
+use crate::error::{AtPath, Error};
 use crate::scan::resolve;
 use crate::text::printable;
 use axum::body::Body;
@@ -279,9 +279,9 @@ fn allowed_hosts(port: u16) -> Vec<String> {
 /// Refuse a thumbnail cache inside any cataloged library, shown or not: writing there would
 /// modify the library, and the next scan would catalog the thumbnails.
 fn check_cache_outside_libraries(catalog: &Catalog, cache_dir: &Path) -> Result<(), Error> {
-    let cache_dir = resolve(cache_dir)?;
+    let cache_dir = resolve(cache_dir).at(cache_dir)?;
     for library in catalog.libraries()? {
-        if cache_dir.starts_with(&library.root) {
+        if within(&cache_dir, Path::new(&library.root)) {
             return Err(Error::CacheInLibrary {
                 cache: cache_dir,
                 library: library.root,

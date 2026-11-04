@@ -434,14 +434,43 @@ pub async fn dates_latest(
     }
 }
 
-/// `YYYY-MM` as `May 2024`, or `None` if it is not a month.
-fn month_label(month: &str) -> Option<String> {
-    let (year, number) = month.split_once('-')?;
-    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) || number.len() != 2 {
-        return None;
+/// A month of the dates listing, written `YYYY-MM` in URLs and the catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct YearMonth {
+    year: u16,
+    month: Month,
+}
+
+impl YearMonth {
+    /// `YYYY-MM`, or `None` if `text` is not a month.
+    fn parse(text: &str) -> Option<Self> {
+        let digits =
+            |part: &str, len| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+        let (year, month) = text.split_once('-')?;
+        if !digits(year, 4) || !digits(month, 2) {
+            return None;
+        }
+        Some(Self {
+            year: year.parse().ok()?,
+            month: Month::try_from(month.parse::<u8>().ok()?).ok()?,
+        })
     }
-    let name = Month::try_from(number.parse::<u8>().ok()?).ok()?;
-    Some(format!("{name} {year}"))
+
+    /// The month as people read it, like `May 2024`.
+    fn label(self) -> String {
+        format!("{} {}", self.month, self.year)
+    }
+}
+
+impl std::fmt::Display for YearMonth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04}-{:02}", self.year, u8::from(self.month))
+    }
+}
+
+/// A catalog month name like `2024-05` as people read it, or as it is if it is not a month.
+fn month_label(name: &str) -> String {
+    YearMonth::parse(name).map_or_else(|| String::from(name), YearMonth::label)
 }
 
 /// A year in the dates sidebar: its months, newest first, and the files in them.
@@ -477,7 +506,8 @@ pub async fn dates(
     UrlPath(month): UrlPath<String>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
-    let label = month_label(&month).ok_or(AppError::NotFound)?;
+    let shown = YearMonth::parse(&month).ok_or(AppError::NotFound)?;
+    let (month, label) = (shown.to_string(), shown.label());
     let media_type = query.media_type;
     let page = query.page();
     let filter = Filter {
@@ -528,7 +558,7 @@ pub async fn dates(
                                 li class=[(m.name == month).then_some("active")] {
                                     @let url = format!("/dates/{}", urlencoding::encode(&m.name));
                                     a href=(with_type(&url, media_type)) {
-                                        (month_label(&m.name).unwrap_or_else(|| m.name.clone()))
+                                        (month_label(&m.name))
                                     }
                                     " " span.count { (m.files) }
                                 }
@@ -856,8 +886,9 @@ mod tests {
     }
 
     #[test]
-    fn test_month_label() {
-        assert_eq!(month_label("2024-05").as_deref(), Some("May 2024"));
+    fn test_year_month() {
+        let label = |text: &str| YearMonth::parse(text).map(YearMonth::label);
+        assert_eq!(label("2024-05").as_deref(), Some("May 2024"));
         let names = [
             "January",
             "February",
@@ -873,11 +904,17 @@ mod tests {
             "December",
         ];
         for (number, name) in (1..=12).zip(names) {
-            let label = month_label(&format!("1999-{number:02}"));
-            assert_eq!(label, Some(format!("{name} 1999")));
+            assert_eq!(
+                label(&format!("1999-{number:02}")),
+                Some(format!("{name} 1999"))
+            );
         }
-        assert_eq!(month_label("2024-13"), None);
-        assert_eq!(month_label("2024-00"), None);
-        assert_eq!(month_label("../etc"), None);
+        for bad in [
+            "2024-13", "2024-00", "../etc", "2024-+5", "+024-05", "2024-5", "2024-005",
+        ] {
+            assert_eq!(YearMonth::parse(bad), None, "{bad}");
+        }
+        assert_eq!(YearMonth::parse("0999-01").unwrap().to_string(), "0999-01");
+        assert_eq!(month_label("unknown"), "unknown");
     }
 }

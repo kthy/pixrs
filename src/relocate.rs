@@ -7,9 +7,9 @@
 
 use crate::apply::Lock;
 use crate::catalog::{display_root, library_path, Catalog, Library};
-use crate::error::{utf8, Error};
+use crate::error::{utf8, AtPath, Error};
 use crate::names::{nfc, respelled_path};
-use crate::scan::{progress_bar, resolve, stamp, Unit};
+use crate::scan::{canonical, progress_bar, resolve, stamp, Unit};
 use same_file::is_same_file;
 use std::fs;
 use std::path::{absolute, Path, PathBuf};
@@ -55,7 +55,7 @@ pub fn relocate(
     new: &Path,
     force: bool,
 ) -> Result<RelocateSummary, Error> {
-    let catalog_path = resolve(catalog_path)?;
+    let catalog_path = resolve(catalog_path).at(catalog_path)?;
     if !catalog_path.is_file() {
         return Err(Error::NoCatalog(catalog_path));
     }
@@ -64,9 +64,7 @@ pub fn relocate(
     let libraries = catalog.libraries()?;
     let library = find(&libraries, old)?;
 
-    let new = new
-        .canonicalize()
-        .ok()
+    let new = canonical(new)?
         .filter(|new| new.is_dir())
         .ok_or_else(|| Error::NotADirectory(new.to_path_buf()))?;
     let new_str = utf8(&new, "Folder")?;

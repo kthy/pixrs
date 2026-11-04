@@ -10,7 +10,7 @@ use crate::avhash::{
     Frame, VideoSignature,
 };
 use crate::dates::{from_taken_at, Taken};
-use crate::error::Error;
+use crate::error::{AtPath, Error};
 use crate::imagehash::{ImageHashes, Visual};
 use crate::media::{Dimensions, MediaType};
 use crate::names::folded;
@@ -163,7 +163,7 @@ impl Catalog {
     /// Open the catalog at `path`, creating it if it does not exist.
     pub fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
-            create_dir_all(parent)?;
+            create_dir_all(parent).at(parent)?;
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -1260,6 +1260,16 @@ const MOVED_COLUMNS: &str = "size, mtime_ns, media_type, sha256, taken_at, camer
      camera_model, width, height, hash_version, pixel_hash, phash, fingerprint, duration_ms, \
      frames, chromaprint";
 
+/// Whether `path` is `folder` or inside it, by spelling or, where a file system ignores letter
+/// case or Unicode normalization, by file identity of `path` or a folder on its way. Parts of
+/// `path` that do not exist yet are compared by spelling only.
+pub fn within(path: &Path, folder: &Path) -> bool {
+    path.starts_with(folder)
+        || path
+            .ancestors()
+            .any(|ancestor| is_same_file(ancestor, folder).unwrap_or(false))
+}
+
 /// The path from `outer` to `inner` with `/` separators and a trailing `/` if `inner` is inside
 /// `outer`, or empty if they are the same folder: by spelling, or else by file identity when
 /// both exist. On a file system that ignores letter case (or Unicode normalization, as macOS
@@ -1553,6 +1563,25 @@ mod tests {
             media_type: MediaType::Image,
             sha256: None,
             meta: MediaMeta::default(),
+        }
+    }
+
+    #[test]
+    fn test_within() {
+        let dir = tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        assert!(within(&lib, &lib));
+        assert!(within(&lib.join("not/yet"), &lib));
+        assert!(!within(dir.path(), &lib));
+        assert!(!within(&dir.path().join("library"), &lib));
+        // Another spelling of the folder, as a case-insensitive file system has: by identity.
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("LIB");
+            std::os::unix::fs::symlink(&lib, &alias).unwrap();
+            assert!(within(&alias.join("thumbs"), &lib));
+            assert!(within(&lib, &alias));
         }
     }
 

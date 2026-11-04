@@ -1009,7 +1009,14 @@ impl Run<'_> {
             Ok(()) => {}
             Err(MoveError::Taken) => return self.skip(index, m, Skip::Taken(m.to.clone())),
             Err(MoveError::Failed(e)) => return self.skip(index, m, Skip::Failed(e)),
-            Err(MoveError::Partial(e)) => return Err(e.into()),
+            Err(MoveError::Partial(MoveFault::Stopped)) => return Err(Error::Interrupted),
+            Err(MoveError::Partial(fault)) => {
+                return Err(Error::Move {
+                    from: m.from.clone(),
+                    to: m.to.clone(),
+                    fault: Box::new(fault),
+                })
+            }
         }
         self.journal.write(&Record::Done { index })?;
         debug!("Move {}: {} -> {}", index, shown(&m.from), shown(&m.to));
