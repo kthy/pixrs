@@ -9,6 +9,7 @@
 use crate::decode::{ffmpeg_input_options, file_url, major_minor, run_with_timeout, DecodeError};
 use crate::imagehash::{distance, perceptual_hash, HASH_VERSION};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -77,21 +78,13 @@ pub fn frames_to_bytes(frames: &[Frame]) -> Vec<u8> {
 
 /// Frames from `frames_to_bytes`, or `None` if the bytes are not a whole number of frames.
 pub fn frames_from_bytes(bytes: &[u8]) -> Option<Vec<Frame>> {
-    if !bytes.len().is_multiple_of(FRAME_BYTES) {
+    let (frames, []) = bytes.as_chunks::<FRAME_BYTES>() else {
         return None;
-    }
+    };
     Some(
-        bytes
-            .as_chunks::<FRAME_BYTES>()
-            .0
+        frames
             .iter()
-            .map(|chunk| {
-                (chunk[0] == 1).then(|| {
-                    let mut hash = [0u8; 8];
-                    hash.copy_from_slice(&chunk[1..9]);
-                    u64::from_le_bytes(hash)
-                })
-            })
+            .map(|&[flag, hash @ ..]| (flag == 1).then(|| u64::from_le_bytes(hash)))
             .collect(),
     )
 }
@@ -101,14 +94,13 @@ pub fn values_to_bytes(values: &[u32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-/// Fingerprint values from `values_to_bytes`.
-pub fn values_from_bytes(bytes: &[u8]) -> Vec<u32> {
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&c| u32::from_le_bytes(c))
-        .collect()
+/// Fingerprint values from `values_to_bytes`, or `None` if the bytes are not a whole number of
+/// values.
+pub fn values_from_bytes(bytes: &[u8]) -> Option<Vec<u32>> {
+    let (values, []) = bytes.as_chunks::<4>() else {
+        return None;
+    };
+    Some(values.iter().map(|&c| u32::from_le_bytes(c)).collect())
 }
 
 /// The version a video is hashed with: the signature and image hash definitions (frames are
@@ -139,18 +131,58 @@ pub fn fpcalc_version(fpcalc: &Path) -> String {
         .ok()
         .and_then(|out| {
             // "fpcalc version 1.5.1"
-            let out = String::from_utf8_lossy(&out).into_owned();
+            let out = String::from_utf8_lossy(&out);
             out.split_whitespace().nth(2).map(major_minor)
         })
         .unwrap_or_else(|| String::from("unknown"))
 }
 
-/// When a video's picture starts and how long it lasts, in seconds, from `ffprobe`: the video
-/// stream's own start and duration, which a copy without the audio track (or with a shorter
-/// one) shares, falling back to the container's when the stream does not say. The start is
-/// relative to the container's start, as `ffmpeg -ss` expects: camcorder MTS files start at
-/// several seconds or more.
-fn video_span(ffprobe: &Path, source: &Path) -> Result<(f64, f64), DecodeError> {
+/// What `ffprobe -of json` prints for the entries `video_span` asks for. Times are strings of
+/// seconds.
+#[derive(Deserialize)]
+struct Probe {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    #[serde(default)]
+    format: ProbeTimes,
+}
+
+/// A stream's start and duration, and its tags.
+#[derive(Deserialize)]
+struct ProbeStream {
+    #[serde(flatten)]
+    times: ProbeTimes,
+    /// Sorted by key, so the first duration tag found does not depend on the order.
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+}
+
+/// A start and duration in seconds, as `ffprobe` prints them.
+#[derive(Default, Deserialize)]
+struct ProbeTimes {
+    start_time: Option<String>,
+    duration: Option<String>,
+}
+
+/// A number of seconds, if it is one and finite.
+fn seconds(value: Option<&String>) -> Option<f64> {
+    value?.parse::<f64>().ok().filter(|x| x.is_finite())
+}
+
+/// Where a video's picture is, in seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Span {
+    /// After the container's start.
+    start: f64,
+    duration: f64,
+}
+
+/// When a video's picture starts and how long it lasts, from `ffprobe`: the video stream's own
+/// start and duration, which a copy without the audio track (or with a shorter one) shares,
+/// falling back to the container's when the stream does not say. The start is relative to the
+/// container's start, as `ffmpeg -ss` expects: camcorder MTS files start at several seconds or
+/// more.
+fn video_span(ffprobe: &Path, source: &Path) -> Result<Span, DecodeError> {
     let mut command = Command::new(ffprobe);
     command
         .args([
@@ -168,44 +200,43 @@ fn video_span(ffprobe: &Path, source: &Path) -> Result<(f64, f64), DecodeError> 
         ])
         .args(["-of", "json"])
         .arg(file_url(source));
-    let out = run_with_timeout(command)?;
-    let json: serde_json::Value = serde_json::from_slice(&out)?;
-    let number = |v: &serde_json::Value, key: &str| {
-        v.get(key)
-            .and_then(|x| x.as_str())
-            .and_then(|x| x.parse::<f64>().ok())
-            .filter(|x| x.is_finite())
-    };
-    let stream = &json["streams"][0];
-    let format = &json["format"];
+    span_from_probe(&run_with_timeout(command)?)
+}
+
+/// The span `video_span` reads from `ffprobe`'s JSON.
+fn span_from_probe(json: &[u8]) -> Result<Span, DecodeError> {
+    let probe: Probe = serde_json::from_slice(json)?;
+    let stream = probe.streams.first();
+    let format = &probe.format;
     // Matroska and WebM keep a stream's duration only in a tag, `DURATION` or with a language,
     // like `DURATION-eng`.
     let tagged = || {
-        let tags = stream["tags"].as_object()?;
-        tags.iter()
+        stream?
+            .tags
+            .iter()
             .find(|(key, _)| {
                 let key = key.to_ascii_uppercase();
                 key == "DURATION" || key.starts_with("DURATION-")
             })
-            .and_then(|(_, value)| value.as_str())
-            .and_then(parse_clock)
+            .and_then(|(_, value)| parse_clock(value))
     };
-    let duration = number(stream, "duration")
+    let duration = seconds(stream.and_then(|s| s.times.duration.as_ref()))
         .filter(|d| *d > 0.0)
         .or_else(tagged)
         .filter(|d| *d > 0.0)
-        .or_else(|| number(format, "duration"))
+        .or_else(|| seconds(format.duration.as_ref()))
         .filter(|d| *d > 0.0)
         .ok_or(DecodeError::NoDuration)?;
-    let start = match (number(stream, "start_time"), number(format, "start_time")) {
+    let stream_start = seconds(stream.and_then(|s| s.times.start_time.as_ref()));
+    let start = match (stream_start, seconds(format.start_time.as_ref())) {
         (Some(stream), Some(format)) => (stream - format).max(0.0),
         _ => 0.0,
     };
-    Ok((start, duration))
+    Ok(Span { start, duration })
 }
 
 /// Seconds from a clock time like `01:02:03.500000000`.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "a fused multiply-add rounds differently, which would change the durations read"
 )]
@@ -235,17 +266,17 @@ fn frame_at(ffmpeg: &Path, source: &Path, seconds: f64) -> Result<Frame, DecodeE
         return Ok(None);
     }
     let img = image::load_from_memory(&png).map_err(DecodeError::Image)?;
-    Ok(perceptual_hash(&img).map(|(hash, _)| hash))
+    Ok(perceptual_hash(&img).map(|visual| visual.phash))
 }
 
 /// The signature of a video: its picture's duration and its frames at 5%, 15%, ... 85% of it.
 /// `ffmpeg` turns frames upright as the file says. A frame `ffmpeg` cannot decode counts as one
 /// without detail, unless no frame can be decoded at all.
-#[allow(
+#[expect(
     clippy::suboptimal_flops,
     reason = "a fused multiply-add rounds differently, which would move the frames sampled"
 )]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     reason = "durations in seconds, frame indices below 10"
@@ -257,7 +288,7 @@ pub fn video_signature(
 ) -> Result<VideoSignature, DecodeError> {
     // A file that cannot be opened is unreadable, not invalid, so it is tried again later.
     std::fs::File::open(source)?;
-    let (start, duration) = video_span(ffprobe, source)?;
+    let Span { start, duration } = video_span(ffprobe, source)?;
     let mut frames = Vec::with_capacity(FRAMES);
     let (mut decoded, mut invalid) = (0, None);
     for i in 0..FRAMES {
@@ -293,7 +324,7 @@ struct Fpcalc {
 /// The Chromaprint fingerprint of the first `AUDIO_SECONDS` of an audio file, from `fpcalc`.
 /// Clips shorter than about 5 seconds give too few values to compare, and never match; under
 /// about 3 seconds, `fpcalc` gives none.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "fpcalc prints the 32-bit values signed or unsigned depending on its version"
@@ -352,7 +383,7 @@ pub fn frames_match(a: &[Frame], b: &[Frame], threshold: u32) -> bool {
 /// The share of differing bits between two fingerprints at the offset (within about 2 seconds)
 /// where they agree best, or 1 if they hardly overlap. Offsets are given up on once they differ
 /// in more than `give_up` of the bits they are compared on; 1 compares them all.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -374,7 +405,7 @@ fn best_bit_error_rate(a: &[u32], b: &[u32], give_up: f64) -> f64 {
         let limit = (give_up.min(best) * 32.0 * overlap as f64) as u64;
         let mut bits = 0u64;
         // Unrelated audio differs in about half its bits, so most offsets end early.
-        for (x, y) in a[..overlap].chunks(64).zip(b[..overlap].chunks(64)) {
+        for (x, y) in a.chunks(64).zip(b.chunks(64)) {
             bits += x
                 .iter()
                 .zip(y)
@@ -438,7 +469,8 @@ pub(crate) mod tests {
     /// frames all differ, with `extra` arguments to `ffmpeg` before the output.
     pub fn zoom(path: &Path, from: u32, seconds: u32, extra: &[&str]) -> Option<()> {
         let source = format!(
-            "mandelbrot=size=640x360:rate=25,trim=start={from}:duration={seconds},setpts=PTS-STARTPTS"
+            "mandelbrot=size=640x360:rate=25,trim=start={from}:duration={seconds},\
+             setpts=PTS-STARTPTS"
         );
         let mut args = vec!["-f", "lavfi", "-i", &source];
         args.extend(extra);
@@ -495,9 +527,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             values_from_bytes(&values_to_bytes(&[1, u32::MAX])),
-            [1, u32::MAX]
+            Some(vec![1, u32::MAX])
         );
         assert_eq!(frames_from_bytes(&[1, 2, 3]), None);
+        assert_eq!(values_from_bytes(&[1, 2, 3, 4, 5]), None);
     }
 
     #[test]
@@ -728,5 +761,69 @@ pub(crate) mod tests {
             "{}",
             bit_error_rate(&a.values, &c.values)
         );
+    }
+
+    #[test]
+    fn test_span_prefers_the_stream_and_starts_from_the_container() {
+        let json = br#"{"programs": [], "streams": [{"start_time": "1.500000",
+            "duration": "10.000000", "tags": {"DURATION": "00:00:12.0"}}],
+            "format": {"start_time": "0.500000", "duration": "11.000000"}}"#;
+        let span = span_from_probe(json).unwrap();
+        assert_eq!(
+            span,
+            Span {
+                start: 1.0,
+                duration: 10.0
+            }
+        );
+    }
+
+    #[test]
+    fn test_span_reads_a_matroska_duration_tag() {
+        let json = br#"{"streams": [{"start_time": "0.000000", "duration": "0.000000",
+            "tags": {"language": "eng", "DURATION-eng": "00:01:02.500000000"}}],
+            "format": {"start_time": "0.000000", "duration": "63.000000"}}"#;
+        assert_eq!(
+            span_from_probe(json).unwrap(),
+            Span {
+                start: 0.0,
+                duration: 62.5
+            }
+        );
+    }
+
+    #[test]
+    fn test_span_falls_back_to_the_container() {
+        let json = br#"{"streams": [], "format": {"duration": "5.000000"}}"#;
+        let span = span_from_probe(json).unwrap();
+        assert_eq!(
+            span,
+            Span {
+                start: 0.0,
+                duration: 5.0
+            }
+        );
+        let earlier = br#"{"streams": [{"start_time": "0.1", "duration": "nan"}],
+            "format": {"start_time": "0.2", "duration": "5"}}"#;
+        assert_eq!(
+            span_from_probe(earlier).unwrap(),
+            Span {
+                start: 0.0,
+                duration: 5.0
+            }
+        );
+    }
+
+    #[test]
+    fn test_span_without_a_duration_is_an_error() {
+        let json = br#"{"streams": [{}], "format": {}}"#;
+        assert!(matches!(
+            span_from_probe(json),
+            Err(DecodeError::NoDuration)
+        ));
+        assert!(matches!(
+            span_from_probe(b"{}"),
+            Err(DecodeError::NoDuration)
+        ));
     }
 }

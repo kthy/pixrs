@@ -112,7 +112,7 @@ impl Error {
 }
 
 impl fmt::Display for Error {
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "one arm per variant keeps every message of the program in one place"
     )]

@@ -162,29 +162,29 @@ impl AppState {
     /// it cannot skip or repeat groups. One report is made at a time and shared by every request
     /// waiting for it. Only reading the catalog holds it; comparing the images does not, so
     /// other pages stay responsive meanwhile.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the lock is held while the report is made, so one is made at a time"
     )]
     pub(crate) async fn dupes(self: &Arc<Self>, fresh: bool) -> Result<Arc<DupeReport>, AppError> {
         let mut cached = self.dupes.lock().await;
-        if let Some(c) = cached.as_mut() {
+        if let Some(c) = cached.as_ref() {
             if !fresh || c.made.elapsed() < DUPES_REFRESH {
                 return Ok(Arc::clone(&c.report));
             }
-            if self.query(super::catalog::Catalog::data_version).await? == c.version {
-                c.made = Instant::now();
-                return Ok(Arc::clone(&c.report));
-            }
         }
-        let version = self.query(super::catalog::Catalog::data_version).await?;
+        let version = self.query(Catalog::data_version).await?;
+        if let Some(c) = cached.as_mut().filter(|c| c.version == version) {
+            c.made = Instant::now();
+            return Ok(Arc::clone(&c.report));
+        }
         let (libraries, similar) = (self.libraries.clone(), self.similarity.images);
         let input = self
             .query(move |catalog| load_dupes(catalog, &libraries, similar))
             .await?;
         let state = Arc::clone(self);
         let report = tokio::task::spawn_blocking(move || {
-            Arc::new(group_dupes(input, &state.libraries, state.similarity))
+            Arc::new(group_dupes(&input, &state.libraries, state.similarity))
         })
         .await?;
         *cached = Some(CachedDupes {
@@ -315,10 +315,16 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/preview/{lib}/{*path}", get(preview))
         .route(
             "/static/htmx-4.0.0.min.js",
-            get(|| asset(HTMX, "text/javascript")),
+            get(|| async { asset(HTMX, "text/javascript") }),
         )
-        .route("/static/pixrs.css", get(|| asset(CSS, "text/css")))
-        .route("/static/pixrs.js", get(|| asset(JS, "text/javascript")))
+        .route(
+            "/static/pixrs.css",
+            get(|| async { asset(CSS, "text/css") }),
+        )
+        .route(
+            "/static/pixrs.js",
+            get(|| async { asset(JS, "text/javascript") }),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             check_host,
@@ -404,8 +410,7 @@ async fn check_host(State(state): State<Arc<AppState>>, req: Request, next: Next
 }
 
 /// A compiled-in asset.
-#[allow(clippy::unused_async, reason = "an axum handler")]
-async fn asset(body: &'static str, content_type: &'static str) -> Response {
+fn asset(body: &'static str, content_type: &'static str) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),

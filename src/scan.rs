@@ -10,10 +10,12 @@ use crate::avhash::{
     VideoSignature,
 };
 use crate::catalog::{
-    cataloged_spelling, display_root, library_path, Catalog, FileRecord, MediaMeta, Stamp,
+    cataloged_spelling, display_root, library_path, Catalog, FileRecord, HashVersion, MediaMeta,
+    Stamp, UnhashedFile,
 };
 use crate::dates::quicktime_creation;
 use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, Tools};
+use crate::digest::sha256_from;
 use crate::error::{utf8, Error};
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
@@ -24,12 +26,12 @@ use indicatif::{
 };
 use log::debug;
 use nom_exif::{EntryValue, ExifDateTime, ExifTag, Metadata, TrackInfoTag};
-use ring::digest::{Context, SHA256};
+use rusqlite::Transaction;
 use same_file::is_same_file;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display};
 use std::fs::{symlink_metadata, File, Metadata as FsMetadata};
-use std::io::{self, Read};
+use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{absolute, Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,6 +106,19 @@ impl ScanOptions {
     };
 }
 
+/// A cataloged path with its size and mtime.
+#[derive(Clone, Debug)]
+struct Row {
+    path: String,
+    stamp: Stamp,
+}
+
+/// A row whose file is on disk under another Unicode normalization of its name.
+struct Respelled {
+    old: String,
+    new: String,
+}
+
 /// A media file that is new or changed since the last scan.
 struct Pending {
     rel: String,
@@ -111,6 +126,32 @@ struct Pending {
     stamp: Stamp,
     media_type: MediaType,
     new: bool,
+}
+
+/// What the walk found.
+#[derive(Default)]
+struct Walked {
+    /// Cataloged paths of the media files found, and the old paths of the respelled rows.
+    seen: HashSet<String>,
+    respelled: Vec<Respelled>,
+    /// Folders and files that could not be read, relative to the root. Rows below them stay.
+    unreadable: Vec<String>,
+    /// New and changed media files, to be read.
+    pending: Vec<Pending>,
+}
+
+/// A media file for the decoding pass, with the version its hashes will have.
+struct ToDecode {
+    rel: String,
+    media_type: MediaType,
+    version: String,
+}
+
+/// What the hash pass made of a file.
+enum Hashed {
+    Image(ImageHashes),
+    Video(VideoSignature),
+    Audio(AudioFingerprint),
 }
 
 /// Scan the media files below `library` into the catalog at `catalog_path`.
@@ -146,411 +187,537 @@ pub fn scan(
 }
 
 /// `scan`, with the external tools given instead of looked up on `PATH`.
-#[allow(clippy::too_many_lines, reason = "to be split by phase")]
 pub fn scan_with(
     library: &Path,
     catalog_path: &Path,
     options: ScanOptions,
     tools: &Tools,
 ) -> Result<ScanSummary, Error> {
-    let quiet = options.quiet;
-    let start = library
-        .canonicalize()
-        .ok()
-        .filter(|start| start.is_dir())
-        .ok_or_else(|| Error::NotADirectory(library.to_path_buf()))?;
+    let start = scanned_folder(library)?;
     let catalog_path = resolve(catalog_path)?;
-    let outside = |root: &Path| {
-        if catalog_path.starts_with(root) {
-            return Err(Error::CatalogInLibrary {
-                catalog: catalog_path.clone(),
-                library: root.to_path_buf(),
-            });
-        }
-        Ok(())
-    };
-    outside(&start)?;
-
+    outside_library(&catalog_path, &start)?;
     let catalog = Catalog::open(&catalog_path)?;
-    // One folder under another letter case is the same library.
-    let start = cataloged_spelling(&catalog.libraries()?, &start);
-    let start_str = utf8(&start, "Library")?;
-    let mut summary = ScanSummary::default();
-    // `start` may be part of a library; `root` is the library's root, and paths are relative to
-    // it. `part` is the scanned folder relative to `root`, empty for the whole library.
-    let (library_id, root) = match catalog.containing_library(&start)? {
-        Some((id, root)) => (id, PathBuf::from(root)),
-        None => (catalog.library_id(start_str)?, start.clone()),
-    };
-    outside(&root)?;
-    let part = relative_path(&root, &start).ok_or_else(|| Error::NotUtf8 {
-        what: "Library",
-        path: start.clone(),
-    })?;
-    if !part.is_empty() {
-        summary.part_of = Some(display_root(&root.to_string_lossy()));
-    }
-    summary.folded = catalog
-        .fold_nested(library_id, &root)?
-        .iter()
-        .map(|r| display_root(r))
-        .collect();
-    let mut known = catalog.stamps(library_id)?;
-    let respellable = respellable(&known, &part);
-    known.retain(|rel, _| is_within(rel, &part));
+    let mut scan = Scan::new(&catalog, &catalog_path, &start, options.quiet)?;
 
-    let mut seen: HashSet<String> = HashSet::new();
-    // Rows found under another Unicode normalization, with the name on disk.
-    let mut respelled: Vec<(String, String)> = vec![];
-    let mut unreadable: Vec<String> = vec![];
-    let mut pending: Vec<Pending> = vec![];
+    let mut known = catalog.stamps(scan.library_id)?;
+    let respellable = respellable(&known, &scan.part);
+    known.retain(|rel, _| is_within(rel, &scan.part));
+    let walked = scan.walk(&known, &respellable);
+    scan.refuse_empty_walk(&walked, &known, options.allow_empty)?;
+    scan.read(walked, &known)?;
+    scan.hash()?;
+    scan.decode(tools)?;
+    Ok(scan.summary)
+}
 
-    // Walk: find the media files and pick out the new and changed ones. On a network share this
-    // alone can take hours, so it shows the folder it is in.
-    let walk = spinner("[1/4] Walking", quiet);
-    for entry in WalkDir::new(&start) {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                let path = e.path().unwrap_or(&start).to_path_buf();
-                walk.suspend(|| warn(&path, &e));
-                if let Some(rel) = relative_path(&root, &path) {
-                    unreadable.push(rel);
-                }
-                summary.skipped += 1;
-                continue;
-            }
-        };
-        if entry.file_type().is_dir() {
-            let dir = entry
-                .path()
-                .strip_prefix(&root)
-                .unwrap_or_else(|_| entry.path());
-            walk.set_message(shown(dir).to_string());
-            continue;
-        }
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Some(media_type) = MediaType::from_path(entry.path()) else {
-            continue;
-        };
-        walk.inc(1);
-        let Some(rel) = relative_path(&root, entry.path()) else {
-            walk.suspend(|| warn(entry.path(), "file name is not valid UTF-8"));
-            summary.skipped += 1;
-            continue;
-        };
-        let mut known_stamp = known.get(&rel).copied();
-        if known_stamp.is_none() {
-            let found = respelling(&rel, entry.path(), &root, &known, &respellable, &seen);
-            if let Some((old, old_stamp)) = found {
-                seen.insert(old.clone());
-                respelled.push((old, rel.clone()));
-                known_stamp = Some(old_stamp);
-            }
-        }
-        let stamp = match entry
-            .metadata()
-            .map_err(io::Error::from)
-            .and_then(|m| stamp(&m))
+/// The folder `library`, canonical. A path that does not lead to a folder is a usage error;
+/// one that cannot be resolved for another reason, like permissions, an I/O error.
+fn scanned_folder(library: &Path) -> Result<PathBuf, Error> {
+    match library.canonicalize() {
+        Ok(start) if start.is_dir() => Ok(start),
+        Err(e)
+            if !matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
         {
-            Ok(stamp) => stamp,
-            Err(e) => {
-                walk.suspend(|| warn(entry.path(), &e));
-                summary.skipped += 1;
-                seen.insert(rel);
-                continue;
-            }
+            Err(Error::File {
+                path: library.to_path_buf(),
+                source: e,
+            })
+        }
+        _ => Err(Error::NotADirectory(library.to_path_buf())),
+    }
+}
+
+/// Refuse a catalog at `catalog`, inside the library at `root`.
+fn outside_library(catalog: &Path, root: &Path) -> Result<(), Error> {
+    if catalog.starts_with(root) {
+        return Err(Error::CatalogInLibrary {
+            catalog: catalog.to_path_buf(),
+            library: root.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// A scan under way: the library, the part of it scanned, and what the scan did so far.
+struct Scan<'c> {
+    catalog: &'c Catalog,
+    library_id: i64,
+    /// The library's root. Cataloged paths are relative to it.
+    root: PathBuf,
+    /// The scanned folder: the root, or a folder inside the library.
+    start: PathBuf,
+    /// `start` relative to `root`, empty for the whole library.
+    part: String,
+    quiet: bool,
+    summary: ScanSummary,
+}
+
+impl<'c> Scan<'c> {
+    /// A scan of the canonical folder `start` into `catalog`, at `catalog_path`. Finds the
+    /// library `start` is part of, if any, and folds the libraries inside it into it.
+    fn new(
+        catalog: &'c Catalog,
+        catalog_path: &Path,
+        start: &Path,
+        quiet: bool,
+    ) -> Result<Self, Error> {
+        // One folder under another letter case is the same library.
+        let start = cataloged_spelling(&catalog.libraries()?, start);
+        let start_str = utf8(&start, "Library")?;
+        let (library_id, root) = match catalog.containing_library(&start)? {
+            Some(library) => (library.id, PathBuf::from(library.root)),
+            None => (catalog.library_id(start_str)?, start.clone()),
         };
-        match known_stamp {
-            Some(known_stamp) if known_stamp == stamp => summary.unchanged += 1,
-            known_stamp => pending.push(Pending {
-                rel: rel.clone(),
-                path: entry.into_path(),
-                stamp,
-                media_type,
-                new: known_stamp.is_none(),
-            }),
+        outside_library(catalog_path, &root)?;
+        let part = relative_path(&root, &start).ok_or_else(|| Error::NotUtf8 {
+            what: "Library",
+            path: start.clone(),
+        })?;
+        let mut summary = ScanSummary::default();
+        if !part.is_empty() {
+            summary.part_of = Some(display_root(&root.to_string_lossy()));
         }
-        seen.insert(rel);
-    }
-    walk.finish_and_clear();
-    // Not `walk.println`, which pads the line to the terminal width instead of ending it.
-    if !walk.is_hidden() {
-        eprintln!(
-            "Found {} media files, {} new or changed ({})",
-            HumanCount(walk.position()),
-            HumanCount(pending.len() as u64),
-            HumanDuration(walk.elapsed())
-        );
-    }
-
-    // An unmounted drive or share often leaves an empty folder behind, so an empty walk only
-    // removes rows when the user says the folder really is empty, and never when it could not
-    // be listed.
-    if seen.is_empty() && !known.is_empty() {
-        if unreadable.contains(&part) {
-            return Err(Error::Unlistable {
-                folder: start,
-                cataloged: known.len(),
-            });
-        }
-        if !options.allow_empty {
-            return Err(Error::NoMedia {
-                folder: start,
-                cataloged: known.len(),
-            });
-        }
+        summary.folded = catalog
+            .fold_nested(library_id, &root)?
+            .iter()
+            .map(|r| display_root(r))
+            .collect();
+        Ok(Self {
+            catalog,
+            library_id,
+            root,
+            start,
+            part,
+            quiet,
+            summary,
+        })
     }
 
-    // Pass 1: record new and changed files. A changed file loses its hash until pass 2.
-    let pb = progress_bar(pending.len() as u64, "[2/4] Reading", false, quiet);
-    let mut tx = catalog.transaction()?;
-    for (old, new) in &respelled {
-        catalog.respell(library_id, old, new)?;
-    }
-    summary.respelled = respelled.len();
-    for (i, file) in pending.into_iter().enumerate() {
-        if i > 0 && i % COMMIT_EVERY == 0 {
-            tx.commit()?;
-            tx = catalog.transaction()?;
-        }
-        pb.set_message(printable(&file.rel).into_owned());
-        // A parser bug on one broken file should not end the scan, or keep the file out of the
-        // catalog: it is cataloged without metadata, like a file whose metadata cannot be parsed.
-        let read = catch_unwind(AssertUnwindSafe(|| read_meta(&file.path)));
-        let meta = match read {
-            Ok(Ok(meta)) => meta,
-            Ok(Err(e)) => {
-                pb.suspend(|| warn(&file.path, &e));
-                if !root.is_dir() {
-                    pb.finish_and_clear();
-                    tx.commit()?;
-                    return Err(disappeared(&root));
-                }
-                summary.skipped += 1;
-                pb.inc(1);
-                continue;
-            }
-            Err(_) => {
-                pb.suspend(|| {
-                    eprintln!(
-                        "Cataloging {} without metadata: the metadata parser crashed on it",
-                        shown(&file.path)
-                    );
-                });
-                MediaMeta::default()
-            }
-        };
-        let record = FileRecord {
-            path: file.rel,
-            stamp: file.stamp,
-            media_type: file.media_type,
-            sha256: None,
-            meta,
-        };
-        catalog.upsert(library_id, &record)?;
-        if file.new {
-            summary.added += 1;
-        } else {
-            summary.updated += 1;
-        }
-        pb.inc(1);
-    }
-    finish_step(&pb, &format!("Read {} files", HumanCount(pb.position())));
-
-    for rel in known.keys() {
-        if !seen.contains(rel) && !unreadable.iter().any(|dir| is_within(rel, dir)) {
-            catalog.remove(library_id, rel)?;
-            summary.removed += 1;
-        }
-    }
-    tx.commit()?;
-
-    // Pass 2: hash files that share their size with another file and have no hash yet.
-    let mut to_hash = catalog.unhashed_with_shared_size(library_id)?;
-    to_hash.retain(|(rel, _)| is_within(rel, &part));
-    let pb = progress_bar(
-        to_hash.iter().map(|(_, size)| size).sum(),
-        "[3/4] Hashing",
-        true,
-        quiet,
-    );
-    let mut tx = Some(catalog.transaction()?);
-    let mut done = 0;
-    let hash = |(rel, _): &(String, u64)| {
-        pb.set_message(printable(rel).into_owned());
-        hash_file(&library_path(&root, rel), &pb)
-    };
-    in_parallel(&to_hash, MAX_HASHERS, hash, |i, hashed| {
-        let rel = &to_hash[i].0;
-        if done > 0 && done % COMMIT_EVERY == 0 {
-            tx.take().expect("a transaction is open").commit()?;
-            tx = Some(catalog.transaction()?);
-        }
-        done += 1;
-        match hashed {
-            Ok(sha256) => {
-                catalog.set_sha256(library_id, rel, &sha256)?;
-                summary.hashed += 1;
-            }
-            Err(e) => {
-                pb.suspend(|| warn(&library_path(&root, rel), &e));
-                if !root.is_dir() {
-                    pb.finish_and_clear();
-                    tx.take().expect("a transaction is open").commit()?;
-                    return Err(disappeared(&root));
-                }
-                summary.skipped += 1;
-            }
-        }
-        Ok(())
-    })?;
-    finish_step(
-        &pb,
-        &format!(
-            "Hashed {} files, {}",
-            HumanCount(done as u64),
-            HumanBytes(pb.position())
-        ),
-    );
-    tx.expect("a transaction is open").commit()?;
-
-    // Pass 3: image hashes, video signatures and audio fingerprints of files that have none
-    // yet, or were made with other decoder versions.
-    let ffmpeg_version = tools.ffmpeg.as_ref().map(|(_, v)| v.as_str());
-    let heic_ok = ffmpeg_version.is_some_and(ffmpeg_handles_heic);
-    let mut warned_heic = false;
-    let mut to_decode: Vec<(String, MediaType, String)> = vec![];
-    for (rel, media_type, stored) in catalog.hash_versions(library_id)? {
-        if !is_within(&rel, &part) {
-            continue;
-        }
-        let current = match media_type {
-            MediaType::Image => match (image_decoder(&rel), ffmpeg_version) {
-                (Some(Decoder::InProcess), _) => hash_version(&rel, ""),
-                (Some(Decoder::Ffmpeg), Some(version)) if heic_ok => hash_version(&rel, version),
-                (Some(Decoder::Ffmpeg), Some(version)) => {
-                    // An old `ffmpeg` may decode only part of a HEIC photo; better no hashes
-                    // than wrong ones.
-                    if !warned_heic {
-                        eprintln!(
-                            "ffmpeg {version} is older than 7.1 and may decode HEIC photos only in \
-                             part, so HEIC and AVIF images are not hashed."
-                        );
-                        warned_heic = true;
+    /// Find the media files below the scanned folder and pick out the new and changed ones, by
+    /// the cataloged rows in `known`. On a network share this alone can take hours, so it shows
+    /// the folder it is in.
+    fn walk(
+        &mut self,
+        known: &HashMap<String, Stamp>,
+        respellable: &HashMap<String, Row>,
+    ) -> Walked {
+        let mut walked = Walked::default();
+        let walk = spinner("[1/4] Walking", self.quiet);
+        for entry in WalkDir::new(&self.start) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    let path = e.path().unwrap_or(&self.start).to_path_buf();
+                    walk.suspend(|| warn(&path, &e));
+                    if let Some(rel) = relative_path(&self.root, &path) {
+                        walked.unreadable.push(rel);
                     }
-                    None
+                    self.summary.skipped += 1;
+                    continue;
                 }
-                _ => None,
-            },
-            MediaType::Video => match (ffmpeg_version, &tools.ffprobe) {
-                (Some(version), Some(_)) => Some(video_version(version)),
-                _ => None,
-            },
-            MediaType::Audio => tools.fpcalc.as_ref().map(|(_, v)| audio_version(v)),
-        };
-        match current {
-            Some(current) if stored.as_ref() != Some(&current) => {
-                to_decode.push((rel, media_type, current));
+            };
+            if entry.file_type().is_dir() {
+                let dir = entry
+                    .path()
+                    .strip_prefix(&self.root)
+                    .unwrap_or_else(|_| entry.path());
+                walk.set_message(shown(dir).to_string());
+                continue;
             }
-            // Hashes made earlier, e.g. with an `ffmpeg` that is gone now, are kept.
-            None if stored.is_none() => summary.media_without_decoder += 1,
-            Some(_) | None => {}
-        }
-    }
-    let pb = progress_bar(to_decode.len() as u64, "[4/4] Decoding", false, quiet);
-    let mut tx = Some(catalog.transaction()?);
-    let mut done = 0;
-    let files: Vec<(&str, MediaType)> = to_decode
-        .iter()
-        .map(|(rel, media_type, _)| (rel.as_str(), *media_type))
-        .collect();
-    hash_files(&root, &files, tools, |i, result| {
-        let ((rel, media_type), version) = (files[i], to_decode[i].2.as_str());
-        if done > 0 && done % COMMIT_EVERY == 0 {
-            tx.take().expect("a transaction is open").commit()?;
-            tx = Some(catalog.transaction()?);
-        }
-        done += 1;
-        pb.set_message(printable(rel).into_owned());
-        pb.inc(1);
-        match result {
-            Ok(Some(hashed)) => {
-                record_hashes(
-                    &catalog,
-                    library_id,
-                    rel,
-                    version,
-                    Some(&hashed),
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Some(media_type) = MediaType::from_path(entry.path()) else {
+                continue;
+            };
+            walk.inc(1);
+            let Some(rel) = relative_path(&self.root, entry.path()) else {
+                walk.suspend(|| warn(entry.path(), "file name is not valid UTF-8"));
+                self.summary.skipped += 1;
+                continue;
+            };
+            let mut known_stamp = known.get(&rel).copied();
+            if known_stamp.is_none() {
+                let path = entry.path();
+                let found = respelling(&rel, path, &self.root, known, respellable, &walked.seen);
+                if let Some(row) = found {
+                    walked.seen.insert(row.path.clone());
+                    known_stamp = Some(row.stamp);
+                    walked.respelled.push(Respelled {
+                        old: row.path,
+                        new: rel.clone(),
+                    });
+                }
+            }
+            let stamp = match entry
+                .metadata()
+                .map_err(io::Error::from)
+                .and_then(|m| stamp(&m))
+            {
+                Ok(stamp) => stamp,
+                Err(e) => {
+                    walk.suspend(|| warn(entry.path(), &e));
+                    self.summary.skipped += 1;
+                    walked.seen.insert(rel);
+                    continue;
+                }
+            };
+            match known_stamp {
+                Some(known_stamp) if known_stamp == stamp => self.summary.unchanged += 1,
+                known_stamp => walked.pending.push(Pending {
+                    rel: rel.clone(),
+                    path: entry.into_path(),
+                    stamp,
                     media_type,
-                )?;
-                summary.media_hashed += 1;
+                    new: known_stamp.is_none(),
+                }),
             }
-            Ok(None) => summary.media_without_decoder += 1,
-            Err(e) => {
-                let path = library_path(&root, rel);
-                // The reason can quote the file, or come from `ffmpeg`.
-                pb.suspend(|| {
-                    eprintln!(
-                        "Cannot decode {}: {}",
-                        shown(&path),
-                        printable(&e.to_string())
-                    );
-                });
-                if !root.is_dir() {
-                    tx.take().expect("a transaction is open").commit()?;
-                    return Err(disappeared(&root));
-                }
-                // A file that is gone or unreadable now is tried again on the next scan; only
-                // one the decoder rejects is recorded as undecodable.
-                if e.is_transient() || !path.is_file() {
-                    summary.skipped += 1;
-                } else {
-                    record_hashes(&catalog, library_id, rel, version, None, media_type)?;
-                    summary.media_undecodable += 1;
-                }
-            }
+            walked.seen.insert(rel);
+        }
+        walk.finish_and_clear();
+        // Not `walk.println`, which pads the line to the terminal width instead of ending it.
+        if !walk.is_hidden() {
+            eprintln!(
+                "Found {} media files, {} new or changed ({})",
+                HumanCount(walk.position()),
+                HumanCount(walked.pending.len() as u64),
+                HumanDuration(walk.elapsed())
+            );
+        }
+        walked
+    }
+
+    /// Refuse a walk that found no media where `known` lists some: an unmounted drive or share
+    /// often leaves an empty folder behind, so such a walk only removes rows when the user says
+    /// the folder really is empty (`allow_empty`), and never when it could not be listed.
+    fn refuse_empty_walk(
+        &self,
+        walked: &Walked,
+        known: &HashMap<String, Stamp>,
+        allow_empty: bool,
+    ) -> Result<(), Error> {
+        if !walked.seen.is_empty() || known.is_empty() {
+            return Ok(());
+        }
+        if walked.unreadable.contains(&self.part) {
+            return Err(Error::Unlistable {
+                folder: self.start.clone(),
+                cataloged: known.len(),
+            });
+        }
+        if !allow_empty {
+            return Err(Error::NoMedia {
+                folder: self.start.clone(),
+                cataloged: known.len(),
+            });
         }
         Ok(())
-    })?;
-    finish_step(&pb, &format!("Decoded {} files", HumanCount(pb.position())));
-    if part.is_empty() {
-        catalog.mark_scanned(library_id)?;
     }
-    tx.expect("a transaction is open").commit()?;
 
-    Ok(summary)
+    /// Record the new and changed files the walk found, and remove the rows of `known` whose
+    /// files are gone. A changed file loses its hash until the hash pass.
+    fn read(&mut self, walked: Walked, known: &HashMap<String, Stamp>) -> Result<(), Error> {
+        let Walked {
+            seen,
+            respelled,
+            unreadable,
+            pending,
+        } = walked;
+        let pb = progress_bar(
+            pending.len() as u64,
+            "[2/4] Reading",
+            Unit::Files,
+            self.quiet,
+        );
+        let mut batch = Batch::begin(self.catalog)?;
+        for Respelled { old, new } in &respelled {
+            self.catalog.respell(self.library_id, old, new)?;
+        }
+        self.summary.respelled = respelled.len();
+        for file in pending {
+            batch.tick()?;
+            pb.set_message(printable(&file.rel).into_owned());
+            // A parser bug on one broken file should not end the scan, or keep the file out of
+            // the catalog: it is cataloged without metadata, like a file whose metadata cannot be
+            // parsed.
+            let read = catch_unwind(AssertUnwindSafe(|| read_meta(&file.path)));
+            let meta = match read {
+                Ok(Ok(meta)) => meta,
+                Ok(Err(e)) => {
+                    pb.suspend(|| warn(&file.path, &e));
+                    stop_if_gone(&self.root, &pb, &mut batch)?;
+                    self.summary.skipped += 1;
+                    pb.inc(1);
+                    continue;
+                }
+                Err(_) => {
+                    pb.suspend(|| {
+                        eprintln!(
+                            "Cataloging {} without metadata: the metadata parser crashed on it",
+                            shown(&file.path)
+                        );
+                    });
+                    MediaMeta::default()
+                }
+            };
+            let record = FileRecord {
+                path: file.rel,
+                stamp: file.stamp,
+                media_type: file.media_type,
+                sha256: None,
+                meta,
+            };
+            self.catalog.upsert(self.library_id, &record)?;
+            if file.new {
+                self.summary.added += 1;
+            } else {
+                self.summary.updated += 1;
+            }
+            pb.inc(1);
+        }
+        finish_step(&pb, &format!("Read {} files", HumanCount(pb.position())));
+
+        for rel in known.keys() {
+            if !seen.contains(rel) && !unreadable.iter().any(|dir| is_within(rel, dir)) {
+                self.catalog.remove(self.library_id, rel)?;
+                self.summary.removed += 1;
+            }
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    /// Hash the files that share their size with another cataloged file and have no hash yet.
+    fn hash(&mut self) -> Result<(), Error> {
+        let mut to_hash = self.catalog.unhashed_with_shared_size(self.library_id)?;
+        to_hash.retain(|file| is_within(&file.path, &self.part));
+        let bytes = to_hash.iter().map(|file| file.size).sum();
+        let pb = progress_bar(bytes, "[3/4] Hashing", Unit::Bytes, self.quiet);
+        let mut batch = Batch::begin(self.catalog)?;
+        let (catalog, library_id, root) = (self.catalog, self.library_id, &self.root);
+        let summary = &mut self.summary;
+        let hash = |file: &UnhashedFile| {
+            pb.set_message(printable(&file.path).into_owned());
+            hash_file(&library_path(root, &file.path), &pb)
+        };
+        in_parallel(&to_hash, MAX_HASHERS, hash, |file, hashed| {
+            batch.tick()?;
+            match hashed {
+                Ok(sha256) => {
+                    catalog.set_sha256(library_id, &file.path, &sha256)?;
+                    summary.hashed += 1;
+                }
+                Err(e) => {
+                    pb.suspend(|| warn(&library_path(root, &file.path), &e));
+                    stop_if_gone(root, &pb, &mut batch)?;
+                    summary.skipped += 1;
+                }
+            }
+            Ok(())
+        })?;
+        finish_step(
+            &pb,
+            &format!(
+                "Hashed {} files, {}",
+                HumanCount(batch.done as u64),
+                HumanBytes(pb.position())
+            ),
+        );
+        batch.commit()?;
+        Ok(())
+    }
+
+    /// The media files the decoding pass decodes: those without image hashes, signatures or
+    /// fingerprints, or with ones made with other decoder versions. Counts the files there is no
+    /// decoder for.
+    fn decode_queue(&mut self, tools: &Tools) -> Result<Vec<ToDecode>, Error> {
+        let ffmpeg_version = tools.ffmpeg.as_ref().map(|ffmpeg| ffmpeg.version.as_str());
+        let heic_ok = ffmpeg_version.is_some_and(ffmpeg_handles_heic);
+        let mut warned_heic = false;
+        let mut queue = vec![];
+        for HashVersion {
+            path: rel,
+            media_type,
+            version: stored,
+        } in self.catalog.hash_versions(self.library_id)?
+        {
+            if !is_within(&rel, &self.part) {
+                continue;
+            }
+            let current = match media_type {
+                MediaType::Image => match (image_decoder(&rel), ffmpeg_version) {
+                    (Some(Decoder::InProcess(_)), _) => hash_version(&rel, ""),
+                    (Some(Decoder::Ffmpeg), Some(version)) if heic_ok => {
+                        hash_version(&rel, version)
+                    }
+                    (Some(Decoder::Ffmpeg), Some(version)) => {
+                        // An old `ffmpeg` may decode only part of a HEIC photo; better no hashes
+                        // than wrong ones.
+                        if !warned_heic {
+                            eprintln!(
+                                "ffmpeg {version} is older than 7.1 and may decode HEIC photos \
+                                 only in part, so HEIC and AVIF images are not hashed."
+                            );
+                            warned_heic = true;
+                        }
+                        None
+                    }
+                    _ => None,
+                },
+                MediaType::Video => match (ffmpeg_version, &tools.ffprobe) {
+                    (Some(version), Some(_)) => Some(video_version(version)),
+                    _ => None,
+                },
+                MediaType::Audio => tools
+                    .fpcalc
+                    .as_ref()
+                    .map(|fpcalc| audio_version(&fpcalc.version)),
+            };
+            match current {
+                Some(current) if stored.as_ref() != Some(&current) => queue.push(ToDecode {
+                    rel,
+                    media_type,
+                    version: current,
+                }),
+                // Hashes made earlier, e.g. with an `ffmpeg` that is gone now, are kept.
+                None if stored.is_none() => self.summary.media_without_decoder += 1,
+                Some(_) | None => {}
+            }
+        }
+        Ok(queue)
+    }
+
+    /// Make image hashes, video signatures and audio fingerprints, in parallel, for the files
+    /// `decode_queue` picks. Marks the library scanned if the whole of it was.
+    fn decode(&mut self, tools: &Tools) -> Result<(), Error> {
+        let to_decode = self.decode_queue(tools)?;
+        let pb = progress_bar(
+            to_decode.len() as u64,
+            "[4/4] Decoding",
+            Unit::Files,
+            self.quiet,
+        );
+        let mut batch = Batch::begin(self.catalog)?;
+        let (catalog, library_id, root) = (self.catalog, self.library_id, &self.root);
+        let summary = &mut self.summary;
+        hash_files(root, &to_decode, tools, |file, result| {
+            batch.tick()?;
+            pb.set_message(printable(&file.rel).into_owned());
+            pb.inc(1);
+            match result {
+                Ok(Some(hashed)) => {
+                    record_hashes(catalog, library_id, file, &hashed)?;
+                    summary.media_hashed += 1;
+                }
+                Ok(None) => summary.media_without_decoder += 1,
+                Err(e) => {
+                    let path = library_path(root, &file.rel);
+                    // The reason can quote the file, or come from `ffmpeg`.
+                    pb.suspend(|| {
+                        eprintln!(
+                            "Cannot decode {}: {}",
+                            shown(&path),
+                            printable(&e.to_string())
+                        );
+                    });
+                    stop_if_gone(root, &pb, &mut batch)?;
+                    // A file that is gone or unreadable now is tried again on the next scan;
+                    // only one the decoder rejects is recorded as undecodable.
+                    if e.is_transient() || !path.is_file() {
+                        summary.skipped += 1;
+                    } else {
+                        record_undecodable(catalog, library_id, file)?;
+                        summary.media_undecodable += 1;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        finish_step(&pb, &format!("Decoded {} files", HumanCount(pb.position())));
+        if self.part.is_empty() {
+            self.catalog.mark_scanned(self.library_id)?;
+        }
+        batch.commit()?;
+        Ok(())
+    }
 }
 
-/// What the hash pass made of a file.
-enum Hashed {
-    Image(ImageHashes),
-    Video(VideoSignature),
-    Audio(AudioFingerprint),
+/// Catalog writes in transactions of `COMMIT_EVERY` files, so an interrupted scan keeps its
+/// progress. The open transaction is rolled back if the batch is dropped before `commit`, as
+/// when a write fails.
+struct Batch<'c> {
+    catalog: &'c Catalog,
+    tx: Option<Transaction<'c>>,
+    /// Files counted so far.
+    done: usize,
 }
 
-/// Store a file's hashes, or that decoding it failed (`None`), with `version`.
+impl<'c> Batch<'c> {
+    fn begin(catalog: &'c Catalog) -> rusqlite::Result<Self> {
+        Ok(Self {
+            catalog,
+            tx: Some(catalog.transaction()?),
+            done: 0,
+        })
+    }
+
+    /// Count a file, after committing the files before it if they fill a transaction.
+    fn tick(&mut self) -> rusqlite::Result<()> {
+        if self.done > 0 && self.done.is_multiple_of(COMMIT_EVERY) {
+            self.commit()?;
+            self.tx = Some(self.catalog.transaction()?);
+        }
+        self.done += 1;
+        Ok(())
+    }
+
+    /// Commit what was written so far.
+    fn commit(&mut self) -> rusqlite::Result<()> {
+        self.tx.take().map_or(Ok(()), Transaction::commit)
+    }
+}
+
+/// Stop the scan if the library at `root` is gone (an unplugged drive, a dropped network share)
+/// instead of failing on every remaining file. What it did so far is committed first.
+fn stop_if_gone(root: &Path, pb: &ProgressBar, batch: &mut Batch) -> Result<(), Error> {
+    if root.is_dir() {
+        return Ok(());
+    }
+    pb.finish_and_clear();
+    batch.commit()?;
+    Err(Error::Disappeared(root.to_path_buf()))
+}
+
+/// Store a file's hashes, with the version they were made with.
 fn record_hashes(
     catalog: &Catalog,
     library_id: i64,
-    rel: &str,
-    version: &str,
-    hashed: Option<&Hashed>,
-    media_type: MediaType,
+    file: &ToDecode,
+    hashed: &Hashed,
 ) -> rusqlite::Result<()> {
-    match (hashed, media_type) {
-        (Some(Hashed::Image(h)), _) => catalog.set_image_hashes(library_id, rel, version, Some(h)),
-        (Some(Hashed::Video(s)), _) => {
-            catalog.set_video_signature(library_id, rel, version, Some(s))
-        }
-        (Some(Hashed::Audio(f)), _) => {
-            catalog.set_audio_fingerprint(library_id, rel, version, Some(f))
-        }
-        (None, MediaType::Image) => catalog.set_image_hashes(library_id, rel, version, None),
-        (None, MediaType::Video) => catalog.set_video_signature(library_id, rel, version, None),
-        (None, MediaType::Audio) => catalog.set_audio_fingerprint(library_id, rel, version, None),
+    let (rel, version) = (file.rel.as_str(), file.version.as_str());
+    match hashed {
+        Hashed::Image(h) => catalog.set_image_hashes(library_id, rel, version, Some(h)),
+        Hashed::Video(s) => catalog.set_video_signature(library_id, rel, version, Some(s)),
+        Hashed::Audio(f) => catalog.set_audio_fingerprint(library_id, rel, version, Some(f)),
+    }
+}
+
+/// Store that a file failed to decode with the decoders of its version, so it is not tried
+/// again until it or they change.
+fn record_undecodable(
+    catalog: &Catalog,
+    library_id: i64,
+    file: &ToDecode,
+) -> rusqlite::Result<()> {
+    let (rel, version) = (file.rel.as_str(), file.version.as_str());
+    match file.media_type {
+        MediaType::Image => catalog.set_image_hashes(library_id, rel, version, None),
+        MediaType::Video => catalog.set_video_signature(library_id, rel, version, None),
+        MediaType::Audio => catalog.set_audio_fingerprint(library_id, rel, version, None),
     }
 }
 
@@ -561,7 +728,7 @@ fn hash_media(
     media_type: MediaType,
     tools: &Tools,
 ) -> Result<Option<Hashed>, DecodeError> {
-    let ffmpeg = tools.ffmpeg.as_ref().map(|(f, _)| f.as_path());
+    let ffmpeg = tools.ffmpeg.as_ref().map(|ffmpeg| ffmpeg.path.as_path());
     match media_type {
         MediaType::Image => Ok(hash_image(path, rel, ffmpeg)?.map(Hashed::Image)),
         MediaType::Video => match (ffmpeg, &tools.ffprobe) {
@@ -571,26 +738,25 @@ fn hash_media(
             _ => Ok(None),
         },
         MediaType::Audio => match &tools.fpcalc {
-            Some((fpcalc, _)) => Ok(Some(Hashed::Audio(audio_fingerprint(fpcalc, path)?))),
+            Some(fpcalc) => Ok(Some(Hashed::Audio(audio_fingerprint(&fpcalc.path, path)?))),
             None => Ok(None),
         },
     }
 }
 
-/// Hash the files at the relative paths in `files` below `root` on several threads, and pass
-/// each result with its index in `files` to `record` on this thread, in the order they finish.
-/// Stops at the first error from `record`.
+/// Hash `files` below `root` on several threads, and pass each with its result to `record` on
+/// this thread, in the order they finish. Stops at the first error from `record`.
 fn hash_files(
     root: &Path,
-    files: &[(&str, MediaType)],
+    files: &[ToDecode],
     tools: &Tools,
-    record: impl FnMut(usize, Result<Option<Hashed>, DecodeError>) -> Result<(), Error>,
+    record: impl FnMut(&ToDecode, Result<Option<Hashed>, DecodeError>) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let work = |&(rel, media_type): &(&str, MediaType)| {
-        let path = library_path(root, rel);
+    let work = |file: &ToDecode| {
+        let path = library_path(root, &file.rel);
         // A decoder bug on one broken file should not end the scan.
         catch_unwind(AssertUnwindSafe(|| {
-            hash_media(&path, rel, media_type, tools)
+            hash_media(&path, &file.rel, file.media_type, tools)
         }))
         .unwrap_or_else(|_| Err(DecodeError::Crashed))
     };
@@ -598,14 +764,14 @@ fn hash_files(
 }
 
 /// `work` on each of `items` on up to `max_workers` threads (no more than there are cores),
-/// passing each result with its index in `items` to `record` on this thread, in the order they
-/// finish. `record` is where the catalog is written: it has one connection, and one writer.
-/// Stops at the first error from `record`.
+/// passing each item with its result to `record` on this thread, in the order they finish.
+/// `record` is where the catalog is written: it has one connection, and one writer. Stops at the
+/// first error from `record`.
 fn in_parallel<T: Sync, R: Send>(
     items: &[T],
     max_workers: usize,
     work: impl Fn(&T) -> R + Sync,
-    mut record: impl FnMut(usize, R) -> Result<(), Error>,
+    mut record: impl FnMut(&T, R) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let workers = available_parallelism()
         .map_or(1, std::num::NonZero::get)
@@ -621,15 +787,15 @@ fn in_parallel<T: Sync, R: Send>(
                 let Some(item) = items.get(i) else {
                     break;
                 };
-                if tx.send((i, work(item))).is_err() {
+                if tx.send((item, work(item))).is_err() {
                     break;
                 }
             });
         }
         drop(tx);
         // Leaving early drops `rx`, which makes the workers stop at their next send.
-        for (i, result) in rx {
-            record(i, result)?;
+        for (item, result) in rx {
+            record(item, result)?;
         }
         Ok(())
     })
@@ -641,9 +807,9 @@ pub fn resolve(path: &Path) -> io::Result<PathBuf> {
     let path = absolute(path)?;
     for ancestor in path.ancestors() {
         if let Ok(mut resolved) = ancestor.canonicalize() {
-            let rest = path
-                .strip_prefix(ancestor)
-                .expect("an ancestor is a prefix");
+            let Ok(rest) = path.strip_prefix(ancestor) else {
+                continue;
+            };
             for part in rest.components() {
                 match part {
                     Component::ParentDir => {
@@ -657,12 +823,6 @@ pub fn resolve(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Ok(path)
-}
-
-/// The error a scan stops with when the library is gone (an unplugged drive, a dropped network
-/// share), instead of failing on every remaining file. What it did so far is committed first.
-fn disappeared(root: &Path) -> Error {
-    Error::Disappeared(root.to_path_buf())
 }
 
 /// Print a warning about a file that is skipped.
@@ -687,48 +847,55 @@ fn is_within(rel: &str, dir: &str) -> bool {
 /// name and that a lookup of the file's name in NFC in `known` does not find, by their path in
 /// NFC: rows not spelled in NFC, and rows in `part` only in NFC. With every row in NFC and a
 /// whole library scanned, as usual, there are none.
-fn respellable(known: &HashMap<String, Stamp>, part: &str) -> HashMap<String, (String, Stamp)> {
+fn respellable(known: &HashMap<String, Stamp>, part: &str) -> HashMap<String, Row> {
     let part_nfc = nfc(part);
     let mut rows = HashMap::new();
     for (rel, stamp) in known {
         let rel_nfc = nfc(rel);
         let looked_up = is_within(rel, part) && rel_nfc == rel.as_str();
         if !looked_up && is_within(&rel_nfc, &part_nfc) {
-            rows.insert(rel_nfc.into_owned(), (rel.clone(), *stamp));
+            let row = Row {
+                path: rel.clone(),
+                stamp: *stamp,
+            };
+            rows.insert(rel_nfc.into_owned(), row);
         }
     }
     rows
 }
 
-/// The cataloged row, with its stamp, that is the file at `path` (`rel` in the library at
-/// `root`) under another Unicode normalization of its name: a row in `known` whose path is
-/// `rel` in NFC, or one in `respellable`. Not if `seen` has it, as the file of another name, or
-/// if its path leads to another file (on Linux, which keeps names as given, both spellings can
-/// be files of their own).
+/// The cataloged row that is the file at `path` (`rel` in the library at `root`) under another
+/// Unicode normalization of its name: a row in `known` whose path is `rel` in NFC, or one in
+/// `respellable`. Not if `seen` has it, as the file of another name, or if its path leads to
+/// another file (on Linux, which keeps names as given, both spellings can be files of their
+/// own).
 fn respelling(
     rel: &str,
     path: &Path,
     root: &Path,
     known: &HashMap<String, Stamp>,
-    respellable: &HashMap<String, (String, Stamp)>,
+    respellable: &HashMap<String, Row>,
     seen: &HashSet<String>,
-) -> Option<(String, Stamp)> {
+) -> Option<Row> {
     let rel_nfc = nfc(rel);
-    let (old, stamp) = match respellable.get(rel_nfc.as_ref()) {
-        Some((old, stamp)) => (old.clone(), *stamp),
+    let row = match respellable.get(rel_nfc.as_ref()) {
+        Some(row) => row.clone(),
         None if rel_nfc != rel => {
             let stamp = *known.get(rel_nfc.as_ref())?;
-            (rel_nfc.into_owned(), stamp)
+            Row {
+                path: rel_nfc.into_owned(),
+                stamp,
+            }
         }
         None => return None,
     };
-    if seen.contains(&old) {
+    if seen.contains(&row.path) {
         return None;
     }
-    let old_path = library_path(root, &old);
+    let old_path = library_path(root, &row.path);
     let elsewhere =
         symlink_metadata(&old_path).is_ok() && !is_same_file(&old_path, path).unwrap_or(false);
-    (!elsewhere).then_some((old, stamp))
+    (!elsewhere).then_some(row)
 }
 
 /// `path` relative to `root` with `/` separators, or `None` if any part is not valid UTF-8.
@@ -744,15 +911,13 @@ fn relative_path(root: &Path, path: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// Size and modification time of a file.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "nanoseconds since 1970 fit in i64 until 2262"
-)]
+/// Size and modification time of a file. Nanoseconds since 1970 fit in `i64` until 2262; times
+/// further from 1970 either way are cut to the most `i64` holds.
 pub(crate) fn stamp(meta: &FsMetadata) -> io::Result<Stamp> {
+    let nanos = |d: Duration| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
     let mtime_ns = match meta.modified()?.duration_since(UNIX_EPOCH) {
-        Ok(after) => after.as_nanos() as i64,
-        Err(before) => -(before.duration().as_nanos() as i64),
+        Ok(after) => nanos(after),
+        Err(before) => -nanos(before.duration()),
     };
     Ok(Stamp {
         size: meta.len(),
@@ -760,24 +925,38 @@ pub(crate) fn stamp(meta: &FsMetadata) -> io::Result<Stamp> {
     })
 }
 
-/// A progress bar of `len` files, or bytes if `bytes` is set. The message is cut to fit the
-/// terminal: a line that wraps is not cleared when the bar is drawn again.
+/// What a progress bar counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unit {
+    Files,
+    Bytes,
+}
+
+/// A progress bar of `len` files or bytes. The message is cut to fit the terminal: a line that
+/// wraps is not cleared when the bar is drawn again.
+#[expect(
+    clippy::expect_used,
+    reason = "the templates are constants; test_progress_templates_parse checks them"
+)]
 pub(crate) fn progress_bar(
     len: u64,
     prefix: &'static str,
-    bytes: bool,
+    unit: Unit,
     quiet: bool,
 ) -> ProgressBar {
     if quiet {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(len).with_prefix(prefix);
-    let t = if bytes {
-        "{prefix} [{elapsed}, ETA {eta}] {bar:15.white/grey} {bytes:>10}/{total_bytes} \
-         {binary_bytes_per_sec:>11} {wide_msg:.dim}"
-    } else {
-        "{prefix} [{elapsed}, ETA {eta}] {bar:15.white/grey} {human_pos:>7}/{human_len:7} \
-         {rate:>8} {wide_msg:.dim}"
+    let t = match unit {
+        Unit::Bytes => {
+            "{prefix} [{elapsed}, ETA {eta}] {bar:15.white/grey} {bytes:>10}/{total_bytes} \
+             {binary_bytes_per_sec:>11} {wide_msg:.dim}"
+        }
+        Unit::Files => {
+            "{prefix} [{elapsed}, ETA {eta}] {bar:15.white/grey} {human_pos:>7}/{human_len:7} \
+             {rate:>8} {wide_msg:.dim}"
+        }
     };
     pb.set_style(
         ProgressStyle::default_bar()
@@ -803,6 +982,10 @@ fn finish_step(pb: &ProgressBar, done: &str) {
 }
 
 /// A spinner counting media files, with the current folder as its message.
+#[expect(
+    clippy::expect_used,
+    reason = "the templates are constants; test_progress_templates_parse checks them"
+)]
 fn spinner(prefix: &'static str, quiet: bool) -> ProgressBar {
     if quiet {
         return ProgressBar::hidden();
@@ -821,20 +1004,8 @@ fn spinner(prefix: &'static str, quiet: bool) -> ProgressBar {
 
 /// SHA-256 of the file at `path` as lowercase hex, advancing `pb` by the bytes read.
 fn hash_file(path: &Path, pb: &ProgressBar) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut context = Context::new(&SHA256);
-    let mut buffer = vec![0; 64 * 1024];
-    loop {
-        let count = match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => count,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        context.update(&buffer[..count]);
-        pb.inc(count as u64);
-    }
-    Ok(data_encoding::HEXLOWER.encode(context.finish().as_ref()))
+    let digest = sha256_from(pb.wrap_read(File::open(path)?))?;
+    Ok(data_encoding::HEXLOWER.encode(digest.as_ref()))
 }
 
 /// Read date taken, camera and dimensions from EXIF or video/audio track metadata.
@@ -926,7 +1097,7 @@ fn dimension(value: &EntryValue) -> Option<u32> {
         .or_else(|| value.as_u64().and_then(|n| u32::try_from(n).ok()))
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "test fixtures with small values"
@@ -934,6 +1105,14 @@ fn dimension(value: &EntryValue) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_progress_templates_parse() {
+        for unit in [Unit::Bytes, Unit::Files] {
+            progress_bar(1, "test", unit, false).finish_and_clear();
+        }
+        spinner("test", false).finish_and_clear();
+    }
 
     use pretty_assertions::assert_eq;
     use std::fs::{create_dir_all, remove_file, write};
@@ -1134,8 +1313,8 @@ mod tests {
             .hash_versions(id)
             .unwrap()
             .into_iter()
-            .filter(|(_, _, version)| version.is_none())
-            .map(|(path, _, _)| path)
+            .filter(|file| file.version.is_none())
+            .map(|file| file.path)
             .collect();
         // Without tools, the video has no decoder either.
         assert_eq!(unhashed, ["clip.mp4", "raw.nef"]);
@@ -1291,7 +1470,10 @@ mod tests {
         assert_eq!((summary.hashed, summary.skipped), (n, 0));
         for file in fx.files() {
             let name = file.path.rsplit('/').next().unwrap();
-            let expected = ring::digest::digest(&SHA256, name.trim_end_matches(".jpg").as_bytes());
+            let expected = ring::digest::digest(
+                &ring::digest::SHA256,
+                name.trim_end_matches(".jpg").as_bytes(),
+            );
             assert_eq!(
                 file.sha256.as_deref(),
                 Some(data_encoding::HEXLOWER.encode(expected.as_ref()).as_str()),
@@ -1309,7 +1491,7 @@ mod tests {
             &items,
             4,
             |&i| i * 2,
-            |i, doubled| {
+            |&i, doubled| {
                 assert_eq!(doubled, i * 2);
                 seen[i] += 1;
                 Ok(())

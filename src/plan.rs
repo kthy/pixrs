@@ -7,8 +7,8 @@
  *************************************************************************************************/
 
 use crate::catalog::{display_root, library_path, Catalog, FileRecord, FileRef, Library, Stamp};
-use crate::dates::{from_name, from_taken_at, Taken};
-use crate::dupes::{plural, DupeFile, DupeGroup, DupeReport, Tier};
+use crate::dates::{from_name, Taken};
+use crate::dupes::{plural, DupeFile, DupeGroup, DupeReport, Role, Tier};
 use crate::error::{AtPath, Error};
 use crate::media::MediaType;
 use crate::names::folded;
@@ -685,7 +685,7 @@ fn date_taken(
     opts: &OrganizeOptions,
 ) -> (Option<Taken>, &'static str) {
     let plausible = |t: &Taken| opts.trust_dates || t.is_plausible(opts.now);
-    let from_meta = file.meta.taken_at.as_deref().and_then(from_taken_at);
+    let from_meta = file.meta.taken();
     if let (Some(raw), Some(false)) = (&file.meta.taken_at, from_meta.map(|t| plausible(&t))) {
         debug!(
             "{}: metadata date {} is before 1980 or in the future; ignored",
@@ -907,7 +907,7 @@ impl Quarantine<'_> {
         let nothing_to_move = group
             .files
             .iter()
-            .all(|f| f.matches == Some(Tier::Similar) || f.keep);
+            .all(|f| matches!(f.role, Role::Keep | Role::Copy(Tier::Similar)));
         if nothing_to_move {
             return Ok(());
         }
@@ -939,7 +939,7 @@ impl Quarantine<'_> {
 
     /// Plan moving one copy of `keeper`, if it is one that moves.
     fn copy(&mut self, file: &DupeFile, keeper: &Keeper) -> Result<(), Error> {
-        if !matches!(file.matches, Some(Tier::Exact | Tier::SamePixels)) {
+        if !matches!(file.role, Role::Copy(Tier::Exact | Tier::SamePixels)) {
             debug!(
                 "{} stays: only similar to the kept file",
                 printable(&file.path)

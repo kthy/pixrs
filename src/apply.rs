@@ -6,6 +6,7 @@
  *************************************************************************************************/
 
 use crate::catalog::{Catalog, CatalogRow, Stamp};
+use crate::digest::{same_digest, sha256_from, sha256_of, Hasher, READ_SIZE};
 use crate::error::{AtPath, Error};
 use crate::names::folded;
 use crate::plan::{
@@ -13,7 +14,7 @@ use crate::plan::{
 };
 use crate::text::{printable, shown};
 use log::debug;
-use ring::digest::{Context, Digest, SHA256};
+use ring::digest::Digest;
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -450,24 +451,6 @@ fn matches(meta: &fs::Metadata, stamp: Stamp) -> bool {
         })
 }
 
-/// How much is read at once to copy and hash files: large reads keep the round trips to a
-/// network share few.
-const READ_SIZE: usize = 256 * 1024;
-
-/// Hashes what is written to it.
-struct Hasher(Context);
-
-impl Write for Hasher {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.update(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Writes to a file, and hashes what it writes.
 struct HashingWriter<'a> {
     file: &'a mut File,
@@ -483,25 +466,6 @@ impl Write for HashingWriter<'_> {
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
-}
-
-/// SHA-256 of everything `reader` reads.
-fn sha256_from(reader: impl Read) -> io::Result<Digest> {
-    let mut hasher = Hasher(Context::new(&SHA256));
-    io::copy(
-        &mut BufReader::with_capacity(READ_SIZE, reader),
-        &mut hasher,
-    )?;
-    Ok(hasher.0.finish())
-}
-
-/// SHA-256 of a file.
-fn sha256_of(path: &Path) -> io::Result<Digest> {
-    sha256_from(File::open(path)?)
-}
-
-fn same_digest(a: &Digest, b: &Digest) -> bool {
-    a.as_ref() == b.as_ref()
 }
 
 /// Whether the file `part` is the start of (or all of) the file `whole`: a copy, stopped or
@@ -544,7 +508,10 @@ fn remove_source(path: &Path) -> io::Result<()> {
     if cfg!(windows) {
         let mut permissions = fs::metadata(path)?.permissions();
         if permissions.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows only, where this clears the read-only attribute and nothing else"
+            )]
             permissions.set_readonly(false);
             fs::set_permissions(path, permissions)?;
         }
@@ -608,14 +575,14 @@ fn copy_verified(
     let mut source = BufReader::with_capacity(READ_SIZE, File::open(from)?);
     let mut writer = HashingWriter {
         file: &mut *copy,
-        hasher: Hasher(Context::new(&SHA256)),
+        hasher: Hasher::new(),
     };
     if stop_in_copy {
         io::copy(&mut source.take(stamp.size / 2), &mut writer)?;
         return Err(MoveFault::Stopped);
     }
     io::copy(&mut source, &mut writer)?;
-    let hash = writer.hasher.0.finish();
+    let hash = writer.hasher.finish();
     copy.sync_all()?;
     copy.set_modified(system_time(stamp.mtime_ns))?;
     copy.seek(io::SeekFrom::Start(0))?;
@@ -1157,7 +1124,7 @@ fn update_catalog(
         } => {
             // A row at the target is stale: the file there was gone, or the move would not
             // have happened.
-            catalog.rename_row(row.library_id, &row.path, row.library_id, new_path, true)?;
+            catalog.rename_row(row, &row.with_path(new_path), true)?;
         }
         MoveKind::Organize {
             row,
@@ -1658,13 +1625,8 @@ impl Undo {
                 row,
                 new_path: Some(new_path),
             } => {
-                self.catalog.rename_row(
-                    row.library_id,
-                    new_path,
-                    row.library_id,
-                    &row.path,
-                    false,
-                )?;
+                self.catalog
+                    .rename_row(&row.with_path(new_path), row, false)?;
             }
             MoveKind::Organize {
                 row,
@@ -2617,10 +2579,11 @@ mod tests {
             let intent = r#"{"event":"intent","index":0,"from":"a","to":"b","size":1}"#;
             fs::write(&path, format!("{start}\n{intent}\n")).unwrap();
             let error = undo(&path).unwrap_err();
-            assert!(
-                matches!(&error, Error::Journal(JournalError::Version { found: f, .. }) if *f == found),
-                "{error}"
-            );
+            let version = match &error {
+                Error::Journal(JournalError::Version { found, .. }) => Some(*found),
+                _ => None,
+            };
+            assert_eq!(version, Some(found), "{error}");
             assert_eq!(error.exit_code(), exitcode::DATAERR);
         }
         fs::write(&path, "{\"event\":\"done\",\"index\":0}\n").unwrap();

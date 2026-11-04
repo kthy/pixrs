@@ -58,14 +58,6 @@ impl Token {
             _ => return None,
         })
     }
-
-    const fn needs_date(self) -> bool {
-        matches!(self, Self::Year | Self::Month | Self::Day | Self::Date) || self.needs_time()
-    }
-
-    const fn needs_time(self) -> bool {
-        matches!(self, Self::Hour | Self::Minute | Self::Second | Self::Time)
-    }
 }
 
 /// Text or a token in a template segment.
@@ -168,7 +160,11 @@ impl Template {
             }
             segments.push(parse_segment(source, segment)?);
         }
-        let file = segments.pop().expect("split yields at least one segment");
+        let Some(file) = segments.pop() else {
+            return Err(TemplateError::NoExt {
+                template: String::from(source),
+            });
+        };
         if !file.contains(&Part::Token(Token::Ext)) {
             return Err(TemplateError::NoExt {
                 template: String::from(source),
@@ -224,21 +220,17 @@ impl Template {
         let mut folders: Vec<String> = vec![];
         let mut in_undated = false;
         for segment in &self.folders {
-            if has(segment, facts) {
-                folders.push(sanitize(&fill(segment, facts, None)));
+            if let Some(folder) = fill(segment, facts, None) {
+                folders.push(sanitize(&folder));
                 in_undated = false;
             } else if !in_undated {
                 folders.push(sanitize(undated));
                 in_undated = true;
             }
         }
-        let file = if has(&self.file, facts) {
-            fill(&self.file, facts, None)
-        } else if let Some(counter) = self.counter_for_time(facts) {
-            fill(&self.file, facts, Some(counter))
-        } else {
-            format!("{}.{}", facts.name, facts.ext)
-        };
+        let file = fill(&self.file, facts, None)
+            .or_else(|| fill(&self.file, facts, Some(self.counter_for_time(facts)?)))
+            .unwrap_or_else(|| format!("{}.{}", facts.name, facts.ext));
         Rendered {
             folders,
             file: sanitize(&file),
@@ -323,52 +315,51 @@ fn parse_segment(source: &str, segment: &str) -> Result<Vec<Part>, TemplateError
     Ok(parts)
 }
 
-/// Whether the file has every value the segment needs.
-fn has(segment: &[Part], facts: &Facts) -> bool {
-    segment.iter().all(|part| match part {
-        Part::Token(t) if t.needs_time() => facts.taken.is_some_and(|d| d.time.is_some()),
-        Part::Token(t) if t.needs_date() => facts.taken.is_some(),
-        _ => true,
-    })
-}
-
-/// The segment filled in; `has` must be true, or `time` must stand in for the missing time.
-fn fill(segment: &[Part], facts: &Facts, time: Option<&str>) -> String {
-    let date = facts.taken.unwrap_or(Taken {
-        year: 0,
-        month: 0,
-        day: 0,
-        time: None,
-    });
-    let (hour, minute, second) = date.time.unwrap_or_default();
+/// The segment filled in, or `None` if the file lacks a date or time it needs. `time` stands in
+/// for a missing time of day in `{time}`.
+fn fill(segment: &[Part], facts: &Facts, time: Option<&str>) -> Option<String> {
+    let date = || facts.taken.map(|taken| taken.date);
+    let clock = || facts.taken.and_then(|taken| taken.time);
     let mut out = String::new();
     for part in segment {
-        match part {
-            Part::Text(text) => out.push_str(text),
-            Part::Token(token) => {
-                let _ = match token {
-                    Token::Year => write!(out, "{:04}", date.year),
-                    Token::Month => write!(out, "{:02}", date.month),
-                    Token::Day => write!(out, "{:02}", date.day),
-                    Token::Hour => write!(out, "{hour:02}"),
-                    Token::Minute => write!(out, "{minute:02}"),
-                    Token::Second => write!(out, "{second:02}"),
-                    Token::Date => {
-                        write!(out, "{:04}-{:02}-{:02}", date.year, date.month, date.day)
-                    }
-                    Token::Time => match time {
-                        Some(time) => out.write_str(time),
-                        None => write!(out, "{hour:02}{minute:02}{second:02}"),
-                    },
-                    Token::Type => out.write_str(facts.media_type.as_str()),
-                    Token::Camera => out.write_str(facts.camera.unwrap_or("unknown")),
-                    Token::Name => out.write_str(facts.name),
-                    Token::Ext => out.write_str(facts.ext),
-                };
+        let token = match part {
+            Part::Text(text) => {
+                out.push_str(text);
+                continue;
             }
-        }
+            Part::Token(token) => token,
+        };
+        let _ = match token {
+            Token::Year => write!(out, "{:04}", date()?.year()),
+            Token::Month => write!(out, "{:02}", u8::from(date()?.month())),
+            Token::Day => write!(out, "{:02}", date()?.day()),
+            Token::Hour => write!(out, "{:02}", clock()?.hour()),
+            Token::Minute => write!(out, "{:02}", clock()?.minute()),
+            Token::Second => write!(out, "{:02}", clock()?.second()),
+            Token::Date => {
+                let d = date()?;
+                write!(
+                    out,
+                    "{:04}-{:02}-{:02}",
+                    d.year(),
+                    u8::from(d.month()),
+                    d.day()
+                )
+            }
+            Token::Time => match (clock(), time) {
+                (Some(c), _) => {
+                    write!(out, "{:02}{:02}{:02}", c.hour(), c.minute(), c.second())
+                }
+                (None, Some(time)) => out.write_str(time),
+                (None, None) => return None,
+            },
+            Token::Type => out.write_str(facts.media_type.as_str()),
+            Token::Camera => out.write_str(facts.camera.unwrap_or("unknown")),
+            Token::Name => out.write_str(facts.name),
+            Token::Ext => out.write_str(facts.ext),
+        };
     }
-    out
+    Some(out)
 }
 
 /// A folder or file name valid on Windows, macOS and Linux: illegal and control characters
@@ -402,6 +393,7 @@ mod tests {
     use super::*;
 
     use pretty_assertions::assert_eq;
+    use time::macros::{date, time};
 
     /// The folders and the file name `t` gives a file, with `undated` for missing dates.
     fn render(t: &Template, facts: &Facts) -> Vec<String> {
@@ -421,10 +413,8 @@ mod tests {
     }
 
     const MAY_FIRST: Taken = Taken {
-        year: 2023,
-        month: 5,
-        day: 1,
-        time: Some((14, 32, 5)),
+        date: date!(2023 - 05 - 01),
+        time: Some(time!(14:32:05)),
     };
 
     #[test]

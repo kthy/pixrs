@@ -29,9 +29,6 @@ use tokio::time::timeout;
 /// Image extensions browsers show, lowercase.
 const SHOWN_BY_BROWSERS: &[&str] = &["avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"];
 
-/// Image extensions browsers cannot show but the viewer can make a preview of, lowercase.
-const SHOWN_AS_PREVIEW: &[&str] = &["heic", "heif", "tif", "tiff"];
-
 /// The renditions the viewer makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Size {
@@ -69,7 +66,7 @@ enum Decoder {
 
 /// The lowercase extension of a cataloged file.
 fn extension(file: &FileRecord) -> String {
-    decode::extension(&file.path)
+    crate::media::extension(Path::new(&file.path)).unwrap_or_default()
 }
 
 /// What the viewer shows for an image.
@@ -81,12 +78,11 @@ pub enum ViewSource {
 }
 
 /// What the viewer shows for an image: the original if browsers can show it, otherwise a
-/// preview if one can be made, otherwise the placeholder (e.g. RAW files).
+/// preview if pixrs can decode it (HEIC, TIFF), otherwise the placeholder (e.g. RAW files).
 pub fn view_source(file: &FileRecord) -> ViewSource {
-    let ext = extension(file);
-    if SHOWN_BY_BROWSERS.contains(&ext.as_str()) {
+    if SHOWN_BY_BROWSERS.contains(&extension(file).as_str()) {
         ViewSource::Original
-    } else if SHOWN_AS_PREVIEW.contains(&ext.as_str()) {
+    } else if image_decoder(&file.path).is_some() {
         ViewSource::Preview
     } else {
         ViewSource::Placeholder
@@ -97,7 +93,7 @@ pub fn view_source(file: &FileRecord) -> ViewSource {
 fn decoder(file: &FileRecord) -> Option<Decoder> {
     match file.media_type {
         MediaType::Image => match image_decoder(&file.path)? {
-            decode::Decoder::InProcess => Some(Decoder::InProcess),
+            decode::Decoder::InProcess(_) => Some(Decoder::InProcess),
             decode::Decoder::Ffmpeg => Some(Decoder::FfmpegImage),
         },
         MediaType::Video => Some(Decoder::FfmpegVideo),
@@ -136,10 +132,11 @@ impl Thumbnailer {
             Decoder::FfmpegImage | Decoder::FfmpegVideo => Some(self.ffmpeg.clone()?),
         };
         let key = cache_key(located, size);
-        let cached = cache_dir
+        // Spread over folders by the key's first two hex digits, so none holds too many files.
+        let dir = cache_dir
             .join(size.dir())
-            .join(&key[..2])
-            .join(format!("{key}.jpg"));
+            .join(key.get(..2).unwrap_or_default());
+        let cached = dir.join(format!("{key}.jpg"));
         if let Ok(jpeg) = tokio::fs::read(&cached).await {
             return Some(jpeg);
         }
@@ -162,18 +159,14 @@ impl Thumbnailer {
             }
         };
         match made {
-            Ok(jpeg) => {
-                let written = tokio::task::spawn_blocking(move || {
-                    let written = write_atomically(&cached, &jpeg);
-                    (written, cached, jpeg)
-                })
-                .await
-                .ok()?;
-                if let (Err(e), cached, _) = &written {
-                    warn!("Unable to cache {}: {}", shown(cached), e);
+            Ok(jpeg) => tokio::task::spawn_blocking(move || {
+                if let Err(e) = write_atomically(&dir, &cached, &jpeg) {
+                    warn!("Unable to cache {}: {}", shown(&cached), e);
                 }
-                Some(written.2)
-            }
+                jpeg
+            })
+            .await
+            .ok(),
             Err(e) => {
                 warn!(
                     "No thumbnail for {}: {}",
@@ -247,7 +240,7 @@ fn render_in_process(source: &Path, max: u32) -> Result<Vec<u8>, DecodeError> {
 }
 
 /// The image without transparency, on a white background.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "a blend of two bytes stays below 256"
 )]
@@ -324,11 +317,10 @@ async fn run(mut command: Command) -> Result<Vec<u8>, DecodeError> {
     }
 }
 
-/// Write `path` so that readers never see a partial file. The contents go through a new
-/// temporary file pixrs created, which only takes the place of `path` if its name still leads
-/// to that file.
-fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let dir = path.parent().expect("cache files are in a folder");
+/// Write `path` in the folder `dir` so that readers never see a partial file. The contents go
+/// through a new temporary file pixrs created, which only takes the place of `path` if its name
+/// still leads to that file.
+fn write_atomically(dir: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let (temp, mut file) = reserve_temp(dir)?;
     let written = file.write_all(contents).and_then(|()| {
@@ -413,6 +405,17 @@ mod tests {
         assert_eq!(
             view_source(&record("h.nef", MediaType::Image)),
             ViewSource::Placeholder
+        );
+        for name in ["i.HEIC", "j.heif", "k.tif"] {
+            assert_eq!(
+                view_source(&record(name, MediaType::Image)),
+                ViewSource::Preview,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            view_source(&record("l.avif", MediaType::Image)),
+            ViewSource::Original
         );
     }
 

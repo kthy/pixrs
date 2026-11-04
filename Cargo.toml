@@ -37,7 +37,7 @@ maud = "0.27"                                                                   
 nom-exif = "3"                                                                                       # MIT
 open = "5"                                                                                           # MIT
 ring = "0.17"                                                                                        # It's complicated
-rusqlite = { version = "0.41", features = ["bundled"] }                                              # MIT (bundled SQLite is public domain)
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }                             # MIT (bundled SQLite is public domain)
 same-file = "1"                                                                                      # Unlicense OR MIT
 serde = { version = "1", features = ["derive"] }                                                     # MIT OR Apache-2.0
 serde_json = "1"                                                                                     # MIT OR Apache-2.0
@@ -74,3 +74,10 @@ option_if_let_else = "allow"
 too_long_first_doc_paragraph = "allow"
 # Pairs like `moving`/`moved` and `fault`/`faulty` name related things on purpose.
 similar_names = "allow"
+# Production code must not panic on bad input: no unwrap, expect, panic or slice indexing outside
+# tests (clippy.toml allows them in tests). A site that cannot fail by construction says why in
+# a narrow `#[expect]`.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
