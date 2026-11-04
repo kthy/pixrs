@@ -190,7 +190,10 @@ impl PlanError {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::SuffixWithoutN | Self::Overlap { .. } => exitcode::USAGE,
-            _ => exitcode::DATAERR,
+            Self::NotAPlan { .. }
+            | Self::Version { .. }
+            | Self::QuarantineOverlap { .. }
+            | Self::BadMove { .. } => exitcode::DATAERR,
         }
     }
 }

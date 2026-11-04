@@ -732,13 +732,13 @@ impl Catalog {
     }
 
     /// Move a file's row `from` one path `to` another, possibly in another library, if there is
-    /// a row at `from`. A row at `to` is dropped first with `replace` (when the file there is
-    /// known to be gone); without it, the row stays where it is. Returns whether it moved.
+    /// a row at `from`. What happens to a row at `to` is up to `existing`. Returns whether it
+    /// moved.
     pub fn rename_row(
         &self,
         from: &FileRef,
         to: &FileRef,
-        replace: bool,
+        existing: ExistingRow,
     ) -> rusqlite::Result<bool> {
         if from == to {
             return Ok(false);
@@ -748,10 +748,10 @@ impl Catalog {
             return Ok(false);
         }
         if self.has_row(to.library_id, &to.path)? {
-            if !replace {
-                return Ok(false);
+            match existing {
+                ExistingRow::Keep => return Ok(false),
+                ExistingRow::Replace => self.remove(to.library_id, &to.path)?,
             }
-            self.remove(to.library_id, &to.path)?;
         }
         self.conn.execute(
             "UPDATE files SET library_id = ?3, path = ?4 WHERE library_id = ?1 AND path = ?2",
@@ -1129,6 +1129,15 @@ impl AvSignature {
             Self::Audio(audio) => Some(&audio.values),
         }
     }
+}
+
+/// What `Catalog::rename_row` does with a row already at the new path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExistingRow {
+    /// Keep it, and leave the moved row where it is.
+    Keep,
+    /// Drop it first, as the file there is known to be gone.
+    Replace,
 }
 
 /// A catalog row's key: a library ID and a path in that library, with `/` separators.

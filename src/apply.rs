@@ -5,7 +5,7 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
-use crate::catalog::{Catalog, CatalogRow, Stamp};
+use crate::catalog::{Catalog, CatalogRow, ExistingRow, Stamp};
 use crate::digest::{same_digest, sha256_from, sha256_of, Hasher, READ_SIZE};
 use crate::error::{AtPath, Error};
 use crate::names::folded;
@@ -81,9 +81,13 @@ struct Intent {
 /// The start of a journal's first line, read before the rest so that a journal of another
 /// version is refused by its version, not by the first record that changed.
 #[derive(Deserialize)]
-struct Header {
-    event: String,
-    version: Option<u32>,
+#[serde(tag = "event", rename_all = "kebab-case")]
+enum Header {
+    Start {
+        version: Option<u32>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 /// What a temporary file is.
@@ -169,13 +173,22 @@ impl Drop for Lock {
     }
 }
 
-/// Test hooks for `apply`.
+/// Test hooks for `apply`, set per thread by tests (`tests::with_hooks`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ApplyOptions {
     /// Copy instead of renaming, as across file systems.
     pub(crate) force_copy: bool,
     /// Where to stop as if interrupted.
     pub(crate) stop: Option<Stop>,
+}
+
+/// The test hooks of this thread; none outside tests.
+fn hooks() -> ApplyOptions {
+    #[cfg(test)]
+    let hooks = tests::HOOKS.get();
+    #[cfg(not(test))]
+    let hooks = ApplyOptions::default();
+    hooks
 }
 
 /// Where a test stops `apply` as if it was interrupted.
@@ -189,6 +202,15 @@ pub(crate) enum Stop {
     InCopy,
     /// Halfway through the first rename that only changes letter case.
     InRename,
+}
+
+/// Which end of a move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// Where the file is.
+    Source,
+    /// Where it goes.
+    Target,
 }
 
 /// A file `apply` left where it was, and why.
@@ -409,8 +431,8 @@ pub enum Skip {
     KeeperChanged(PathBuf),
     /// It is the same file as the kept copy at this path.
     SameAsKeeper(PathBuf),
-    /// A symbolic link is on the way to its folder (`target`: its target folder).
-    ThroughLink { target: bool, dir: PathBuf },
+    /// A symbolic link is on the way to its folder on `side`.
+    ThroughLink { side: Side, dir: PathBuf },
     /// Whether a link is on the way to `dir` cannot be checked.
     Unchecked { dir: PathBuf, source: io::Error },
     /// Its target folder cannot be created.
@@ -434,13 +456,12 @@ impl fmt::Display for Skip {
             Self::SameAsKeeper(path) => {
                 write!(f, "it is the same file as the kept copy {}", path.display())
             }
-            Self::ThroughLink { target, dir } => write!(
+            Self::ThroughLink { side, dir } => write!(
                 f,
                 "{} {} is reached through a symbolic link",
-                if *target {
-                    "its target folder"
-                } else {
-                    "its folder"
+                match side {
+                    Side::Source => "its folder",
+                    Side::Target => "its target folder",
                 },
                 dir.display()
             ),
@@ -663,14 +684,13 @@ fn copy_verified(
     via: &Path,
     copy: &mut File,
     stamp: Stamp,
-    stop_in_copy: bool,
 ) -> Result<Digest, MoveFault> {
     let mut source = BufReader::with_capacity(READ_SIZE, File::open(from)?);
     let mut writer = HashingWriter {
         file: &mut *copy,
         hasher: Hasher::new(),
     };
-    if stop_in_copy {
+    if hooks().stop == Some(Stop::InCopy) {
         io::copy(&mut source.take(stamp.size / 2), &mut writer)?;
         return Err(MoveFault::Stopped);
     }
@@ -698,23 +718,22 @@ fn move_file(
     from: &Path,
     to: &Path,
     stamp: Stamp,
-    opts: &ApplyOptions,
     note_via: impl FnMut(&Path, Via) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     if spelling_only(from, to) {
-        return rename_spelling(from, to, opts, note_via);
+        return rename_spelling(from, to, note_via);
     }
     if exists(to) {
         return Err(MoveError::Taken);
     }
-    if !opts.force_copy {
+    if !hooks().force_copy {
         match fs::rename(from, to) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {}
             Err(e) => return Err(MoveError::Failed(e.into())),
         }
     }
-    copy_across(from, to, stamp, opts, note_via)
+    copy_across(from, to, stamp, note_via)
 }
 
 /// The folder a target goes in.
@@ -728,7 +747,6 @@ fn folder_of(path: &Path) -> &Path {
 fn rename_spelling(
     from: &Path,
     to: &Path,
-    opts: &ApplyOptions,
     mut note_via: impl FnMut(&Path, Via) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     if exactly_there(to).unwrap_or(true) && !same_file(from, to) {
@@ -746,7 +764,7 @@ fn rename_spelling(
         let _ = fs::remove_file(&via);
         return Err(MoveError::Failed(e.into()));
     }
-    if opts.stop == Some(Stop::InRename) {
+    if hooks().stop == Some(Stop::InRename) {
         return Err(MoveError::Partial(MoveFault::Stopped));
     }
     // `from` is out of the way now, so anything at `to` is another file. Go back if the old
@@ -774,7 +792,6 @@ fn copy_across(
     from: &Path,
     to: &Path,
     stamp: Stamp,
-    opts: &ApplyOptions,
     mut note_via: impl FnMut(&Path, Via) -> io::Result<()>,
 ) -> Result<(), MoveError> {
     let dir = folder_of(to);
@@ -784,7 +801,6 @@ fn copy_across(
         shown(from),
         shown(&via)
     );
-    let stop_in_copy = opts.stop == Some(Stop::InCopy);
     let copied = note_via(
         &via,
         Via::Copy {
@@ -792,12 +808,12 @@ fn copy_across(
         },
     )
     .map_err(MoveFault::from)
-    .and_then(|()| copy_verified(from, &via, &mut copy, stamp, stop_in_copy));
+    .and_then(|()| copy_verified(from, &via, &mut copy, stamp));
     let hash = match copied {
         Ok(hash) => hash,
-        Err(e) if stop_in_copy => {
+        Err(MoveFault::Stopped) => {
             // As if the process died here: the partial copy stays for undo to clean up.
-            return Err(MoveError::Partial(e));
+            return Err(MoveError::Partial(MoveFault::Stopped));
         }
         Err(e) => {
             discard(&via, copy);
@@ -856,41 +872,57 @@ fn unchanged(path: &Path, stamp: Stamp) -> Result<(), Skip> {
 #[derive(Default)]
 struct KnownFolders(HashSet<PathBuf>);
 
-/// Whether a symbolic link is on the way to `dir`, so that it is somewhere else than its path
-/// says. With a `base` that `dir` is below, `base` must be where its path says (canonical), as
-/// the roots plans are made from are, and the parts after it must not be links, as far as they
-/// exist: the rest are created below them. Without one (`undo` has no plan), the nearest
-/// existing ancestor of `dir` must be canonical. What is found real is remembered in `known`.
-fn through_symlink(dir: &Path, base: Option<&Path>, known: &mut KnownFolders) -> io::Result<bool> {
-    if known.0.contains(dir) {
+impl KnownFolders {
+    fn contains(&self, dir: &Path) -> bool {
+        self.0.contains(dir)
+    }
+
+    fn insert(&mut self, dir: PathBuf) {
+        self.0.insert(dir);
+    }
+}
+
+/// Whether `dir` is somewhere else than its path says: its nearest existing ancestor (itself,
+/// if it exists) is not canonical, so a symbolic link is on the way. For `undo`, which has no
+/// plan whose roots are canonical. What is found real is remembered in `known`.
+fn off_its_path(dir: &Path, known: &mut KnownFolders) -> io::Result<bool> {
+    if known.contains(dir) {
         return Ok(false);
     }
-    let below_base = base.and_then(|base| Some((base, dir.strip_prefix(base).ok()?)));
-    let Some((base, rest)) = below_base else {
-        let existing = dir.ancestors().find(|d| exists(d)).unwrap_or(dir);
-        if known.0.contains(existing) {
-            return Ok(false);
-        }
-        let real = fs::canonicalize(existing)? == existing;
-        if real {
-            known.0.insert(existing.to_path_buf());
-        }
-        return Ok(!real);
+    let existing = dir.ancestors().find(|d| exists(d)).unwrap_or(dir);
+    if known.contains(existing) {
+        return Ok(false);
+    }
+    let real = fs::canonicalize(existing)? == existing;
+    if real {
+        known.insert(existing.to_path_buf());
+    }
+    Ok(!real)
+}
+
+/// Whether a symbolic link is on the way from `base` to `dir`, which is below it: `base` must
+/// be where its path says (canonical), as the roots plans are made from are, and the parts
+/// after it must not be links, as far as they exist; the rest are created below them. What is
+/// found real is remembered in `known`.
+fn link_below(base: &Path, dir: &Path, known: &mut KnownFolders) -> io::Result<bool> {
+    if known.contains(dir) {
+        return Ok(false);
+    }
+    let Ok(rest) = dir.strip_prefix(base) else {
+        return off_its_path(dir, known);
     };
-    if through_symlink(base, None, known)? {
+    if off_its_path(base, known)? {
         return Ok(true);
     }
     let mut path = base.to_path_buf();
     for part in rest.components() {
         path.push(part);
-        if known.0.contains(&path) {
+        if known.contains(&path) {
             continue;
         }
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
-            Ok(meta) if meta.is_dir() => {
-                known.0.insert(path.clone());
-            }
+            Ok(meta) if meta.is_dir() => known.insert(path.clone()),
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
@@ -901,7 +933,7 @@ fn through_symlink(dir: &Path, base: Option<&Path>, known: &mut KnownFolders) ->
 
 /// `Err` for a move into `dir` if a symbolic link is on the way to it, or it cannot be checked.
 fn link_free(dir: &Path, known: &mut KnownFolders) -> Result<(), MoveError> {
-    match through_symlink(dir, None, known) {
+    match off_its_path(dir, known) {
         Ok(false) => Ok(()),
         Ok(true) => Err(MoveError::Failed(MoveFault::ThroughLink(dir.to_path_buf()))),
         Err(e) => Err(MoveError::Failed(e.into())),
@@ -921,18 +953,22 @@ fn not_misplaced(m: &Move, plan: &Plan, known: &mut KnownFolders) -> Result<(), 
         .map(|l| l.root.as_path())
         .find(|root| m.from.starts_with(root));
     let destination = Some(plan.destination.as_path());
-    for (target, dir, base) in [
-        (false, m.from.parent(), root),
-        (true, m.to.parent(), destination),
+    for (side, dir, base) in [
+        (Side::Source, m.from.parent(), root),
+        (Side::Target, m.to.parent(), destination),
     ] {
         let Some(dir) = dir else {
             continue;
         };
-        match through_symlink(dir, base, known) {
+        let linked = match base.filter(|base| dir.starts_with(base)) {
+            Some(base) => link_below(base, dir, known),
+            None => off_its_path(dir, known),
+        };
+        match linked {
             Ok(false) => {}
             Ok(true) => {
                 return Err(Skip::ThroughLink {
-                    target,
+                    side,
                     dir: dir.to_path_buf(),
                 })
             }
@@ -1013,69 +1049,22 @@ impl std::error::Error for ApplyError {
 
 /// Carry out the plan in `plan_path`.
 pub fn apply(plan_path: &Path, plan: &Plan) -> Result<ApplySummary, ApplyError> {
-    apply_with(plan_path, plan, &ApplyOptions::default())
-}
-
-/// `apply`, with test hooks.
-pub(crate) fn apply_with(
-    plan_path: &Path,
-    plan: &Plan,
-    opts: &ApplyOptions,
-) -> Result<ApplySummary, ApplyError> {
-    let mut journal = None;
-    apply_journaled(plan_path, plan, opts, &mut journal)
-        .map_err(|error| ApplyError { error, journal })
-}
-
-/// `apply`, which tells the journal it started as soon as there is one.
-fn apply_journaled(
-    plan_path: &Path,
-    plan: &Plan,
-    opts: &ApplyOptions,
-    journal_out: &mut Option<PathBuf>,
-) -> Result<ApplySummary, Error> {
-    // `read_plan` checks too; a plan built in code is checked here.
-    plan.check()?;
-    // The journal names the plan, and journals are UTF-8.
-    crate::error::utf8(plan_path, "Plan")?;
-    let catalog = Catalog::open_for_update(&plan.catalog)?;
-    let _lock = Lock::take(&plan.catalog)?;
-    let (mut journal, journal_path) = new_journal(plan_path, &plan.catalog)?;
-    *journal_out = Some(journal_path.clone());
-    journal.write(&Record::Start {
-        version: PLAN_VERSION,
-        plan: plan_path.to_path_buf(),
-        catalog: plan.catalog.clone(),
+    let run = Run::start(plan_path, plan).map_err(|error| ApplyError {
+        error,
+        journal: None,
     })?;
-    let mut run = Run {
-        plan,
-        opts,
-        catalog,
-        journal,
-        known: KnownFolders::default(),
-        done: vec![false; plan.moves.len()],
-        summary: ApplySummary {
-            journal: journal_path,
-            ..ApplySummary::default()
-        },
-    };
-    for (index, m) in plan.moves.iter().enumerate() {
-        run.carry_out(index, m)?;
-    }
-    if let PlanKind::Organize {
-        prune_empty: true, ..
-    } = plan.kind
-    {
-        run.prune_emptied()?;
-    }
-    run.journal.write(&Record::Finished)?;
-    Ok(run.summary)
+    let journal = run.summary.journal.clone();
+    run.carry_out_all(plan_path).map_err(|error| ApplyError {
+        error,
+        journal: Some(journal),
+    })
 }
 
 /// A run of `apply`: the plan, the open catalog and journal, and what has happened so far.
 struct Run<'a> {
     plan: &'a Plan,
-    opts: &'a ApplyOptions,
+    /// Held until the run ends.
+    _lock: Lock,
     catalog: Catalog,
     journal: Journal,
     known: KnownFolders,
@@ -1084,7 +1073,52 @@ struct Run<'a> {
     summary: ApplySummary,
 }
 
-impl Run<'_> {
+impl<'a> Run<'a> {
+    /// Check the plan, take the lock and open the catalog and a new journal.
+    fn start(plan_path: &Path, plan: &'a Plan) -> Result<Self, Error> {
+        // `read_plan` checks too; a plan built in code is checked here.
+        plan.check()?;
+        // The journal names the plan, and journals are UTF-8.
+        crate::error::utf8(plan_path, "Plan")?;
+        let catalog = Catalog::open_for_update(&plan.catalog)?;
+        let lock = Lock::take(&plan.catalog)?;
+        let (journal, journal_path) = new_journal(plan_path, &plan.catalog)?;
+        Ok(Self {
+            plan,
+            _lock: lock,
+            catalog,
+            journal,
+            known: KnownFolders::default(),
+            done: vec![false; plan.moves.len()],
+            summary: ApplySummary {
+                journal: journal_path,
+                ..ApplySummary::default()
+            },
+        })
+    }
+
+    /// Carry out every move of the plan, journaled, and prune the folders they emptied if the
+    /// plan says so.
+    fn carry_out_all(mut self, plan_path: &Path) -> Result<ApplySummary, Error> {
+        let plan = self.plan;
+        self.journal.write(&Record::Start {
+            version: PLAN_VERSION,
+            plan: plan_path.to_path_buf(),
+            catalog: plan.catalog.clone(),
+        })?;
+        for (index, m) in plan.moves.iter().enumerate() {
+            self.carry_out(index, m)?;
+        }
+        if let PlanKind::Organize {
+            prune_empty: true, ..
+        } = plan.kind
+        {
+            self.prune_emptied()?;
+        }
+        self.journal.write(&Record::Finished)?;
+        Ok(self.summary)
+    }
+
     /// Carry out the move at `index`, or skip it. `Err` only for a failure that ends the run.
     fn carry_out(&mut self, index: usize, m: &Move) -> Result<(), Error> {
         let checked =
@@ -1100,7 +1134,7 @@ impl Run<'_> {
             planned: m.clone(),
         }))?;
         let journal = &mut self.journal;
-        let moved = move_file(&m.from, &m.to, m.stamp, self.opts, |path, via| {
+        let moved = move_file(&m.from, &m.to, m.stamp, |path, via| {
             journal.via(index, path, via)
         });
         match moved {
@@ -1122,11 +1156,11 @@ impl Run<'_> {
             *done = true;
         }
         self.summary.moved += 1;
-        if self.opts.stop == Some(Stop::BeforeCatalog) {
+        if hooks().stop == Some(Stop::BeforeCatalog) {
             return Err(Error::Interrupted);
         }
         update_catalog(&self.catalog, &mut self.journal, index, m)?;
-        if self.opts.stop == Some(Stop::AfterMoves(self.summary.moved)) {
+        if hooks().stop == Some(Stop::AfterMoves(self.summary.moved)) {
             return Err(Error::Interrupted);
         }
         Ok(())
@@ -1196,7 +1230,7 @@ fn create_folders(
     };
     let missing: Vec<&Path> = dir
         .ancestors()
-        .take_while(|d| !known.0.contains(*d) && !exists(d))
+        .take_while(|d| !known.contains(d) && !exists(d))
         .collect();
     for folder in missing.into_iter().rev() {
         journal.write(&Record::Mkdir {
@@ -1209,7 +1243,7 @@ fn create_folders(
         if let Some(parent) = folder.parent() {
             sync_dir(parent)?;
         }
-        known.0.insert(folder.to_path_buf());
+        known.insert(folder.to_path_buf());
     }
     Ok(())
 }
@@ -1229,7 +1263,7 @@ fn update_catalog(
         } => {
             // A row at the target is stale: the file there was gone, or the move would not
             // have happened.
-            catalog.rename_row(row, &row.with_path(new_path), true)?;
+            catalog.rename_row(row, &row.with_path(new_path), ExistingRow::Replace)?;
         }
         MoveKind::Organize {
             row,
@@ -1304,7 +1338,7 @@ impl std::error::Error for JournalError {
 /// `Err` unless `line`, the first of the journal at `path`, starts a journal of this version.
 fn check_start(path: &Path, line: &str) -> Result<(), JournalError> {
     match serde_json::from_str::<Header>(line) {
-        Ok(Header { event, version }) if event == "start" => {
+        Ok(Header::Start { version }) => {
             if version == Some(PLAN_VERSION) {
                 Ok(())
             } else {
@@ -1359,9 +1393,10 @@ enum Found {
 }
 
 /// Where the file of a journaled move is, a file with `stamp`. Only a copy pixrs made itself (a
-/// temporary copy is journaled for the move, and the two names are different files with the
-/// same contents) counts as a copy that may be removed.
-fn locate(from: &Path, to: &Path, stamp: Stamp, had_copy: bool) -> io::Result<Found> {
+/// temporary copy is among the move's journaled `vias`, and the two names are different files
+/// with the same contents) counts as a copy that may be removed.
+fn locate(from: &Path, to: &Path, stamp: Stamp, vias: &[&ViaFile]) -> io::Result<Found> {
+    let had_copy = vias.iter().any(|v| matches!(v.via, Via::Copy { .. }));
     let neither = || {
         Found::Unclear(UndoWarning::Missing {
             from: from.to_path_buf(),
@@ -1641,8 +1676,7 @@ impl Undo {
             debug!("Move {}: skipped by apply; {} stays", i, shown(from));
             return Ok(());
         }
-        let had_copy = vias.iter().any(|v| matches!(v.via, Via::Copy { .. }));
-        let found = locate(from, to, planned.stamp, had_copy).unwrap_or_else(|error| {
+        let found = locate(from, to, planned.stamp, &vias).unwrap_or_else(|error| {
             Found::Unclear(UndoWarning::CannotCheck {
                 target: to.to_path_buf(),
                 error,
@@ -1671,9 +1705,7 @@ impl Undo {
                 // says, as the roots plans are made from are.
                 let journal = &mut self.journal;
                 let moved = link_free(folder_of(from), &mut self.known).and_then(|()| {
-                    move_file(to, from, m.stamp, &ApplyOptions::default(), |path, via| {
-                        journal.via(index, path, via)
-                    })
+                    move_file(to, from, m.stamp, |path, via| journal.via(index, path, via))
                 });
                 match moved {
                     Ok(()) => {
@@ -1723,7 +1755,7 @@ impl Undo {
                 new_path: Some(new_path),
             } => {
                 self.catalog
-                    .rename_row(&row.with_path(new_path), row, false)?;
+                    .rename_row(&row.with_path(new_path), row, ExistingRow::Keep)?;
             }
             MoveKind::Organize {
                 row,
@@ -1989,6 +2021,22 @@ mod tests {
         /// cannot flush folders.
         static FOLDER_SYNC_ERROR: std::cell::Cell<Option<i32>> =
             const { std::cell::Cell::new(None) };
+
+        /// The test hooks `apply` runs with on this thread.
+        pub(super) static HOOKS: std::cell::Cell<ApplyOptions> =
+            const { std::cell::Cell::new(ApplyOptions { force_copy: false, stop: None }) };
+    }
+
+    /// `apply`, with test hooks.
+    fn apply_with(
+        plan_path: &Path,
+        plan: &Plan,
+        opts: &ApplyOptions,
+    ) -> Result<ApplySummary, ApplyError> {
+        HOOKS.set(*opts);
+        let result = apply(plan_path, plan);
+        HOOKS.set(ApplyOptions::default());
+        result
     }
 
     pub(super) fn folder_sync_result() -> io::Result<()> {
@@ -2063,7 +2111,7 @@ mod tests {
             size: 9,
             mtime_ns: 0,
         };
-        let hash = copy_verified(&from, &via, &mut copy, stamp, false).unwrap();
+        let hash = copy_verified(&from, &via, &mut copy, stamp).unwrap();
         assert!(same_digest(&hash, &sha256_of(&from).unwrap()));
         assert_eq!(fs::read(&via).unwrap(), b"the photo");
         discard(&via, copy);
@@ -2095,7 +2143,7 @@ mod tests {
             size: 9,
             mtime_ns: 0,
         };
-        copy_verified(&from, &via, &mut copy, stamp, false).unwrap();
+        copy_verified(&from, &via, &mut copy, stamp).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"precious");
         assert!(!still_ours(&via, &copy));
         discard(&via, copy);
