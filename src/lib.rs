@@ -28,6 +28,7 @@ pub mod digest;
 pub mod dupes;
 pub mod error;
 pub mod imagehash;
+pub mod library;
 pub mod logging;
 pub mod media;
 pub mod names;

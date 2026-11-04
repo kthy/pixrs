@@ -7,8 +7,9 @@
 
 use super::thumbs::{self, ViewSource};
 use super::{AppError, AppState, Located};
-use crate::catalog::{display_root, FileRecord, Filter, HashedFile, Neighbors, Page, Tally};
+use crate::catalog::{FileRecord, Filter, HashedFile, Neighbors, Page, Tally};
 use crate::dupes::{human_mtime, plural, DupeGroup, Role, Tier};
+use crate::library::{LibraryId, Root};
 use crate::media::MediaType;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -81,7 +82,7 @@ struct Context {
 }
 
 impl Context {
-    fn view_url(self, library_id: i64, path: &str) -> String {
+    fn view_url(self, library_id: LibraryId, path: &str) -> String {
         with_query(
             &file_url("view", library_id, path),
             &[
@@ -101,17 +102,17 @@ fn encode_path(path: &str) -> String {
 }
 
 /// URL of a file under one of the per-file routes (`view`, `media`, `thumb`, `preview`).
-fn file_url(route: &str, library_id: i64, path: &str) -> String {
+fn file_url(route: &str, library_id: LibraryId, path: &str) -> String {
     format!("/{}/{}/{}", route, library_id, encode_path(path))
 }
 
 /// URL of a thumbnail. The mtime makes a changed file's thumbnail a new URL for browser caches.
-fn thumb_url(library_id: i64, path: &str, mtime_ns: i64) -> String {
+fn thumb_url(library_id: LibraryId, path: &str, mtime_ns: i64) -> String {
     format!("{}?v={}", file_url("thumb", library_id, path), mtime_ns)
 }
 
 /// URL of a folder; `""` is the library root.
-fn folder_url(library_id: i64, dir: &str) -> String {
+fn folder_url(library_id: LibraryId, dir: &str) -> String {
     if dir.is_empty() {
         format!("/folders/{library_id}")
     } else {
@@ -208,7 +209,7 @@ fn layout(
 }
 
 /// One file in a listing.
-fn tile(library_id: i64, file: &FileRecord, context: Context) -> Markup {
+fn tile(library_id: LibraryId, file: &FileRecord, context: Context) -> Markup {
     html! {
         a.tile href=(context.view_url(library_id, &file.path)) title=(file.path) {
             img loading="lazy" alt=""
@@ -272,7 +273,7 @@ pub async fn libraries(
             @for library in shown {
                 li {
                     a href=(with_type(&folder_url(library.id, ""), media_type)) {
-                        (display_root(&library.root))
+                        (library.root.to_string())
                     }
                     span.count { (library.files) " files" }
                     @if let Some(scanned_at) = &library.scanned_at {
@@ -288,7 +289,7 @@ pub async fn libraries(
 /// `/folders/{lib}`: the root folder of a library.
 pub async fn folder_root(
     State(state): State<Arc<AppState>>,
-    UrlPath(library_id): UrlPath<i64>,
+    UrlPath(library_id): UrlPath<LibraryId>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
     folder_page(state, library_id, String::new(), query).await
@@ -297,7 +298,7 @@ pub async fn folder_root(
 /// `/folders/{lib}/{*dir}`: a folder in a library.
 pub async fn folder(
     State(state): State<Arc<AppState>>,
-    UrlPath((library_id, dir)): UrlPath<(i64, String)>,
+    UrlPath((library_id, dir)): UrlPath<(LibraryId, String)>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
     let dir = String::from(dir.trim_end_matches('/'));
@@ -306,7 +307,7 @@ pub async fn folder(
 
 async fn folder_page(
     state: Arc<AppState>,
-    library_id: i64,
+    library_id: LibraryId,
     dir: String,
     query: ListQuery,
 ) -> Result<Response, AppError> {
@@ -353,7 +354,7 @@ async fn folder_page(
     };
 
     let title = if dir.is_empty() {
-        display_root(&root)
+        root.to_string()
     } else {
         String::from(file_name(&dir))
     };
@@ -387,7 +388,7 @@ async fn folder_page(
 }
 
 /// The links from the libraries to the folder `dir` of a library, one per folder on the way.
-fn crumbs(library_id: i64, root: &str, dir: &str, media_type: Option<MediaType>) -> Markup {
+fn crumbs(library_id: LibraryId, root: &Root, dir: &str, media_type: Option<MediaType>) -> Markup {
     // Each folder on the way, as its path in the library and its name.
     let folders: Vec<(&str, &str)> = if dir.is_empty() {
         vec![]
@@ -401,7 +402,7 @@ fn crumbs(library_id: i64, root: &str, dir: &str, media_type: Option<MediaType>)
             a href="/" { "Libraries" }
             " / "
             a href=(with_type(&folder_url(library_id, ""), media_type)) {
-                (display_root(root))
+                (root)
             }
             @for (path, name) in folders {
                 " / "
@@ -692,7 +693,7 @@ struct Surroundings {
 impl Surroundings {
     async fn of(
         state: &Arc<AppState>,
-        library_id: i64,
+        library_id: LibraryId,
         file: &FileRecord,
         context: Context,
     ) -> Result<Self, AppError> {
@@ -721,9 +722,9 @@ impl Surroundings {
                 })
             })
             .await?;
-        found
-            .copies
-            .sort_by(|a, b| (a.mtime_ns, &a.root, &a.path).cmp(&(b.mtime_ns, &b.root, &b.path)));
+        found.copies.sort_by(|a, b| {
+            (a.stamp.mtime_ns, &a.root, &a.path).cmp(&(b.stamp.mtime_ns, &b.root, &b.path))
+        });
         Ok(found)
     }
 }
@@ -731,7 +732,7 @@ impl Surroundings {
 /// `/view/{lib}/{*path}`: one file, full size, with its details and prev/next links.
 pub async fn view(
     State(state): State<Arc<AppState>>,
-    UrlPath((library_id, path)): UrlPath<(i64, String)>,
+    UrlPath((library_id, path)): UrlPath<(LibraryId, String)>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
     let Located {
@@ -775,7 +776,7 @@ fn pager(path: &str, neighbors: &Neighbors, context: Context) -> Markup {
 }
 
 /// The file itself: an image, or a player.
-fn stage(library_id: i64, file: &FileRecord, codec: Option<&str>) -> Markup {
+fn stage(library_id: LibraryId, file: &FileRecord, codec: Option<&str>) -> Markup {
     let media_url = file_url("media", library_id, &file.path);
     html! {
         div.stage {
@@ -801,7 +802,7 @@ fn stage(library_id: i64, file: &FileRecord, codec: Option<&str>) -> Markup {
 }
 
 /// What the viewer shows of an image: the original, a preview, or the placeholder.
-fn image_source(library_id: i64, file: &FileRecord) -> String {
+fn image_source(library_id: LibraryId, file: &FileRecord) -> String {
     match thumbs::view_source(file) {
         ViewSource::Original => file_url("media", library_id, &file.path),
         ViewSource::Preview => format!(
@@ -814,7 +815,7 @@ fn image_source(library_id: i64, file: &FileRecord) -> String {
 }
 
 /// What the catalog knows about the file in the library at `root`.
-fn details(file: &FileRecord, root: &str, date: Option<&str>, codec: Option<&str>) -> Markup {
+fn details(file: &FileRecord, root: &Root, date: Option<&str>, codec: Option<&str>) -> Markup {
     let dubious_date = file
         .meta
         .taken()
@@ -836,7 +837,7 @@ fn details(file: &FileRecord, root: &str, date: Option<&str>, codec: Option<&str
             }
             dt { "Size" } dd { (HumanBytes(file.stamp.size)) }
             @if let Some(codec) = codec { dt { "Codec" } dd { (codec) } }
-            dt { "Library" } dd { (display_root(root)) }
+            dt { "Library" } dd { (root) }
             dt { "Path" } dd { (file.path) }
             @if let Some(sha256) = &file.sha256 { dt { "SHA-256" } dd.hash { (sha256) } }
         }
@@ -844,7 +845,12 @@ fn details(file: &FileRecord, root: &str, date: Option<&str>, codec: Option<&str
 }
 
 /// The file's identical copies, oldest (the one `dupes` keeps) first, if it has any.
-fn copies_list(library_id: i64, path: &str, copies: &[HashedFile], context: Context) -> Markup {
+fn copies_list(
+    library_id: LibraryId,
+    path: &str,
+    copies: &[HashedFile],
+    context: Context,
+) -> Markup {
     html! {
         @if copies.len() > 1 {
             h2 { "Identical copies" }
@@ -855,7 +861,7 @@ fn copies_list(library_id: i64, path: &str, copies: &[HashedFile], context: Cont
                             "This file"
                         } @else {
                             a href=(context.view_url(copy.library_id, &copy.path)) {
-                                (display_root(&copy.root)) " / " (copy.path)
+                                (copy.root.to_string()) " / " (copy.path)
                             }
                         }
                         @if i == 0 { " " span.badge.keep { "keep" } }
@@ -875,10 +881,10 @@ mod tests {
     #[test]
     fn test_urls() {
         assert_eq!(
-            file_url("media", 3, "a b/ø#?.jpg"),
+            file_url("media", LibraryId(3), "a b/ø#?.jpg"),
             "/media/3/a%20b/%C3%B8%23%3F.jpg"
         );
-        assert_eq!(folder_url(1, ""), "/folders/1");
+        assert_eq!(folder_url(LibraryId(1), ""), "/folders/1");
         assert_eq!(
             with_query("/x", &[("type", Some("image")), ("page", None)]),
             "/x?type=image"

@@ -244,7 +244,7 @@ fn print_video_copies(videos: &[HashedAv], opt: &Opt, ffmpeg: &Path, ffprobe: &P
     for variant in VIDEO_VARIANTS {
         let mut results = vec![];
         for (n, video) in videos.iter().step_by(step).take(opt.sample).enumerate() {
-            let source = library_path(Path::new(&video.file.root), &video.file.path);
+            let source = library_path(video.file.root.as_path(), &video.file.path);
             let copy = out.join(format!("variant-{n}.{}", variant.extension));
             if !encode(ffmpeg, &source, variant.options, &copy) {
                 continue;

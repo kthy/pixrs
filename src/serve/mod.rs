@@ -11,6 +11,7 @@ mod thumbs;
 use crate::catalog::{library_path, within, Catalog, FileRecord};
 use crate::dupes::{group_dupes, load_dupes, DupeReport, Similarity};
 use crate::error::{AtPath, Error};
+use crate::library::{LibraryId, Root};
 use crate::scan::resolve;
 use crate::text::printable;
 use axum::body::Body;
@@ -42,7 +43,7 @@ static JS: &str = include_str!("assets/pixrs.js");
 pub struct Config {
     pub catalog: Catalog,
     /// Only show files in these libraries; all if empty.
-    pub libraries: Vec<i64>,
+    pub libraries: Vec<LibraryId>,
     /// Where thumbnails are cached. Without one, every file gets a placeholder.
     pub cache_dir: Option<PathBuf>,
     pub port: u16,
@@ -53,7 +54,7 @@ pub struct Config {
 /// Shared state of the running viewer.
 pub(crate) struct AppState {
     catalog: Mutex<Catalog>,
-    libraries: Vec<i64>,
+    libraries: Vec<LibraryId>,
     thumbs: Thumbnailer,
     /// `ffprobe`, if it is on `PATH`.
     ffprobe: Option<PathBuf>,
@@ -134,7 +135,7 @@ impl IntoResponse for AppError {
 /// A cataloged file and where it is on disk.
 pub(crate) struct Located {
     /// Root of its library, as stored in the catalog.
-    pub root: String,
+    pub root: Root,
     pub full_path: PathBuf,
     pub file: FileRecord,
 }
@@ -196,7 +197,7 @@ impl AppState {
     }
 
     /// Whether the listings show the library.
-    pub(crate) fn shows(&self, library_id: i64) -> bool {
+    pub(crate) fn shows(&self, library_id: LibraryId) -> bool {
         self.libraries.is_empty() || self.libraries.contains(&library_id)
     }
 
@@ -205,7 +206,7 @@ impl AppState {
     /// found too, since duplicate groups show copies in every library.
     pub(crate) async fn locate(
         self: &Arc<Self>,
-        library_id: i64,
+        library_id: LibraryId,
         path: String,
     ) -> Result<Located, AppError> {
         let found = self
@@ -216,7 +217,7 @@ impl AppState {
             .await?;
         let (root, file) = found.ok_or(AppError::NotFound)?;
         Ok(Located {
-            full_path: library_path(Path::new(&root), &file.path),
+            full_path: library_path(root.as_path(), &file.path),
             root,
             file,
         })
@@ -281,7 +282,7 @@ fn allowed_hosts(port: u16) -> Vec<String> {
 fn check_cache_outside_libraries(catalog: &Catalog, cache_dir: &Path) -> Result<(), Error> {
     let cache_dir = resolve(cache_dir).at(cache_dir)?;
     for library in catalog.libraries()? {
-        if within(&cache_dir, Path::new(&library.root)) {
+        if within(&cache_dir, library.root.as_path()) {
             return Err(Error::CacheInLibrary {
                 cache: cache_dir,
                 library: library.root,
@@ -424,7 +425,7 @@ fn asset(body: &'static str, content_type: &'static str) -> Response {
 /// The original file, with range requests so audio and video can seek.
 async fn media(
     State(state): State<Arc<AppState>>,
-    UrlPath((lib, path)): UrlPath<(i64, String)>,
+    UrlPath((lib, path)): UrlPath<(LibraryId, String)>,
     req: Request,
 ) -> Result<Response, AppError> {
     let located = state.locate(lib, path).await?;
@@ -435,7 +436,7 @@ async fn media(
 /// A small JPEG for listings, or a placeholder.
 async fn thumb(
     State(state): State<Arc<AppState>>,
-    UrlPath((lib, path)): UrlPath<(i64, String)>,
+    UrlPath((lib, path)): UrlPath<(LibraryId, String)>,
 ) -> Result<Response, AppError> {
     let located = state.locate(lib, path).await?;
     Ok(rendition(&state, &located, Size::Thumb).await)
@@ -444,7 +445,7 @@ async fn thumb(
 /// A large JPEG of an image the browser cannot show itself, or a placeholder.
 async fn preview(
     State(state): State<Arc<AppState>>,
-    UrlPath((lib, path)): UrlPath<(i64, String)>,
+    UrlPath((lib, path)): UrlPath<(LibraryId, String)>,
 ) -> Result<Response, AppError> {
     let located = state.locate(lib, path).await?;
     Ok(rendition(&state, &located, Size::Preview).await)
@@ -495,7 +496,7 @@ mod tests {
         root: PathBuf,
         cache: PathBuf,
         app: Router,
-        library_id: i64,
+        library_id: LibraryId,
     }
 
     fn fixture(ffmpeg: bool) -> Fixture {
@@ -654,7 +655,7 @@ mod tests {
             format!("/media/{lib}/sub%20dir/../secret.txt"),
             format!("/media/{lib}/..%2Fsecret.txt"),
             format!("/media/{lib}/%2E%2E/%2E%2E/etc/passwd"),
-            format!("/media/{}/sub%20dir/red%20%C3%A9.png", lib + 1),
+            format!("/media/{}/sub%20dir/red%20%C3%A9.png", lib.0 + 1),
         ] {
             assert_eq!(
                 get(&f.app, &uri, host).await.status(),

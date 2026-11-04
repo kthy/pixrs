@@ -10,7 +10,7 @@ use crate::avhash::{
     VideoSignature,
 };
 use crate::catalog::{
-    cataloged_spelling, display_root, library_path, within, Catalog, FileRecord, HashVersion,
+    cataloged_spelling, library_path, within, Catalog, FileRecord, HashVersion, LibraryRoot,
     MediaMeta, Stamp, UnhashedFile,
 };
 use crate::dates::quicktime_creation;
@@ -18,6 +18,7 @@ use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, To
 use crate::digest::sha256_from;
 use crate::error::{utf8, AtPath, Error};
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
+use crate::library::{LibraryId, Root};
 use crate::media::MediaType;
 use crate::names::nfc;
 use crate::text::{printable, shown};
@@ -95,9 +96,9 @@ pub struct ScanSummary {
     pub media_without_decoder: usize,
     /// The root of the library the scanned folder is part of, if it is not that library's root.
     /// Only that part of the library was scanned.
-    pub part_of: Option<String>,
+    pub part_of: Option<Root>,
     /// Roots of the libraries inside the scanned one that were folded into it.
-    pub folded: Vec<String>,
+    pub folded: Vec<Root>,
 }
 
 /// How a scan runs.
@@ -261,7 +262,7 @@ fn outside_library(catalog: &Path, root: &Path) -> Result<(), Error> {
 /// A scan under way: the library, the part of it scanned, and what the scan did so far.
 struct Scan<'c> {
     catalog: &'c Catalog,
-    library_id: i64,
+    library_id: LibraryId,
     /// The library's root. Cataloged paths are relative to it.
     root: PathBuf,
     /// The scanned folder: the root, or a folder inside the library.
@@ -284,10 +285,14 @@ impl<'c> Scan<'c> {
         // One folder under another letter case is the same library.
         let start = cataloged_spelling(&catalog.libraries()?, start);
         let start_str = utf8(&start, "Library")?;
-        let (library_id, root) = match catalog.containing_library(&start)? {
-            Some(library) => (library.id, PathBuf::from(library.root)),
-            None => (catalog.library_id(start_str)?, start.clone()),
+        let library = match catalog.containing_library(&start)? {
+            Some(library) => library,
+            None => LibraryRoot {
+                id: catalog.library_id(start_str)?,
+                root: Root::from(start_str),
+            },
         };
+        let (library_id, root) = (library.id, library.root.as_path().to_path_buf());
         outside_library(catalog_path, &root)?;
         let part = relative_path(&root, &start).ok_or_else(|| Error::NotUtf8 {
             what: "Library",
@@ -295,13 +300,9 @@ impl<'c> Scan<'c> {
         })?;
         let mut summary = ScanSummary::default();
         if !part.is_empty() {
-            summary.part_of = Some(display_root(&root.to_string_lossy()));
+            summary.part_of = Some(library.root);
         }
-        summary.folded = catalog
-            .fold_nested(library_id, &root)?
-            .iter()
-            .map(|r| display_root(r))
-            .collect();
+        summary.folded = catalog.fold_nested(library_id, &root)?;
         Ok(Self {
             catalog,
             library_id,
@@ -710,7 +711,7 @@ fn stop_if_gone(root: &Path, pb: &ProgressBar, batch: &mut Batch) -> Result<(), 
 /// Store a file's hashes, with the version they were made with.
 fn record_hashes(
     catalog: &Catalog,
-    library_id: i64,
+    library_id: LibraryId,
     file: &ToDecode,
     hashed: &Hashed,
 ) -> rusqlite::Result<()> {
@@ -726,7 +727,7 @@ fn record_hashes(
 /// again until it or they change.
 fn record_undecodable(
     catalog: &Catalog,
-    library_id: i64,
+    library_id: LibraryId,
     file: &ToDecode,
 ) -> rusqlite::Result<()> {
     let (rel, version) = (file.rel.as_str(), file.version.as_str());
@@ -1321,7 +1322,7 @@ mod tests {
         let images = catalog.hashed_images(true).unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(images[0].pixel_hash, images[1].pixel_hash);
-        assert_ne!(images[0].file.size, images[1].file.size);
+        assert_ne!(images[0].file.stamp.size, images[1].file.stamp.size);
         drop(catalog);
 
         // Unchanged images are not decoded again; the RAW file is tried again.
@@ -1571,7 +1572,7 @@ mod tests {
         let summary = part.unwrap();
         assert_eq!((summary.added, summary.updated, summary.removed), (1, 1, 0));
         let root = fx.lib().canonicalize().unwrap();
-        assert_eq!(summary.part_of, Some(display_root(root.to_str().unwrap())));
+        assert_eq!(summary.part_of, Some(Root::new(&root).unwrap()));
         // No new library, and the rest of the library is left as it was.
         let catalog = Catalog::open(&fx.catalog()).unwrap();
         assert_eq!(catalog.libraries().unwrap().len(), 1);
@@ -1599,7 +1600,7 @@ mod tests {
 
         let summary = fx.scan();
         let inner = fx.lib().join("sub").canonicalize().unwrap();
-        assert_eq!(summary.folded, vec![display_root(inner.to_str().unwrap())]);
+        assert_eq!(summary.folded, vec![Root::new(&inner).unwrap()]);
         // The inner library's files are not read or hashed again.
         assert_eq!(
             (summary.added, summary.unchanged, summary.hashed),
@@ -1908,7 +1909,7 @@ mod tests {
         let summary = scan_with(&part, &fx.catalog(), ALLOW_EMPTY, &Tools::default()).unwrap();
         assert_eq!(summary.removed, 1);
         let root = fx.lib().canonicalize().unwrap();
-        assert_eq!(summary.part_of, Some(display_root(root.to_str().unwrap())));
+        assert_eq!(summary.part_of, Some(Root::new(&root).unwrap()));
         assert_eq!(paths(&fx.files()), vec!["b/two.jpg"]);
     }
 

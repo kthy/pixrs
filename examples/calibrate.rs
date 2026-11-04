@@ -243,7 +243,7 @@ fn main() {
         .libraries()
         .unwrap_or_else(|e| die(&e.to_string()))
         .into_iter()
-        .map(|l| l.root)
+        .map(|l| String::from(l.root.as_str()))
         .collect();
     check_outside(&opt.out, &roots);
     // Images with almost no detail have no perceptual hash and are never similar.
@@ -310,7 +310,7 @@ fn read_labels(path: &Path) -> Vec<Label> {
 /// A stable ID for an image, used in file names and the review answers.
 fn image_id(image: &HashedImage) -> String {
     let f = &image.file;
-    let id = format!("{}\0{}\0{}", f.root, f.path, f.mtime_ns);
+    let id = format!("{}\0{}\0{}", f.root.as_str(), f.path, f.stamp.mtime_ns);
     let digest = ring::digest::digest(&ring::digest::SHA256, id.as_bytes());
     data_encoding::HEXLOWER.encode(&digest.as_ref()[..12])
 }
@@ -341,7 +341,7 @@ fn find_candidates(images: &[HashedImage], max_distance: u32) -> Vec<Candidate> 
 
 /// Decode an image upright, as the scan does for its perceptual hash.
 fn decode(image: &HashedImage, ffmpeg: Option<&Path>) -> Option<DynamicImage> {
-    let path = library_path(Path::new(&image.file.root), &image.file.path);
+    let path = library_path(image.file.root.as_path(), &image.file.path);
     match image_decoder(&image.file.path)? {
         Decoder::InProcess(_) => {
             let (mut img, orientation) = decode_in_process(&path).ok()?;
@@ -808,7 +808,7 @@ fn write_review(
                     small,
                     big,
                     escape(&f.path),
-                    f.size / 1000,
+                    f.stamp.size / 1000,
                     width,
                     height
                 );
