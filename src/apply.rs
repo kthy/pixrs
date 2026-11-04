@@ -2021,6 +2021,52 @@ mod tests {
         assert_eq!(rows(&f), catalog_before);
     }
 
+    #[test]
+    fn test_quarantine_from_another_library_than_the_kept_copy() {
+        let f = fixture(&[("photo.jpg", b"same bytes")]);
+        // The oldest, so it is the kept copy.
+        File::options()
+            .write(true)
+            .open(f.root.join("photo.jpg"))
+            .unwrap()
+            .set_modified(system_time(1_000_000_000_000_000_000))
+            .unwrap();
+        let copies = f.dir.path().join("copies");
+        fs::create_dir(&copies).unwrap();
+        fs::write(copies.join("copy.jpg"), b"same bytes").unwrap();
+        let copies = copies.canonicalize().unwrap();
+        // Scanned again after the copies, so the original is hashed too.
+        for library in [&copies, &f.root] {
+            crate::scan::scan_with(
+                library,
+                &f.catalog_path,
+                crate::scan::ScanOptions::QUIET,
+                &crate::decode::Tools::default(),
+            )
+            .unwrap();
+        }
+        let catalog = Catalog::open(&f.catalog_path).unwrap();
+        let report =
+            crate::dupes::find_dupes(&catalog, &[], crate::dupes::Similarity::default()).unwrap();
+        assert_eq!(report.groups.len(), 1);
+        let quarantine = f.dir.path().canonicalize().unwrap().join("quarantine");
+        let now = datetime!(2026-10-20 12:00 UTC);
+        let (plan, _) =
+            plan_quarantine(&catalog, &f.catalog_path, &report, &[], &quarantine, now).unwrap();
+        drop(catalog);
+        // The kept copy is in a library none of whose files move; the plan lists it all the same.
+        assert_eq!(plan.libraries.len(), 2, "{:?}", plan.libraries);
+        plan.check().unwrap();
+        let plan_path = write_plan(&plan, now).unwrap();
+        let before = (tree(&f.root), tree(&copies));
+
+        let summary = apply(&plan_path, &plan).unwrap();
+        assert_eq!(summary.moved, 1);
+        assert!(f.root.join("photo.jpg").is_file() && !copies.join("copy.jpg").exists());
+        undo(&summary.journal).unwrap();
+        assert_eq!((tree(&f.root), tree(&copies)), before);
+    }
+
     thread_local! {
         /// The OS error every folder flush on this thread fails with, as on a file system that
         /// cannot flush folders.

@@ -1006,7 +1006,8 @@ struct Quarantine<'a> {
     links: Links,
     notes: PlanNotes,
     moves: Vec<Move>,
-    /// Libraries copies are quarantined from, in the order first seen.
+    /// Libraries copies are quarantined from and their kept copies are in, in the order first
+    /// seen: `apply` checks that each kept copy is in one of the plan's libraries.
     involved: Vec<LibraryId>,
 }
 
@@ -1040,10 +1041,21 @@ impl Quarantine<'_> {
                 mtime_ns: kept.mtime_ns,
             },
         };
+        let planned = self.moves.len();
         for file in copies {
             self.copy(file, &keeper)?;
         }
+        if self.moves.len() > planned {
+            self.involve(kept.library_id);
+        }
         Ok(())
+    }
+
+    /// Note that the plan works in the library `id`.
+    fn involve(&mut self, id: LibraryId) {
+        if !self.involved.contains(&id) {
+            self.involved.push(id);
+        }
     }
 
     /// Plan moving one copy of `keeper`, if it is one that moves.
@@ -1107,9 +1119,7 @@ impl Quarantine<'_> {
                 got: assigned.clone(),
             });
         }
-        if !self.involved.contains(&file.library_id) {
-            self.involved.push(file.library_id);
-        }
+        self.involve(file.library_id);
         self.moves.push(Move {
             from: utf8(&source, "File")?,
             to: utf8(&assigned, "Target")?,
