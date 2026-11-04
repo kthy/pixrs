@@ -11,6 +11,7 @@ use crate::dates::{from_name, from_taken_at};
 use crate::dupes::{plural, DupeReport, Tier};
 use crate::error::Error;
 use crate::media::MediaType;
+use crate::names::folded;
 use crate::template::{sanitize, Facts, Template};
 use crate::text::printable;
 use same_file::is_same_file;
@@ -215,21 +216,22 @@ fn listing<'a>(cache: &'a mut Listings, dir: &Path) -> Option<&'a [String]> {
 /// Folder listings read so far.
 type Listings = HashMap<PathBuf, Option<Vec<String>>>;
 
-/// Targets taken so far: by the plan, or by files on disk. Compared case-insensitively on every
-/// OS, since Windows and macOS file systems are, so a plan comes out the same everywhere.
+/// Targets taken so far: by the plan, or by files on disk. Compared ignoring letter case and
+/// Unicode normalization on every OS, since Windows and macOS file systems ignore case and macOS
+/// ignores normalization, so a plan comes out the same everywhere.
 #[derive(Default)]
 struct Taken {
     claimed: HashSet<String>,
     on_disk: Listings,
-    /// Folders by their lowercase path, as spelled on disk or first in the plan. A target
-    /// folder that only differs in letter case from one of them is that folder, so changing the
-    /// case of a folder name is never a move.
+    /// Folders by their `folded` path, as spelled on disk or first in the plan. A target folder
+    /// that only differs in letter case or normalization from one of them is that folder, so
+    /// changing the spelling of a folder name is never a move.
     folders: HashMap<String, PathBuf>,
 }
 
 impl Taken {
     fn key(path: &Path) -> String {
-        path.to_string_lossy().to_lowercase()
+        folded(&path.to_string_lossy())
     }
 
     /// `base` joined with `folders`, each spelled as it already is on disk or in the plan. If a
@@ -244,11 +246,11 @@ impl Taken {
                 dir = known.clone();
                 continue;
             }
-            let lower = name.to_lowercase();
+            let folded_name = folded(name);
             let same_name: Vec<String> = listing(&mut self.on_disk, &dir)
                 .unwrap_or_default()
                 .iter()
-                .filter(|n| n.to_lowercase() == lower)
+                .filter(|n| folded(n) == folded_name)
                 .cloned()
                 .collect();
             let kind = |n: &String| {
@@ -273,9 +275,9 @@ impl Taken {
     }
 
     /// Whether `target` is free for the file now at `own`. Anything on disk with that name in
-    /// any letter case takes it, except `own` itself, so a rename that only changes letter case
-    /// is allowed unless another file has exactly the new name. A folder that cannot be read
-    /// might hold anything: not free.
+    /// any letter case or normalization takes it, except `own` itself, so a rename that only
+    /// changes letter case or normalization is allowed unless another file has exactly the new
+    /// name. A folder that cannot be read might hold anything: not free.
     fn is_free(&mut self, target: &Path, own: &Path) -> bool {
         self.check(target, own) == Some(true)
     }
@@ -291,7 +293,7 @@ impl Taken {
         let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
             return Some(false);
         };
-        let lower = name.to_string_lossy().to_lowercase();
+        let folded_name = folded(&name.to_string_lossy());
         let own_name = (own.parent() == Some(dir))
             .then(|| own.file_name())
             .flatten()
@@ -299,7 +301,7 @@ impl Taken {
         listing(&mut self.on_disk, dir).map(|names| {
             !names
                 .iter()
-                .any(|n| n.to_lowercase() == lower && Some(n.as_str()) != own_name)
+                .any(|n| folded(n) == folded_name && Some(n.as_str()) != own_name)
         })
     }
 
@@ -416,7 +418,10 @@ fn sidecars(dir: &Path, name: &str, new_name: &str, cache: &mut Listings) -> Vec
 /// another media file in its folder shares, and that file stays, stays too.
 fn add_sidecars(moves: &mut Vec<Move>, taken: &mut Taken, notes: &mut PlanNotes) {
     let mut cache = Listings::new();
-    let moving: HashSet<String> = moves.iter().map(|m| m.from.to_lowercase()).collect();
+    let moving: HashSet<String> = moves
+        .iter()
+        .map(|m| Taken::key(Path::new(&m.from)))
+        .collect();
     let mut moved: HashSet<String> = HashSet::new();
     let media_moves = moves.len();
     for i in 0..media_moves {
@@ -619,7 +624,7 @@ pub fn plan_quarantine(
             .unwrap_or_else(|| String::from("library"));
         let mut name = sanitize(&last);
         let mut n = 2;
-        while !used.insert(name.to_lowercase()) {
+        while !used.insert(folded(&name)) {
             name = sanitize(&format!("{}_{}", last, n));
             n += 1;
         }
@@ -1012,6 +1017,22 @@ mod tests {
         );
         assert_eq!(notes.unchanged, 1);
         assert_eq!(notes.collisions.len(), 2);
+    }
+
+    #[test]
+    fn test_names_in_another_normalization_collide() {
+        use crate::names::tests::{NFC, NFD};
+        let (x, y) = (format!("x/{}.jpg", NFD), format!("y/{}.jpg", NFC));
+        let f = fixture(&[(&x, None), (&y, None)]);
+        let (plan, notes) = organize(&f, "{name}.{ext}", false);
+        assert_eq!(
+            moves(&f, &plan),
+            [
+                format!("{} -> {}.jpg", x, NFD),
+                format!("{} -> {}_2.jpg", y, NFC)
+            ]
+        );
+        assert_eq!(notes.collisions.len(), 1);
     }
 
     #[test]

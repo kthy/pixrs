@@ -8,6 +8,7 @@
 use crate::apply::Lock;
 use crate::catalog::{display_root, library_path, Catalog, Library};
 use crate::error::Error;
+use crate::names::{nfc, respelled_path};
 use crate::scan::{progress_bar, resolve, stamp};
 use same_file::is_same_file;
 use std::fs;
@@ -99,7 +100,11 @@ pub fn relocate(
             let (new, pb, matching) = (&new, &pb, &matching);
             s.spawn(move || {
                 for file in chunk {
-                    let same = fs::metadata(library_path(new, &file.path))
+                    // A copy made on another system may spell the name in another Unicode
+                    // normalization; the next scan gives the row that spelling.
+                    let meta = fs::metadata(library_path(new, &file.path))
+                        .or_else(|e| respelled_path(new, &file.path).map_or(Err(e), fs::metadata));
+                    let same = meta
                         .and_then(|meta| stamp(&meta))
                         .is_ok_and(|stamp| stamp == file.stamp);
                     if same {
@@ -134,17 +139,23 @@ pub fn relocate(
 }
 
 /// The library whose root is `old`. It may not exist any more, so it is compared resolved as far
-/// as it exists and as given (made absolute), with and without Windows' `\\?\` prefix.
+/// as it exists and as given (made absolute), with and without Windows' `\\?\` prefix: as
+/// spelled, or else in Unicode NFC, since a root cataloged on macOS may have its accents
+/// decomposed.
 fn find<'a>(libraries: &'a [Library], old: &Path) -> Result<&'a Library, Error> {
     let mut wanted: Vec<PathBuf> = vec![];
     wanted.extend(resolve(old).ok());
     wanted.extend(absolute(old).ok());
-    let found = libraries.iter().find(|library| {
-        let shown = display_root(&library.root);
-        wanted
-            .iter()
-            .any(|path| path == Path::new(&library.root) || path == Path::new(&shown))
-    });
+    let find_by = |same: &dyn Fn(&Path, &Path) -> bool| {
+        libraries.iter().find(|library| {
+            let shown = display_root(&library.root);
+            wanted
+                .iter()
+                .any(|path| same(path, Path::new(&library.root)) || same(path, Path::new(&shown)))
+        })
+    };
+    let in_nfc = |path: &Path| PathBuf::from(nfc(&path.to_string_lossy()).as_ref());
+    let found = find_by(&|a, b| a == b).or_else(|| find_by(&|a, b| in_nfc(a) == in_nfc(b)));
     found.ok_or_else(|| {
         let roots: Vec<String> = libraries
             .iter()
@@ -258,6 +269,32 @@ mod tests {
         .unwrap();
         assert_eq!((scan.unchanged, scan.added, scan.hashed), (2, 0, 0));
         assert!(relocate(&fx.catalog(), Path::new(&old_root), &old, false).is_err());
+    }
+
+    #[test]
+    fn test_relocate_finds_names_in_another_normalization() {
+        use crate::names::tests::{NFC, NFD};
+        let nfd = format!("{}/{}.jpg", NFD, NFD);
+        let fx = Fixture::new(&[(&nfd, b"decomposed")]);
+        // Copied to a system that composes the accents.
+        rename(fx.path("old"), fx.path("new")).unwrap();
+        rename(fx.path("new").join(NFD), fx.path("new").join(NFC)).unwrap();
+        let dir = fx.path("new").join(NFC);
+        rename(
+            dir.join(format!("{}.jpg", NFD)),
+            dir.join(format!("{}.jpg", NFC)),
+        )
+        .unwrap();
+
+        let summary = relocate(&fx.catalog(), &fx.path("old"), &fx.path("new"), false).unwrap();
+        assert_eq!((summary.compared, summary.matching), (1, 1));
+        let scan = crate::scan::scan(
+            &fx.path("new"),
+            &fx.catalog(),
+            crate::scan::ScanOptions::QUIET,
+        )
+        .unwrap();
+        assert_eq!((scan.unchanged, scan.added, scan.removed), (1, 0, 0));
     }
 
     #[test]

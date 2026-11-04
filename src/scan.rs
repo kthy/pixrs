@@ -16,6 +16,7 @@ use crate::decode::{ffmpeg_handles_heic, image_decoder, DecodeError, Decoder, To
 use crate::error::Error;
 use crate::imagehash::{hash_image, hash_version, ImageHashes};
 use crate::media::MediaType;
+use crate::names::nfc;
 use crate::text::{printable, shown};
 use indicatif::{
     HumanBytes, HumanCount, HumanDuration, ProgressBar, ProgressState, ProgressStyle,
@@ -23,9 +24,10 @@ use indicatif::{
 use log::debug;
 use nom_exif::{EntryValue, ExifDateTime, ExifTag, Metadata, TrackInfoTag};
 use ring::digest::{Context, SHA256};
-use std::collections::HashSet;
+use same_file::is_same_file;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display};
-use std::fs::{File, Metadata as FsMetadata};
+use std::fs::{symlink_metadata, File, Metadata as FsMetadata};
 use std::io::{self, Read};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{absolute, Component, Path, PathBuf};
@@ -56,6 +58,10 @@ pub struct ScanSummary {
     pub removed: usize,
     /// Cataloged files with the same size and mtime as last time.
     pub unchanged: usize,
+    /// Cataloged files found under another Unicode normalization of their name (composed or
+    /// decomposed accents), whose rows now have the name as it is on disk, with their hashes.
+    /// Also counted as updated or unchanged.
+    pub respelled: usize,
     /// Files hashed because another cataloged file has the same size.
     pub hashed: usize,
     /// Files or folders that could not be read, or whose names are not valid UTF-8.
@@ -123,6 +129,10 @@ struct Pending {
 /// `options.allow_empty` is set: then those rows are removed, and the library keeps its entry
 /// with no files. The scanned folder must exist and be readable either way.
 ///
+/// Names are matched to cataloged paths as spelled, or else in Unicode NFC: a file whose name
+/// is a cataloged one in another normalization (macOS may decompose accents where Linux and
+/// Windows compose them) keeps its row and hashes, and the row takes the name on disk.
+///
 /// The library itself is only read.
 pub fn scan(
     library: &Path,
@@ -183,9 +193,12 @@ pub fn scan_with(
         .map(|r| display_root(r))
         .collect();
     let mut known = catalog.stamps(library_id)?;
+    let respellable = respellable(&known, &part);
     known.retain(|rel, _| is_within(rel, &part));
 
     let mut seen: HashSet<String> = HashSet::new();
+    // Rows found under another Unicode normalization, with the name on disk.
+    let mut respelled: Vec<(String, String)> = vec![];
     let mut unreadable: Vec<String> = vec![];
     let mut pending: Vec<Pending> = vec![];
 
@@ -222,6 +235,15 @@ pub fn scan_with(
             summary.skipped += 1;
             continue;
         };
+        let mut known_stamp = known.get(&rel).copied();
+        if known_stamp.is_none() {
+            let found = respelling(&rel, entry.path(), &root, &known, &respellable, &seen);
+            if let Some((old, old_stamp)) = found {
+                seen.insert(old.clone());
+                respelled.push((old, rel.clone()));
+                known_stamp = Some(old_stamp);
+            }
+        }
         let stamp = match entry
             .metadata()
             .map_err(io::Error::from)
@@ -235,8 +257,8 @@ pub fn scan_with(
                 continue;
             }
         };
-        match known.get(&rel) {
-            Some(known_stamp) if *known_stamp == stamp => summary.unchanged += 1,
+        match known_stamp {
+            Some(known_stamp) if known_stamp == stamp => summary.unchanged += 1,
             known_stamp => pending.push(Pending {
                 rel: rel.clone(),
                 path: entry.into_path(),
@@ -284,6 +306,10 @@ pub fn scan_with(
     // Pass 1: record new and changed files. A changed file loses its hash until pass 2.
     let pb = progress_bar(pending.len() as u64, "[2/4] Reading", false, quiet);
     let mut tx = catalog.transaction()?;
+    for (old, new) in &respelled {
+        catalog.respell(library_id, old, new)?;
+    }
+    summary.respelled = respelled.len();
     for (i, file) in pending.into_iter().enumerate() {
         if i > 0 && i % COMMIT_EVERY == 0 {
             tx.commit()?;
@@ -660,6 +686,54 @@ fn is_within(rel: &str, dir: &str) -> bool {
         || rel
             .strip_prefix(dir)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The rows of `known` that a file in `part` can be under another Unicode normalization of its
+/// name and that a lookup of the file's name in NFC in `known` does not find, by their path in
+/// NFC: rows not spelled in NFC, and rows in `part` only in NFC. With every row in NFC and a
+/// whole library scanned, as usual, there are none.
+fn respellable(known: &HashMap<String, Stamp>, part: &str) -> HashMap<String, (String, Stamp)> {
+    let part_nfc = nfc(part);
+    let mut rows = HashMap::new();
+    for (rel, stamp) in known {
+        let rel_nfc = nfc(rel);
+        let looked_up = is_within(rel, part) && rel_nfc == rel.as_str();
+        if !looked_up && is_within(&rel_nfc, &part_nfc) {
+            rows.insert(rel_nfc.into_owned(), (rel.clone(), *stamp));
+        }
+    }
+    rows
+}
+
+/// The cataloged row, with its stamp, that is the file at `path` (`rel` in the library at
+/// `root`) under another Unicode normalization of its name: a row in `known` whose path is
+/// `rel` in NFC, or one in `respellable`. Not if `seen` has it, as the file of another name, or
+/// if its path leads to another file (on Linux, which keeps names as given, both spellings can
+/// be files of their own).
+fn respelling(
+    rel: &str,
+    path: &Path,
+    root: &Path,
+    known: &HashMap<String, Stamp>,
+    respellable: &HashMap<String, (String, Stamp)>,
+    seen: &HashSet<String>,
+) -> Option<(String, Stamp)> {
+    let rel_nfc = nfc(rel);
+    let (old, stamp) = match respellable.get(rel_nfc.as_ref()) {
+        Some((old, stamp)) => (old.clone(), *stamp),
+        None if rel_nfc != rel => {
+            let stamp = *known.get(rel_nfc.as_ref())?;
+            (rel_nfc.into_owned(), stamp)
+        }
+        None => return None,
+    };
+    if seen.contains(&old) {
+        return None;
+    }
+    let old_path = library_path(root, &old);
+    let elsewhere =
+        symlink_metadata(&old_path).is_ok() && !is_same_file(&old_path, path).unwrap_or(false);
+    (!elsewhere).then_some((old, stamp))
 }
 
 /// `path` relative to `root` with `/` separators, or `None` if any part is not valid UTF-8.
@@ -1340,6 +1414,111 @@ mod tests {
         fx.write("Æblegrød/blå bær ワイフ.jpg", b"unicode");
         fx.scan();
         assert_eq!(paths(&fx.files()), vec!["Æblegrød/blå bær ワイフ.jpg"]);
+    }
+
+    /// `name` with the accent of `é` composed (NFC) and decomposed (NFD).
+    fn spellings(name: &str) -> (String, String) {
+        use crate::names::tests::{NFC, NFD};
+        (name.replace("{}", NFC), name.replace("{}", NFD))
+    }
+
+    impl Fixture {
+        /// Give the row of the file `on_disk` the path `cataloged`, as if another system had
+        /// spelled its name so.
+        fn respell_row(&self, on_disk: &str, cataloged: &str) {
+            let catalog = Catalog::open(&self.catalog()).unwrap();
+            let root = self.lib().canonicalize().unwrap();
+            let id = catalog.library_id(root.to_str().unwrap()).unwrap();
+            catalog.respell(id, on_disk, cataloged).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_file_under_another_normalization_keeps_its_row() {
+        let fx = Fixture::new();
+        let (nfc, nfd) = spellings("{}/{}.jpg");
+        let (other_nfc, other_nfd) = spellings("{}/other {}.jpg");
+        fx.write(&nfd, b"same size");
+        fx.write(&other_nfd, b"same SIZE");
+        fx.write("plain.jpg", b"plain");
+        assert_eq!(fx.scan().hashed, 2);
+        // Cataloged in NFC, as on Linux; the files on disk are in NFD, as macOS may write them.
+        fx.respell_row(&nfd, &nfc);
+        fx.respell_row(&other_nfd, &other_nfc);
+        fx.write(&other_nfd, b"changed, and longer");
+
+        assert_eq!(
+            fx.scan(),
+            ScanSummary {
+                updated: 1,
+                unchanged: 2,
+                respelled: 2,
+                media_undecodable: 1,
+                ..Default::default()
+            }
+        );
+        let files = fx.files();
+        let mut expected = vec![nfd.as_str(), other_nfd.as_str(), "plain.jpg"];
+        expected.sort();
+        assert_eq!(paths(&files), expected);
+        let row = |path: &str| files.iter().find(|f| f.path == path).unwrap();
+        // The unchanged file keeps its hash; the changed one is read again.
+        assert!(row(&nfd).sha256.is_some());
+        assert_eq!(row(&other_nfd).stamp.size, 19);
+        assert_eq!(fx.scan().unchanged, 3);
+    }
+
+    #[test]
+    fn test_part_of_library_under_another_normalization() {
+        let fx = Fixture::new();
+        let (nfc, nfd) = spellings("{}/{}.jpg");
+        fx.write(&nfd, b"in the part");
+        fx.write("elsewhere.jpg", b"elsewhere");
+        fx.scan();
+        fx.respell_row(&nfd, &nfc);
+
+        let (_, folder) = spellings("{}");
+        let part = scan_with(
+            &fx.lib().join(folder),
+            &fx.catalog(),
+            ScanOptions::QUIET,
+            &Tools::default(),
+        );
+        let summary = part.unwrap();
+        assert_eq!(
+            (summary.added, summary.removed, summary.respelled),
+            (0, 0, 1)
+        );
+        let mut expected = vec![nfd.as_str(), "elsewhere.jpg"];
+        expected.sort();
+        assert_eq!(paths(&fx.files()), expected);
+    }
+
+    /// Linux keeps names as given, so both spellings can be files of their own there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_both_normalizations_on_disk_are_two_files() {
+        let fx = Fixture::new();
+        let (nfc, nfd) = spellings("{}.jpg");
+        fx.write(&nfc, b"composed");
+        fx.write(&nfd, b"decomposed");
+        assert_eq!(fx.scan().added, 2);
+        assert_eq!(fx.scan().unchanged, 2);
+
+        // A new file is not taken for a cataloged one whose name is still there.
+        let catalog = Catalog::open(&fx.catalog()).unwrap();
+        let root = fx.lib().canonicalize().unwrap();
+        let id = catalog.library_id(root.to_str().unwrap()).unwrap();
+        catalog.remove(id, &nfd).unwrap();
+        drop(catalog);
+        let summary = fx.scan();
+        assert_eq!(
+            (summary.added, summary.unchanged, summary.respelled),
+            (1, 1, 0)
+        );
+        let mut expected = vec![nfc.as_str(), nfd.as_str()];
+        expected.sort();
+        assert_eq!(paths(&fx.files()), expected);
     }
 
     #[cfg(target_os = "linux")]
