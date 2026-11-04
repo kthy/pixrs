@@ -560,7 +560,7 @@ const MTIME_SLACK_NS: i64 = 2_000_000_000;
 /// Whether a file has the size of `stamp` and (within `MTIME_SLACK_NS`) its mtime.
 fn matches(meta: &fs::Metadata, stamp: Stamp) -> bool {
     meta.is_file()
-        && crate::scan::stamp(meta).is_ok_and(|s| {
+        && Stamp::of(meta).is_ok_and(|s| {
             s.size == stamp.size && (s.mtime_ns - stamp.mtime_ns).abs() <= MTIME_SLACK_NS
         })
 }
@@ -857,7 +857,7 @@ fn unchanged(path: &Path, stamp: Stamp) -> Result<(), Skip> {
     if !meta.is_file() {
         return Err(Skip::NotAFile);
     }
-    if crate::scan::stamp(&meta).is_ok_and(|s| s == stamp) {
+    if Stamp::of(&meta).is_ok_and(|s| s == stamp) {
         Ok(())
     } else {
         Err(Skip::Changed)
@@ -2538,7 +2538,7 @@ mod tests {
         fs::create_dir(to.parent().unwrap()).unwrap();
         fs::write(&from, b"the same bytes").unwrap();
         fs::write(&to, b"the same bytes").unwrap();
-        let stamp = crate::scan::stamp(&fs::metadata(&from).unwrap()).unwrap();
+        let stamp = Stamp::of(&fs::metadata(&from).unwrap()).unwrap();
         let temp = to.with_file_name(".pixrs-1-2-3.tmp");
         let journal = write_journal(
             &f,

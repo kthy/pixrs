@@ -21,25 +21,22 @@ use crate::imagehash::{ImageDecoder, ImageHashes};
 use crate::library::{LibraryId, Root};
 use crate::media::MediaType;
 use crate::names::nfc;
+use crate::parallel::{in_parallel, per_core};
+use crate::paths::{canonical, resolve};
+use crate::progress::{finish_step, progress_bar, spinner, Unit};
 use crate::text::{printable, shown};
 use crate::walk::{Found, MediaFile};
-use indicatif::{
-    HumanBytes, HumanCount, HumanDuration, ProgressBar, ProgressState, ProgressStyle,
-};
+use indicatif::{HumanBytes, HumanCount, HumanDuration, ProgressBar};
 use log::debug;
 use nom_exif::{EntryValue, ExifDateTime, ExifTag, Metadata, TrackInfoTag};
 use rusqlite::Transaction;
 use same_file::is_same_file;
 use std::collections::{HashMap, HashSet};
-use std::fmt::{self, Display};
-use std::fs::{symlink_metadata, File, Metadata as FsMetadata};
+use std::fmt::Display;
+use std::fs::{symlink_metadata, File};
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::{absolute, Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread::{self, available_parallelism};
-use std::time::{Duration, UNIX_EPOCH};
+use std::path::{Component, Path, PathBuf};
 use time::macros::format_description;
 use time::OffsetDateTime;
 
@@ -275,23 +272,6 @@ fn scanned_folder(library: &Path) -> Result<PathBuf, Error> {
     canonical(library)?
         .filter(|start| start.is_dir())
         .ok_or_else(|| Error::NotADirectory(library.to_path_buf()))
-}
-
-/// `path` canonical, or `None` if nothing is there. An error names `path` if it cannot be
-/// resolved for another reason, like permissions.
-pub fn canonical(path: &Path) -> Result<Option<PathBuf>, Error> {
-    match path.canonicalize() {
-        Ok(canonical) => Ok(Some(canonical)),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(e) => Err(e).at(path),
-    }
 }
 
 /// Refuse a catalog at `catalog`, inside the library at `root`.
@@ -789,71 +769,6 @@ fn hash_files(
     in_parallel(files, per_core(MAX_DECODERS), work, record)
 }
 
-/// Up to `max` threads, but no more than there are cores: for work that keeps a core busy.
-fn per_core(max: usize) -> usize {
-    available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(max)
-}
-
-/// `work` on each of `items` on up to `workers` threads, passing each item with its result to
-/// `record` on this thread, in the order they finish. `record` is where the catalog is written:
-/// it has one connection, and one writer. Stops at the first error from `record`.
-fn in_parallel<T: Sync, R: Send>(
-    items: &[T],
-    workers: usize,
-    work: impl Fn(&T) -> R + Sync,
-    mut record: impl FnMut(&T, R) -> Result<(), Error>,
-) -> Result<(), Error> {
-    let workers = workers.clamp(1, items.len().max(1));
-    let next = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::sync_channel(workers * 2);
-    thread::scope(|scope| {
-        for _ in 0..workers {
-            let (tx, next, work) = (tx.clone(), &next, &work);
-            scope.spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(item) = items.get(i) else {
-                    break;
-                };
-                if tx.send((item, work(item))).is_err() {
-                    break;
-                }
-            });
-        }
-        drop(tx);
-        // Leaving early drops `rx`, which makes the workers stop at their next send.
-        for (item, result) in rx {
-            record(item, result)?;
-        }
-        Ok(())
-    })
-}
-
-/// `path` made absolute, with its longest existing prefix canonicalized so that symlinks and `..`
-/// cannot hide where it really is. The parts that do not exist yet are applied lexically.
-pub fn resolve(path: &Path) -> io::Result<PathBuf> {
-    let path = absolute(path)?;
-    for ancestor in path.ancestors() {
-        if let Ok(mut resolved) = ancestor.canonicalize() {
-            let Ok(rest) = path.strip_prefix(ancestor) else {
-                continue;
-            };
-            for part in rest.components() {
-                match part {
-                    Component::ParentDir => {
-                        resolved.pop();
-                    }
-                    Component::Normal(name) => resolved.push(name),
-                    _ => {}
-                }
-            }
-            return Ok(resolved);
-        }
-    }
-    Ok(path)
-}
-
 /// Print a warning about a file that is skipped.
 fn warn(path: &Path, reason: impl Display) {
     eprintln!(
@@ -938,97 +853,6 @@ fn relative_path(root: &Path, path: &Path) -> Option<String> {
         })
         .collect::<Option<Vec<&str>>>()?;
     Some(parts.join("/"))
-}
-
-/// Size and modification time of a file. Nanoseconds since 1970 fit in `i64` until 2262; times
-/// further from 1970 either way are cut to the most `i64` holds.
-pub(crate) fn stamp(meta: &FsMetadata) -> io::Result<Stamp> {
-    let nanos = |d: Duration| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
-    let mtime_ns = match meta.modified()?.duration_since(UNIX_EPOCH) {
-        Ok(after) => nanos(after),
-        Err(before) => -nanos(before.duration()),
-    };
-    Ok(Stamp {
-        size: meta.len(),
-        mtime_ns,
-    })
-}
-
-/// What a progress bar counts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Unit {
-    Files,
-    Bytes,
-}
-
-/// A progress bar of `len` files or bytes. The message is cut to fit the terminal: a line that
-/// wraps is not cleared when the bar is drawn again.
-#[expect(
-    clippy::expect_used,
-    reason = "the templates are constants; test_progress_templates_parse checks them"
-)]
-pub(crate) fn progress_bar(
-    len: u64,
-    prefix: &'static str,
-    unit: Unit,
-    quiet: bool,
-) -> ProgressBar {
-    if quiet {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new(len).with_prefix(prefix);
-    let t = match unit {
-        Unit::Bytes => {
-            "{prefix} [{elapsed}, ETA {eta}] {bar:15.white/grey} {bytes:>10}/{total_bytes} \
-             {binary_bytes_per_sec:>11} {wide_msg:.dim}"
-        }
-        Unit::Files => {
-            "{prefix} [{elapsed}, ETA {eta}] {bar:15.white/grey} {human_pos:>7}/{human_len:7} \
-             {rate:>8} {wide_msg:.dim}"
-        }
-    };
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(t)
-            .expect("Expected a ProgressStyle!")
-            .with_key("rate", |state: &ProgressState, w: &mut dyn fmt::Write| {
-                let _ = write!(w, "{:.1}/s", state.per_sec());
-            })
-            .progress_chars("##-"),
-    );
-    crate::logging::log_around(&pb);
-    pb
-}
-
-/// Clear a finished step's progress bar and print what the step did and how long it took, as
-/// the walk does, unless the bars are hidden.
-fn finish_step(pb: &ProgressBar, done: &str) {
-    pb.finish_and_clear();
-    // Not `pb.println`, which pads the line to the terminal width instead of ending it.
-    if !pb.is_hidden() {
-        eprintln!("{} ({})", done, HumanDuration(pb.elapsed()));
-    }
-}
-
-/// A spinner counting media files, with the current folder as its message.
-#[expect(
-    clippy::expect_used,
-    reason = "the templates are constants; test_progress_templates_parse checks them"
-)]
-fn spinner(prefix: &'static str, quiet: bool) -> ProgressBar {
-    if quiet {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new_spinner().with_prefix(prefix);
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{prefix} [{elapsed}] {spinner} {human_pos} media files {wide_msg:.dim}")
-            .expect("Expected a ProgressStyle!"),
-    );
-    // Tick on a timer, so the spinner moves while a slow folder listing blocks the walk.
-    pb.enable_steady_tick(Duration::from_millis(100));
-    crate::logging::log_around(&pb);
-    pb
 }
 
 /// SHA-256 of the file at `path` as lowercase hex, advancing `pb` by the bytes read.
@@ -1134,14 +958,6 @@ fn dimension(value: &EntryValue) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_progress_templates_parse() {
-        for unit in [Unit::Bytes, Unit::Files] {
-            progress_bar(1, "test", unit, false).finish_and_clear();
-        }
-        spinner("test", false).finish_and_clear();
-    }
 
     use pretty_assertions::assert_eq;
     use std::fs::{create_dir_all, remove_file, write};
@@ -1451,7 +1267,7 @@ mod tests {
             .write(true)
             .open(fx.lib().join("a.jpg"))
             .unwrap();
-        file.set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000))
             .unwrap();
 
         let summary = fx.scan();

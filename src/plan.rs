@@ -732,7 +732,7 @@ fn add_sidecars(moves: &mut Vec<Move>, claims: &mut Claims, notes: &mut PlanNote
                 });
                 continue;
             }
-            let Ok(stamp) = fs::metadata(&source).and_then(|m| crate::scan::stamp(&m)) else {
+            let Ok(stamp) = fs::metadata(&source).and_then(|m| Stamp::of(&m)) else {
                 continue;
             };
             // Both are UTF-8: the folders are those of UTF-8 moves, the names from listings,
@@ -1195,7 +1195,7 @@ pub fn outside_libraries(
     dir: &Path,
     what: &'static str,
 ) -> Result<PathBuf, Error> {
-    let resolved = crate::scan::resolve(dir).at(dir)?;
+    let resolved = crate::paths::resolve(dir).at(dir)?;
     for library in catalog.libraries()? {
         let root = library.root.as_path();
         if within(&resolved, root) || within(root, &resolved) {

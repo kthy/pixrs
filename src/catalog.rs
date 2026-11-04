@@ -97,6 +97,22 @@ pub struct Stamp {
     pub mtime_ns: i64,
 }
 
+impl Stamp {
+    /// Size and modification time of a file. Nanoseconds since 1970 fit in `i64` until 2262;
+    /// times further from 1970 either way are cut to the most `i64` holds.
+    pub fn of(meta: &std::fs::Metadata) -> std::io::Result<Self> {
+        let nanos = |d: Duration| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
+        let mtime_ns = match meta.modified()?.duration_since(std::time::UNIX_EPOCH) {
+            Ok(after) => nanos(after),
+            Err(before) => -nanos(before.duration()),
+        };
+        Ok(Self {
+            size: meta.len(),
+            mtime_ns,
+        })
+    }
+}
+
 /// Metadata read from inside a media file. Every field is optional.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MediaMeta {

@@ -1702,7 +1702,7 @@ mod tests {
         )
         .unwrap();
         let moved: Vec<&Path> = plan.moves.iter().map(|m| m.from.as_path()).collect();
-        let copy = crate::scan::resolve(&copy).unwrap();
+        let copy = crate::paths::resolve(&copy).unwrap();
         assert_eq!(moved, vec![copy.as_path()]);
     }
 

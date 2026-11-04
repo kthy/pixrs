@@ -6,16 +6,16 @@
  *************************************************************************************************/
 
 use crate::apply::Lock;
-use crate::catalog::{library_path, Catalog, Library};
+use crate::catalog::{library_path, within, Catalog, FileRecord, Library, Stamp};
 use crate::error::{utf8, AtPath, Error};
 use crate::library::Root;
 use crate::names::{nfc, respelled_path};
-use crate::scan::{canonical, progress_bar, resolve, stamp, Unit};
+use crate::parallel::in_parallel;
+use crate::paths::{canonical, resolve};
+use crate::progress::{progress_bar, Unit};
 use same_file::is_same_file;
 use std::fs;
 use std::path::{absolute, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
 
 /// Most cataloged files compared with the new place before the catalog is changed.
 const SAMPLE: usize = 100;
@@ -75,7 +75,7 @@ pub fn relocate(
             root: library.root.clone(),
         });
     }
-    if catalog_path.starts_with(&new) {
+    if within(&catalog_path, &new) {
         return Err(Error::CatalogInLibrary {
             catalog: catalog_path,
             library: new,
@@ -86,29 +86,21 @@ pub fn relocate(
     let step = files.len().div_ceil(SAMPLE).max(1);
     let sample: Vec<_> = files.iter().step_by(step).collect();
     let pb = progress_bar(sample.len() as u64, "Comparing", Unit::Files, false);
-    let matching = AtomicUsize::new(0);
-    thread::scope(|s| {
-        for chunk in sample.chunks(sample.len().div_ceil(COMPARERS).max(1)) {
-            let (new, pb, matching) = (&new, &pb, &matching);
-            s.spawn(move || {
-                for file in chunk {
-                    // A copy made on another system may spell the name in another Unicode
-                    // normalization; the next scan gives the row that spelling.
-                    let meta = fs::metadata(library_path(new, &file.path))
-                        .or_else(|e| respelled_path(new, &file.path).map_or(Err(e), fs::metadata));
-                    let same = meta
-                        .and_then(|meta| stamp(&meta))
-                        .is_ok_and(|stamp| stamp == file.stamp);
-                    if same {
-                        matching.fetch_add(1, Ordering::Relaxed);
-                    }
-                    pb.inc(1);
-                }
-            });
-        }
-    });
+    let mut matching = 0;
+    let compare = |file: &&FileRecord| {
+        // A copy made on another system may spell the name in another Unicode normalization;
+        // the next scan gives the row that spelling.
+        let meta = fs::metadata(library_path(&new, &file.path))
+            .or_else(|e| respelled_path(&new, &file.path).map_or(Err(e), fs::metadata));
+        meta.and_then(|meta| Stamp::of(&meta))
+            .is_ok_and(|stamp| stamp == file.stamp)
+    };
+    in_parallel(&sample, COMPARERS, compare, |_, same| {
+        matching += usize::from(same);
+        pb.inc(1);
+        Ok(())
+    })?;
     pb.finish_and_clear();
-    let matching = matching.into_inner();
     if !force && matching * 100 < sample.len() * MIN_MATCHING {
         return Err(Error::TooFewMatch {
             matching,

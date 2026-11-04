@@ -28,7 +28,7 @@ The planned shape, tracked in GitHub issues #32 to #37 (one per step):
   waits for round trips), then hash only files whose size matches another cataloged file, on up
   to 4 threads (`MAX_HASHERS`: a few reads at once hide a network share's round trips without
   making a spinning disk seek much), with one thread writing the catalog in both, as the
-  decoding pass does (`in_parallel` in `src/scan.rs`). Incremental: only reread files
+  decoding pass does (`in_parallel` in `src/parallel.rs`). Incremental: only reread files
   whose path, size or mtime changed. A metadata parser that panics on a file is caught, as the
   decoders are: the file is cataloged without metadata, with a warning, and the scan goes on.
   Libraries never overlap: scanning a folder inside a
@@ -125,9 +125,10 @@ Decided details:
   symbolic links, which could lead anywhere (the scan does not follow links, so a link inside a
   library is not cataloged and nothing else sees it): a plan puts no file into a folder that is a
   link, in any letter case, and warns; `apply` and `undo` skip a move whose source or target folder
-  is reached through a link (`through_symlink`: `apply` checks that the plan's library root and
-  `destination` are canonical and that the parts below them are not links; `undo` has no plan, so
-  there the target's nearest existing folder must be canonical, as resolved roots are). Each folder
+  is reached through a link (`apply` checks that the plan's library root and `destination` are
+  canonical and that the parts below them are not links, `link_below`; `undo` has no plan, so
+  there the target's nearest existing folder must be canonical, as resolved roots are,
+  `off_its_path`). Each folder
   is checked once a run (`KnownFolders`), since on a network share every check is a round trip;
   a folder swapped for a link during the run goes unnoticed, the same race as #44. Folders left
   empty stay unless

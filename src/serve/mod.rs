@@ -12,7 +12,7 @@ use crate::catalog::{library_path, within, Catalog, FileRecord};
 use crate::dupes::{group_dupes, load_dupes, DupeReport, Similarity};
 use crate::error::{AtPath, Error};
 use crate::library::{LibraryId, Root};
-use crate::scan::resolve;
+use crate::paths::resolve;
 use crate::text::printable;
 use axum::body::Body;
 use axum::extract::{Path as UrlPath, Request, State};
