@@ -22,6 +22,7 @@ use rusqlite::{
 use same_file::is_same_file;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs::create_dir_all;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -111,7 +112,7 @@ impl MediaMeta {
     pub fn camera(&self) -> Option<String> {
         match (&self.camera_make, &self.camera_model) {
             (Some(make), Some(model)) if model.starts_with(make.as_str()) => Some(model.clone()),
-            (Some(make), Some(model)) => Some(format!("{} {}", make, model)),
+            (Some(make), Some(model)) => Some(format!("{make} {model}")),
             (Some(one), None) | (None, Some(one)) => Some(one.clone()),
             (None, None) => None,
         }
@@ -167,8 +168,7 @@ impl Catalog {
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
             0 => conn.execute_batch(&format!(
-                "BEGIN; {} PRAGMA user_version = {}; COMMIT;",
-                SCHEMA, SCHEMA_VERSION
+                "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
             ))?,
             SCHEMA_VERSION => {}
             v if (1..SCHEMA_VERSION).contains(&v) => migrate(&conn)?,
@@ -182,7 +182,7 @@ impl Catalog {
                 )))
             }
         }
-        Ok(Catalog { conn })
+        Ok(Self { conn })
     }
 
     /// Open the catalog at `path` for writing. It must exist and have the current schema, or an
@@ -216,7 +216,7 @@ impl Catalog {
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        Ok(Catalog { conn })
+        Ok(Self { conn })
     }
 
     /// Open the catalog at `path` read-only. It must exist and have the current schema; an older
@@ -252,7 +252,7 @@ impl Catalog {
                 SCHEMA_VERSION
             )));
         }
-        Ok(Catalog { conn })
+        Ok(Self { conn })
     }
 
     /// Start a transaction. Catalog writes made while it is alive are part of it.
@@ -330,18 +330,15 @@ impl Catalog {
                 }
             }
         }
-        let (id, root) = match outer {
-            Some((id, root, prefix)) => {
-                self.merge_library(library_id, id, &prefix)?;
-                (id, root)
-            }
-            None => {
-                self.conn.execute(
-                    "UPDATE libraries SET root = ?2 WHERE id = ?1",
-                    params![library_id, new_root],
-                )?;
-                (library_id, String::from(new_root))
-            }
+        let (id, root) = if let Some((id, root, prefix)) = outer {
+            self.merge_library(library_id, id, &prefix)?;
+            (id, root)
+        } else {
+            self.conn.execute(
+                "UPDATE libraries SET root = ?2 WHERE id = ?1",
+                params![library_id, new_root],
+            )?;
+            (library_id, String::from(new_root))
         };
         let inner = self.nested(id, Path::new(&root))?;
         for (inner_id, _, prefix) in &inner {
@@ -379,29 +376,22 @@ impl Catalog {
     fn merge_library(&self, from: i64, into: i64, prefix: &str) -> rusqlite::Result<()> {
         let hash_columns = HASH_COLUMNS
             .iter()
-            .map(|c| {
-                format!(
-                    "{c} = CASE WHEN o.hash_version IS NULL THEN i.{c} ELSE o.{c} END",
-                    c = c
-                )
-            })
+            .map(|c| format!("{c} = CASE WHEN o.hash_version IS NULL THEN i.{c} ELSE o.{c} END"))
             .collect::<Vec<_>>()
             .join(", ");
         self.conn.execute(
             &format!(
-                "UPDATE files AS o SET sha256 = coalesce(o.sha256, i.sha256), {}
+                "UPDATE files AS o SET sha256 = coalesce(o.sha256, i.sha256), {hash_columns}
                  FROM files AS i
                  WHERE o.library_id = ?1 AND i.library_id = ?2 AND o.path = ?3 || i.path
-                   AND o.size = i.size AND o.mtime_ns = i.mtime_ns",
-                hash_columns
+                   AND o.size = i.size AND o.mtime_ns = i.mtime_ns"
             ),
             params![into, from, prefix],
         )?;
         self.conn.execute(
             &format!(
-                "INSERT OR IGNORE INTO files (library_id, path, {cols})
-                 SELECT ?1, ?3 || path, {cols} FROM files WHERE library_id = ?2",
-                cols = MOVED_COLUMNS
+                "INSERT OR IGNORE INTO files (library_id, path, {MOVED_COLUMNS})
+                 SELECT ?1, ?3 || path, {MOVED_COLUMNS} FROM files WHERE library_id = ?2"
             ),
             params![into, from, prefix],
         )?;
@@ -432,6 +422,10 @@ impl Catalog {
     }
 
     /// Size and mtime of every cataloged file in the library, keyed by relative path.
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn stamps(&self, library_id: i64) -> rusqlite::Result<HashMap<String, Stamp>> {
         let mut stmt = self
             .conn
@@ -449,6 +443,10 @@ impl Catalog {
     }
 
     /// Insert or replace a file. A replaced file loses its image hashes until it is hashed again.
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn upsert(&self, library_id: i64, file: &FileRecord) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO files (library_id, path, size, mtime_ns, media_type, sha256, taken_at,
@@ -510,6 +508,10 @@ impl Catalog {
 
     /// Path and size of the library's files that have no hash yet and share their size with
     /// another cataloged file in any library, ordered by path.
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn unhashed_with_shared_size(
         &self,
         library_id: i64,
@@ -529,6 +531,11 @@ impl Catalog {
     /// Number of files in the given libraries (all if empty) that share their size with another
     /// file but have no hash yet, because their library has not been scanned since the size
     /// became shared.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn count_unhashed_with_shared_size(&self, libraries: &[i64]) -> rusqlite::Result<usize> {
         let in_libraries = if libraries.is_empty() {
             String::new()
@@ -543,8 +550,7 @@ impl Catalog {
                 "SELECT count(*) FROM files
                  WHERE sha256 IS NULL
                    AND size IN (SELECT size FROM files GROUP BY size HAVING count(*) > 1)
-                   {}",
-                in_libraries
+                   {in_libraries}"
             ),
             params_from_iter(libraries),
             |row| row.get::<_, i64>(0).map(|n| n as usize),
@@ -552,6 +558,10 @@ impl Catalog {
     }
 
     /// Every file, in any library, whose size and hash match another file's.
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn duplicate_candidates(&self) -> rusqlite::Result<Vec<HashedFile>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256
@@ -586,8 +596,7 @@ impl Catalog {
     /// Every cataloged file in the library, ordered by path.
     pub fn files(&self, library_id: i64) -> rusqlite::Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {} FROM files WHERE library_id = ?1 ORDER BY path",
-            FILE_COLUMNS
+            "SELECT {FILE_COLUMNS} FROM files WHERE library_id = ?1 ORDER BY path"
         ))?;
         let rows = stmt.query_map([library_id], file_record)?;
         rows.collect()
@@ -617,6 +626,11 @@ impl Catalog {
     /// Number of media files in the given libraries (all if empty) the hash pass has not
     /// decoded: not scanned since they changed, or no decoder for them (RAW, HEIC without
     /// `ffmpeg`, video without `ffmpeg`, audio without `fpcalc`).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn count_unhashed(&self, libraries: &[i64]) -> rusqlite::Result<usize> {
         let filter = Filter {
             libraries: libraries.to_vec(),
@@ -624,10 +638,7 @@ impl Catalog {
         };
         let (cond, values) = filter.condition();
         self.conn.query_row(
-            &format!(
-                "SELECT count(*) FROM files WHERE {} AND hash_version IS NULL",
-                cond
-            ),
+            &format!("SELECT count(*) FROM files WHERE {cond} AND hash_version IS NULL"),
             params_from_iter(values),
             |row| row.get::<_, i64>(0).map(|n| n as usize),
         )
@@ -680,6 +691,10 @@ impl Catalog {
     }
 
     /// Every video with a signature and every audio file with a fingerprint, in any library.
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn hashed_av(&self) -> rusqlite::Result<Vec<HashedAv>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256, f.duration_ms,
@@ -712,6 +727,10 @@ impl Catalog {
 
     /// Record that an image was decoded with `version`, with its hashes and decoded
     /// dimensions, or without if decoding failed.
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn set_image_hashes(
         &self,
         library_id: i64,
@@ -741,6 +760,10 @@ impl Catalog {
     /// Every image, in any library, that has image hashes. Without `visual`, perceptual hashes
     /// and fingerprints are left out (`None`), which saves reading about 1 KB per image when
     /// similar images are not looked for.
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn hashed_images(&self, visual: bool) -> rusqlite::Result<Vec<HashedImage>> {
         let visual_columns = if visual {
             "f.phash, f.fingerprint"
@@ -749,10 +772,9 @@ impl Catalog {
         };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256, f.pixel_hash,
-                    coalesce(f.width, 0), coalesce(f.height, 0), {}
+                    coalesce(f.width, 0), coalesce(f.height, 0), {visual_columns}
              FROM files f JOIN libraries l ON l.id = f.library_id
-             WHERE f.pixel_hash IS NOT NULL",
-            visual_columns
+             WHERE f.pixel_hash IS NOT NULL"
         ))?;
         let rows = stmt.query_map([], |row| {
             Ok(HashedImage {
@@ -830,10 +852,9 @@ impl Catalog {
             .conn
             .query_row(
                 &format!(
-                    "SELECT {}, hash_version, pixel_hash, phash, fingerprint, duration_ms, frames,
+                    "SELECT {FILE_COLUMNS}, hash_version, pixel_hash, phash, fingerprint, duration_ms, frames,
                             chromaprint
-                     FROM files WHERE library_id = ?1 AND path = ?2",
-                    FILE_COLUMNS
+                     FROM files WHERE library_id = ?1 AND path = ?2"
                 ),
                 params![library_id, path],
                 |row| {
@@ -843,10 +864,10 @@ impl Catalog {
                         hash_version: row.get(10)?,
                         pixel_hash: row.get(11)?,
                         phash: row.get(12)?,
-                        fingerprint: hex(row.get(13)?),
+                        fingerprint: row.get::<_, Option<Vec<u8>>>(13)?.as_deref().map(hex),
                         duration_ms: row.get(14)?,
-                        frames: hex(row.get(15)?),
-                        chromaprint: hex(row.get(16)?),
+                        frames: row.get::<_, Option<Vec<u8>>>(15)?.as_deref().map(hex),
+                        chromaprint: row.get::<_, Option<Vec<u8>>>(16)?.as_deref().map(hex),
                     })
                 },
             )
@@ -871,16 +892,21 @@ impl Catalog {
                 row.hash_version,
                 row.pixel_hash,
                 row.phash,
-                unhex(&row.fingerprint),
+                unhex(row.fingerprint.as_deref()),
                 row.duration_ms,
-                unhex(&row.frames),
-                unhex(&row.chromaprint),
+                unhex(row.frames.as_deref()),
+                unhex(row.chromaprint.as_deref()),
             ],
         )?;
         tx.commit()
     }
 
     /// Every library with its file count, ordered by root.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn libraries(&self) -> rusqlite::Result<Vec<Library>> {
         let mut stmt = self.conn.prepare(
             "SELECT l.id, l.root, l.scanned_at, count(f.path)
@@ -913,10 +939,7 @@ impl Catalog {
     pub fn file(&self, library_id: i64, path: &str) -> rusqlite::Result<Option<FileRecord>> {
         self.conn
             .query_row(
-                &format!(
-                    "SELECT {} FROM files WHERE library_id = ?1 AND path = ?2",
-                    FILE_COLUMNS
-                ),
+                &format!("SELECT {FILE_COLUMNS} FROM files WHERE library_id = ?1 AND path = ?2"),
                 params![library_id, path],
                 file_record,
             )
@@ -925,6 +948,11 @@ impl Catalog {
 
     /// The folders directly inside the folder `dir` of a library (`""` is the root), with the
     /// number of files below each, ordered by name.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn subfolders(
         &self,
         library_id: i64,
@@ -935,10 +963,9 @@ impl Catalog {
         values.insert(0, Value::from(dir_prefix_len(dir) + 1));
         let mut stmt = self.conn.prepare(&format!(
             "SELECT substr(rest, 1, instr(rest, '/') - 1) AS name, count(*)
-             FROM (SELECT substr(path, ?) AS rest FROM files WHERE {})
+             FROM (SELECT substr(path, ?) AS rest FROM files WHERE {cond})
              WHERE instr(rest, '/') > 0
-             GROUP BY name ORDER BY name",
-            cond
+             GROUP BY name ORDER BY name"
         ))?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
             Ok((row.get(0)?, row.get::<_, i64>(1)? as usize))
@@ -957,8 +984,7 @@ impl Catalog {
         let (cond, mut values) = in_folder(library_id, dir, media_type);
         values.extend([Value::from(page.limit), Value::from(page.offset)]);
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {} FROM files WHERE {} ORDER BY path LIMIT ? OFFSET ?",
-            FILE_COLUMNS, cond
+            "SELECT {FILE_COLUMNS} FROM files WHERE {cond} ORDER BY path LIMIT ? OFFSET ?"
         ))?;
         let rows = stmt.query_map(params_from_iter(values), file_record)?;
         rows.collect()
@@ -979,8 +1005,7 @@ impl Catalog {
             self.conn
                 .query_row(
                     &format!(
-                        "SELECT path FROM files WHERE {} AND path {} ? ORDER BY path {} LIMIT 1",
-                        cond, op, order
+                        "SELECT path FROM files WHERE {cond} AND path {op} ? ORDER BY path {order} LIMIT 1"
                     ),
                     params_from_iter(values),
                     |row| row.get(0),
@@ -992,12 +1017,16 @@ impl Catalog {
 
     /// Months (`YYYY-MM`) that have files, newest first, with the number of files in each.
     /// A file's date is when it was taken, or its mtime in local time if that is unknown.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn months(&self, filter: &Filter) -> rusqlite::Result<Vec<(String, usize)>> {
         let (cond, values) = filter.condition();
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT substr({}, 1, 7) AS month, count(*) FROM files WHERE {}
-             GROUP BY month ORDER BY month DESC",
-            DATE_KEY, cond
+            "SELECT substr({DATE_KEY}, 1, 7) AS month, count(*) FROM files WHERE {cond}
+             GROUP BY month ORDER BY month DESC"
         ))?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
             Ok((row.get(0)?, row.get::<_, i64>(1)? as usize))
@@ -1019,10 +1048,9 @@ impl Catalog {
             Value::from(page.offset),
         ]);
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {}, library_id, {} AS date FROM files
-             WHERE {} AND substr(date, 1, 7) = ?
-             ORDER BY date DESC, library_id DESC, path DESC LIMIT ? OFFSET ?",
-            FILE_COLUMNS, DATE_KEY, cond
+            "SELECT {FILE_COLUMNS}, library_id, {DATE_KEY} AS date FROM files
+             WHERE {cond} AND substr(date, 1, 7) = ?
+             ORDER BY date DESC, library_id DESC, path DESC LIMIT ? OFFSET ?"
         ))?;
         let rows = stmt.query_map(params_from_iter(values), dated_file)?;
         rows.collect()
@@ -1032,10 +1060,7 @@ impl Catalog {
     pub fn date(&self, library_id: i64, path: &str) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row(
-                &format!(
-                    "SELECT {} FROM files WHERE library_id = ?1 AND path = ?2",
-                    DATE_KEY
-                ),
+                &format!("SELECT {DATE_KEY} FROM files WHERE library_id = ?1 AND path = ?2"),
                 params![library_id, path],
                 |row| row.get(0),
             )
@@ -1064,13 +1089,8 @@ impl Catalog {
                 .query_row(
                     &format!(
                         "SELECT library_id, path FROM files
-                         WHERE {} AND ({}, library_id, path) {} (?, ?, ?)
-                         ORDER BY {} {o}, library_id {o}, path {o} LIMIT 1",
-                        cond,
-                        DATE_KEY,
-                        op,
-                        DATE_KEY,
-                        o = order
+                         WHERE {cond} AND ({DATE_KEY}, library_id, path) {op} (?, ?, ?)
+                         ORDER BY {DATE_KEY} {order}, library_id {order}, path {order} LIMIT 1"
                     ),
                     params_from_iter(values),
                     |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1081,6 +1101,11 @@ impl Catalog {
     }
 
     /// Every file, in any library, with the given size and hash.
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "SQLite stores sizes, counts and hashes as i64"
+    )]
     pub fn copies(&self, size: u64, sha256: &str) -> rusqlite::Result<Vec<HashedFile>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256
@@ -1136,14 +1161,13 @@ pub struct CatalogRow {
 }
 
 /// A BLOB as lowercase hex, for `CatalogRow`.
-fn hex(blob: Option<Vec<u8>>) -> Option<String> {
-    blob.map(|b| data_encoding::HEXLOWER.encode(&b))
+fn hex(blob: &[u8]) -> String {
+    data_encoding::HEXLOWER.encode(blob)
 }
 
 /// Lowercase hex from `hex` as a BLOB.
-fn unhex(text: &Option<String>) -> Option<Vec<u8>> {
-    text.as_deref()
-        .and_then(|t| data_encoding::HEXLOWER.decode(t.as_bytes()).ok())
+fn unhex(text: Option<&str>) -> Option<Vec<u8>> {
+    text.and_then(|t| data_encoding::HEXLOWER.decode(t.as_bytes()).ok())
 }
 
 /// A video or audio file with its signature or fingerprint.
@@ -1196,10 +1220,11 @@ impl Filter {
         let mut cond = String::from("1");
         let mut values: Vec<Value> = vec![];
         if !self.libraries.is_empty() {
-            cond.push_str(&format!(
+            let _ = write!(
+                cond,
                 " AND library_id IN ({})",
                 vec!["?"; self.libraries.len()].join(", ")
-            ));
+            );
             values.extend(self.libraries.iter().map(|&id| Value::from(id)));
         }
         if let Some(media_type) = self.media_type {
@@ -1347,6 +1372,10 @@ pub fn one_row_per_file<'a>(
 
 /// Bring a catalog with an older schema version up to `SCHEMA_VERSION`, in one transaction that
 /// holds the write lock, so two processes opening it at once migrate it once.
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "SQLite stores sizes, counts and hashes as i64"
+)]
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Read again under the lock: another process may have migrated it meanwhile.
@@ -1368,6 +1397,10 @@ const DATE_KEY: &str = "coalesce(substr(taken_at, 1, 19), \
 
 /// Number of characters before the names of a folder's children: `dir/`, or none for the root.
 /// SQLite counts characters, not bytes, in `substr` on text.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "SQLite stores sizes, counts and hashes as i64"
+)]
 fn dir_prefix_len(dir: &str) -> i64 {
     if dir.is_empty() {
         0
@@ -1384,8 +1417,8 @@ fn below(library_id: i64, dir: &str, media_type: Option<MediaType>) -> (String, 
     if !dir.is_empty() {
         cond.push_str(" AND path >= ? AND path < ?");
         values.extend([
-            Value::from(format!("{}/", dir)),
-            Value::from(format!("{}0", dir)),
+            Value::from(format!("{dir}/")),
+            Value::from(format!("{dir}0")),
         ]);
     }
     if let Some(media_type) = media_type {
@@ -1419,7 +1452,7 @@ pub fn library_path(root: &Path, rel: &str) -> PathBuf {
 /// A library root as users know it: without the `\\?\` prefix Windows puts on canonical paths.
 pub fn display_root(root: &str) -> String {
     if let Some(unc) = root.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{}", unc)
+        format!(r"\\{unc}")
     } else if let Some(local) = root.strip_prefix(r"\\?\") {
         String::from(local)
     } else {
@@ -1437,6 +1470,10 @@ fn dated_file(row: &Row) -> rusqlite::Result<DatedFile> {
 }
 
 /// Build a `FileRecord` from a row selected in `FILE_COLUMNS` order.
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "SQLite stores sizes, counts and hashes as i64"
+)]
 fn file_record(row: &Row) -> rusqlite::Result<FileRecord> {
     let media_type: String = row.get(3)?;
     Ok(FileRecord {
@@ -1740,7 +1777,7 @@ mod tests {
 
         catalog.remove(id, "a.jpg").unwrap();
         catalog.remove(id, "c.jpg").unwrap();
-        assert!(catalog.files(id).unwrap().is_empty());
+        assert_eq!(catalog.files(id).unwrap(), Vec::<FileRecord>::new());
         assert_eq!(catalog.files(other).unwrap().len(), 2);
     }
 
@@ -1768,7 +1805,7 @@ mod tests {
             let mut file = record(path, 1);
             file.stamp.mtime_ns = JUNE_2020_NS;
             file.meta.taken_at = taken_at.map(String::from);
-            if path.ends_with(".mp4") {
+            if Path::new(path).extension().is_some_and(|e| e == "mp4") {
                 file.media_type = MediaType::Video;
             }
             catalog.upsert(id, &file).unwrap();
@@ -1939,7 +1976,10 @@ mod tests {
 
         catalog.upsert(id, &record("a.jpg", 2)).unwrap();
         assert_eq!(versions(&catalog), ["a.jpg ", "b.jpg v1"]);
-        assert!(catalog.hashed_images(true).unwrap().is_empty());
+        assert_eq!(
+            catalog.hashed_images(true).unwrap(),
+            Vec::<HashedImage>::new()
+        );
         assert_eq!(catalog.count_unhashed(&[id]).unwrap(), 1);
     }
 
@@ -1958,7 +1998,7 @@ mod tests {
         catalog.set_sha256(other, "elsewhere.jpg", "abc").unwrap();
         let copies = catalog.copies(1, "abc").unwrap();
         assert_eq!(copies.len(), 2);
-        assert!(catalog.copies(2, "abc").unwrap().is_empty());
+        assert_eq!(catalog.copies(2, "abc").unwrap(), Vec::<HashedFile>::new());
         assert_eq!(
             catalog.file(id, "x/y/3.jpg").unwrap().unwrap().path,
             "x/y/3.jpg"

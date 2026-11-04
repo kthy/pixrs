@@ -101,7 +101,7 @@ const AUDIO_VARIANTS: &[(&str, &str, &[&str])] = &[
 ];
 
 fn die(msg: &str) -> ! {
-    eprintln!("{}", msg);
+    eprintln!("{msg}");
     exit(1)
 }
 
@@ -111,11 +111,7 @@ fn encode(ffmpeg: &Path, input: &Path, options: &[&str], output: &Path) -> bool 
         .args(["-nostdin", "-y", "-loglevel", "error", "-i"])
         .arg(input)
         .args(options)
-        .args(
-            ["-an"]
-                .iter()
-                .filter(|_| options.iter().any(|o| o.starts_with("-c:v"))),
-        )
+        .args(std::iter::once(&"-an").filter(|_| options.iter().any(|o| o.starts_with("-c:v"))))
         .arg(output)
         .stdin(Stdio::null())
         .status()
@@ -138,6 +134,10 @@ fn frame_counts(a: &[Frame], b: &[Frame], threshold: u32) -> (usize, usize) {
     (matching, both)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "a calibration run, read top to bottom"
+)]
 fn main() {
     let opt = Opt::parse();
     let tools = Tools::find();
@@ -185,7 +185,7 @@ fn main() {
         let mut results = vec![];
         for (n, video) in videos.iter().step_by(step).take(opt.sample).enumerate() {
             let source = library_path(Path::new(&video.file.root), &video.file.path);
-            let copy = out.join(format!("variant-{}.mp4", n));
+            let copy = out.join(format!("variant-{n}.mp4"));
             if !encode(ffmpeg, &source, options, &copy) {
                 continue;
             }
@@ -199,10 +199,7 @@ fn main() {
             let _ = fs::remove_file(&copy);
         }
         let matched = results.iter().filter(|r| r.2).count();
-        let pairs: Vec<String> = results
-            .iter()
-            .map(|(m, b, _)| format!("{}/{}", m, b))
-            .collect();
+        let pairs: Vec<String> = results.iter().map(|(m, b, _)| format!("{m}/{b}")).collect();
         println!(
             "  {:<18} {} of {} match by the rule; {}",
             name,
@@ -239,14 +236,12 @@ fn main() {
     }
     println!();
     println!(
-        "Pairs of different videos with close durations and the same shape: {}; by matching \
-         frames 0..{}: {:?}; matching by the rule: {}",
-        close, FRAMES, by_matching, close_matched
+        "Pairs of different videos with close durations and the same shape: {close}; by matching \
+         frames 0..{FRAMES}: {by_matching:?}; matching by the rule: {close_matched}"
     );
     // All pairs, whatever their durations: how often would the frames alone match?
     println!(
-        "All {} pairs of different videos, ignoring durations: {} match by frames",
-        all_pairs, any_matched
+        "All {all_pairs} pairs of different videos, ignoring durations: {any_matched} match by frames"
     );
 
     if let Some(folder) = &opt.audio {
@@ -271,7 +266,7 @@ fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
-        .map(|e| e.into_path())
+        .map(walkdir::DirEntry::into_path)
         .filter(|p| pixrs::media::MediaType::from_path(p) == Some(pixrs::media::MediaType::Audio))
         .collect();
     let prints: Vec<AudioFingerprint> = files
@@ -283,7 +278,7 @@ fn calibrate_audio(tools: &Tools, folder: &Path, out: &Path) {
     for (name, ext, options) in AUDIO_VARIANTS {
         let mut rates = vec![];
         for (n, file) in files.iter().enumerate() {
-            let copy = out.join(format!("audio-{}.{}", n, ext));
+            let copy = out.join(format!("audio-{n}.{ext}"));
             if !encode(ffmpeg, file, options, &copy) {
                 continue;
             }

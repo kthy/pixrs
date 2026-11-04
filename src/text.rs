@@ -41,7 +41,7 @@ pub fn printable_lines(text: &str) -> String {
 pub struct Shown<'a>(&'a Path);
 
 /// `path`, to print.
-pub fn shown(path: &Path) -> Shown<'_> {
+pub const fn shown(path: &Path) -> Shown<'_> {
     Shown(path)
 }
 

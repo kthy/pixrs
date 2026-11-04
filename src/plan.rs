@@ -108,8 +108,7 @@ impl Plan {
     /// libraries, every target below its destination, and the moves must refer to each other
     /// and to the libraries consistently.
     pub fn check(&self) -> Result<(), Error> {
-        let fault =
-            |what: String| Error::Usage(format!("The plan cannot be carried out: {}", what));
+        let fault = |what: String| Error::Usage(format!("The plan cannot be carried out: {what}"));
         let below = |path: &str, folder: &str| {
             let (path, folder) = (Path::new(path), Path::new(folder));
             path.starts_with(folder) && path != folder
@@ -242,7 +241,7 @@ impl Taken {
         let mut dir = base.to_path_buf();
         for name in folders {
             let wanted = dir.join(name);
-            let key = Taken::key(&wanted);
+            let key = Self::key(&wanted);
             if let Some(known) = self.folders.get(&key) {
                 dir = known.clone();
                 continue;
@@ -285,7 +284,7 @@ impl Taken {
 
     /// `is_free`, with `None` for a folder that cannot be read.
     fn check(&mut self, target: &Path, own: &Path) -> Option<bool> {
-        if self.claimed.contains(&Taken::key(target)) {
+        if self.claimed.contains(&Self::key(target)) {
             return Some(false);
         }
         if target == own {
@@ -307,7 +306,7 @@ impl Taken {
     }
 
     fn claim(&mut self, target: &Path) {
-        self.claimed.insert(Taken::key(target));
+        self.claimed.insert(Self::key(target));
     }
 
     /// The first free target among `target` and its suffixed variants, claimed; `None` if the
@@ -350,10 +349,10 @@ impl Links {
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{}", ext)),
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
         _ => (name.to_string(), String::new()),
     };
-    path.with_file_name(sanitize(&format!("{}{}{}", stem, suffix, ext)))
+    path.with_file_name(sanitize(&format!("{stem}{suffix}{ext}")))
 }
 
 /// `path` as UTF-8, or a usage error naming `what`.
@@ -400,13 +399,13 @@ fn sidecars(dir: &Path, name: &str, new_name: &str, cache: &mut Listings) -> Vec
         if base.eq_ignore_ascii_case(name) {
             found.push(Sidecar {
                 name: candidate.clone(),
-                new_name: format!("{}.{}", new_name, ext),
+                new_name: format!("{new_name}.{ext}"),
                 by_stem: false,
             });
         } else if base.eq_ignore_ascii_case(old_stem) {
             found.push(Sidecar {
                 name: candidate.clone(),
-                new_name: format!("{}.{}", new_stem, ext),
+                new_name: format!("{new_stem}.{ext}"),
                 by_stem: true,
             });
         }
@@ -496,6 +495,7 @@ fn add_sidecars(moves: &mut Vec<Move>, taken: &mut Taken, notes: &mut PlanNotes)
 }
 
 /// Plan how to organize one library by a template.
+#[allow(clippy::too_many_lines, reason = "to be split by phase")]
 pub fn plan_organize(
     catalog: &Catalog,
     catalog_path: &Path,
@@ -624,6 +624,7 @@ pub fn plan_organize(
 /// Similar files are left alone: similar images are mostly burst shots, not copies, and a
 /// re-encoded video may be the better copy. Exact copies in a similar group still move. Each
 /// move requires its group's kept copy to still be there, unchanged, when the plan is applied.
+#[allow(clippy::too_many_lines, reason = "to be split by phase")]
 pub fn plan_quarantine(
     catalog: &Catalog,
     catalog_path: &Path,
@@ -639,14 +640,14 @@ pub fn plan_quarantine(
     let mut used: HashSet<String> = HashSet::new();
     for library in &libraries {
         let shown = display_root(&library.root);
-        let last = Path::new(&shown)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| String::from("library"));
+        let last = Path::new(&shown).file_name().map_or_else(
+            || String::from("library"),
+            |n| n.to_string_lossy().into_owned(),
+        );
         let mut name = sanitize(&last);
         let mut n = 2;
         while !used.insert(folded(&name)) {
-            name = sanitize(&format!("{}_{}", last, n));
+            name = sanitize(&format!("{last}_{n}"));
             n += 1;
         }
         folder_of.insert(library.id, name);
@@ -825,10 +826,10 @@ pub fn write_plan(plan: &Plan, now: OffsetDateTime) -> Result<PathBuf, Error> {
         PlanKind::Organize => "organize",
         PlanKind::Quarantine => "quarantine",
     };
-    let mut path = dir.join(format!("{}-{}.json", kind, stamp));
+    let mut path = dir.join(format!("{kind}-{stamp}.json"));
     let mut n = 2;
     while path.exists() {
-        path = dir.join(format!("{}-{}-{}.json", kind, stamp, n));
+        path = dir.join(format!("{kind}-{stamp}-{n}.json"));
         n += 1;
     }
     let file = fs::File::create(&path)?;
@@ -1061,15 +1062,12 @@ mod tests {
     #[test]
     fn test_names_in_another_normalization_collide() {
         use crate::names::tests::{NFC, NFD};
-        let (x, y) = (format!("x/{}.jpg", NFD), format!("y/{}.jpg", NFC));
+        let (x, y) = (format!("x/{NFD}.jpg"), format!("y/{NFC}.jpg"));
         let f = fixture(&[(&x, None), (&y, None)]);
         let (plan, notes) = organize(&f, "{name}.{ext}", false);
         assert_eq!(
             moves(&f, &plan),
-            [
-                format!("{} -> {}.jpg", x, NFD),
-                format!("{} -> {}_2.jpg", y, NFC)
-            ]
+            [format!("{x} -> {NFD}.jpg"), format!("{y} -> {NFC}_2.jpg")]
         );
         assert_eq!(notes.collisions.len(), 1);
     }
@@ -1127,7 +1125,7 @@ mod tests {
         let mut out = vec![];
         write_summary(&plan, &notes, Path::new("plan.json"), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains(['\u{1b}', '\u{7}', '\r']), "{:?}", text);
+        assert!(!text.contains(['\u{1b}', '\u{7}', '\r']), "{text:?}");
         assert!(text.contains("/lib/a\\u{1b}[2J.jpg\n  -> "), "{}", text);
         assert!(text.contains("Warning: x\\u{7}.jpg is taken, using x\\u{7}_2.jpg"));
         assert!(text.contains("Warning: b.jpg\\rDone. stays"));
@@ -1162,6 +1160,7 @@ mod tests {
 
     #[test]
     fn test_plans_are_checked() {
+        type Fault<'a> = Box<dyn Fn(&mut Plan) + 'a>;
         let f = fixture(&[("a/1.jpg", None)]);
         fs::write(f.root.join("a/1.xmp"), b"edits").unwrap();
         let (plan, _) = organize(&f, "{name}.{ext}", false);
@@ -1170,7 +1169,6 @@ mod tests {
         plan.check().unwrap();
         let outside = f.root.parent().unwrap().join("elsewhere.jpg");
         let outside = outside.to_str().unwrap();
-        type Fault<'a> = Box<dyn Fn(&mut Plan) + 'a>;
         let faults: Vec<(&str, Fault)> = vec![
             (
                 "sidecar of a later move",
@@ -1211,7 +1209,7 @@ mod tests {
                         path: String::from(outside),
                         size: 1,
                         mtime_ns: 0,
-                    })
+                    });
                 }),
             ),
             (
@@ -1236,7 +1234,7 @@ mod tests {
             let mut faulty = plan.clone();
             fault(&mut faulty);
             let err = faulty.check().unwrap_err();
-            assert!(matches!(err, Error::Usage(_)), "{}: {}", what, err);
+            assert!(matches!(err, Error::Usage(_)), "{what}: {err}");
         }
         // Moving the files into a folder outside the library, or another library's copies into
         // quarantine, is fine.

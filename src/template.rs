@@ -6,6 +6,8 @@
  * This file is part of PixRS: <https://github.com/kthy/pixrs>                                   *
  *************************************************************************************************/
 
+use std::fmt::Write as _;
+
 use crate::dates::Taken;
 use crate::media::MediaType;
 
@@ -41,31 +43,28 @@ enum Token {
 impl Token {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
-            "year" => Token::Year,
-            "month" => Token::Month,
-            "day" => Token::Day,
-            "hour" => Token::Hour,
-            "minute" => Token::Minute,
-            "second" => Token::Second,
-            "date" => Token::Date,
-            "time" => Token::Time,
-            "type" => Token::Type,
-            "camera" => Token::Camera,
-            "name" => Token::Name,
-            "ext" => Token::Ext,
+            "year" => Self::Year,
+            "month" => Self::Month,
+            "day" => Self::Day,
+            "hour" => Self::Hour,
+            "minute" => Self::Minute,
+            "second" => Self::Second,
+            "date" => Self::Date,
+            "time" => Self::Time,
+            "type" => Self::Type,
+            "camera" => Self::Camera,
+            "name" => Self::Name,
+            "ext" => Self::Ext,
             _ => return None,
         })
     }
 
-    fn needs_date(self) -> bool {
-        matches!(self, Token::Year | Token::Month | Token::Day | Token::Date) || self.needs_time()
+    const fn needs_date(self) -> bool {
+        matches!(self, Self::Year | Self::Month | Self::Day | Self::Date) || self.needs_time()
     }
 
-    fn needs_time(self) -> bool {
-        matches!(
-            self,
-            Token::Hour | Token::Minute | Token::Second | Token::Time
-        )
+    const fn needs_time(self) -> bool {
+        matches!(self, Self::Hour | Self::Minute | Self::Second | Self::Time)
     }
 }
 
@@ -103,8 +102,7 @@ impl Template {
         for segment in source.split('/') {
             if segment.is_empty() || segment == "." || segment == ".." {
                 return Err(format!(
-                    "Template {:?}: folder names cannot be empty, `.` or `..`",
-                    source
+                    "Template {source:?}: folder names cannot be empty, `.` or `..`"
                 ));
             }
             segments.push(parse_segment(source, segment)?);
@@ -112,12 +110,11 @@ impl Template {
         let file = segments.pop().expect("split yields at least one segment");
         if !file.contains(&Part::Token(Token::Ext)) {
             return Err(format!(
-                "Template {:?}: the file name must contain {{ext}}, or files lose their \
-                 extension",
-                source
+                "Template {source:?}: the file name must contain {{ext}}, or files lose their \
+                 extension"
             ));
         }
-        Ok(Template {
+        Ok(Self {
             source: String::from(source),
             folders: segments,
             file,
@@ -131,7 +128,7 @@ impl Template {
         let mut seen: Vec<&str> = vec![];
         for preset in layout.split(',').map(str::trim) {
             if seen.contains(&preset) {
-                return Err(format!("Layout {:?} lists {} twice", layout, preset));
+                return Err(format!("Layout {layout:?} lists {preset} twice"));
             }
             seen.push(preset);
             match preset {
@@ -141,15 +138,14 @@ impl Template {
                 "type" => folders.push("{type}"),
                 _ => {
                     return Err(format!(
-                        "Unknown layout {:?}: use flat, year, year-month or type, or several \
-                         separated by commas",
-                        preset
-                    ))
+                    "Unknown layout {preset:?}: use flat, year, year-month or type, or several \
+                         separated by commas"
+                ))
                 }
             }
         }
         folders.push(PRESET_FILE);
-        Template::parse(&folders.join("/"))
+        Self::parse(&folders.join("/"))
     }
 
     /// The template as given.
@@ -219,22 +215,21 @@ fn parse_segment(source: &str, segment: &str) -> Result<Vec<Part>, String> {
     while !rest.is_empty() {
         match rest.find(['{', '}']) {
             Some(0) if rest.starts_with('{') => {
-                let end = rest.find('}').ok_or_else(|| {
-                    format!("Template {:?}: `{{` without a closing `}}`", source)
-                })?;
+                let end = rest
+                    .find('}')
+                    .ok_or_else(|| format!("Template {source:?}: `{{` without a closing `}}`"))?;
                 let name = &rest[1..end];
                 let token = Token::parse(name).ok_or_else(|| {
                     format!(
-                        "Template {:?}: unknown token {{{}}}. Tokens: {{year}} {{month}} {{day}} \
+                        "Template {source:?}: unknown token {{{name}}}. Tokens: {{year}} {{month}} {{day}} \
                          {{hour}} {{minute}} {{second}} {{date}} {{time}} {{type}} {{camera}} \
-                         {{name}} {{ext}}",
-                        source, name
+                         {{name}} {{ext}}"
                     )
                 })?;
                 parts.push(Part::Token(token));
                 rest = &rest[end + 1..];
             }
-            Some(0) => return Err(format!("Template {:?}: `}}` without `{{`", source)),
+            Some(0) => return Err(format!("Template {source:?}: `}}` without `{{`")),
             found => {
                 let end = found.unwrap_or(rest.len());
                 let text = &rest[..end];
@@ -243,8 +238,7 @@ fn parse_segment(source: &str, segment: &str) -> Result<Vec<Part>, String> {
                     .find(|&c| ILLEGAL.contains(&c) || c.is_control())
                 {
                     return Err(format!(
-                        "Template {:?}: {:?} is not allowed in file names on Windows",
-                        source, c
+                        "Template {source:?}: {c:?} is not allowed in file names on Windows"
                     ));
                 }
                 parts.push(Part::Text(String::from(text)));
@@ -277,23 +271,27 @@ fn fill(segment: &[Part], facts: &Facts, time: Option<&str>) -> String {
     for part in segment {
         match part {
             Part::Text(text) => out.push_str(text),
-            Part::Token(token) => out.push_str(&match token {
-                Token::Year => format!("{:04}", date.year),
-                Token::Month => format!("{:02}", date.month),
-                Token::Day => format!("{:02}", date.day),
-                Token::Hour => format!("{:02}", hour),
-                Token::Minute => format!("{:02}", minute),
-                Token::Second => format!("{:02}", second),
-                Token::Date => format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
-                Token::Time => match time {
-                    Some(time) => String::from(time),
-                    None => format!("{:02}{:02}{:02}", hour, minute, second),
-                },
-                Token::Type => String::from(facts.media_type.as_str()),
-                Token::Camera => String::from(facts.camera.unwrap_or("unknown")),
-                Token::Name => String::from(facts.name),
-                Token::Ext => String::from(facts.ext),
-            }),
+            Part::Token(token) => {
+                let _ = match token {
+                    Token::Year => write!(out, "{:04}", date.year),
+                    Token::Month => write!(out, "{:02}", date.month),
+                    Token::Day => write!(out, "{:02}", date.day),
+                    Token::Hour => write!(out, "{hour:02}"),
+                    Token::Minute => write!(out, "{minute:02}"),
+                    Token::Second => write!(out, "{second:02}"),
+                    Token::Date => {
+                        write!(out, "{:04}-{:02}-{:02}", date.year, date.month, date.day)
+                    }
+                    Token::Time => match time {
+                        Some(time) => out.write_str(time),
+                        None => write!(out, "{hour:02}{minute:02}{second:02}"),
+                    },
+                    Token::Type => out.write_str(facts.media_type.as_str()),
+                    Token::Camera => out.write_str(facts.camera.unwrap_or("unknown")),
+                    Token::Name => out.write_str(facts.name),
+                    Token::Ext => out.write_str(facts.ext),
+                };
+            }
         }
     }
     out

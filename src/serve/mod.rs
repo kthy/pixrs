@@ -22,6 +22,7 @@ use axum::routing::get;
 use axum::Router;
 use directories::ProjectDirs;
 use log::{debug, log_enabled, warn, Level};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -84,16 +85,16 @@ pub(crate) enum AppError {
 
 impl From<rusqlite::Error> for AppError {
     fn from(e: rusqlite::Error) -> Self {
-        AppError::Internal(format!("catalog error: {}", e))
+        Self::Internal(format!("catalog error: {e}"))
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
-            AppError::NotFound => (StatusCode::NOT_FOUND, "Not found").into_response(),
-            AppError::Internal(msg) => {
-                warn!("{}", msg);
+            Self::NotFound => (StatusCode::NOT_FOUND, "Not found").into_response(),
+            Self::Internal(msg) => {
+                warn!("{msg}");
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             }
         }
@@ -132,18 +133,22 @@ impl AppState {
     /// it cannot skip or repeat groups. One report is made at a time and shared by every request
     /// waiting for it. Only reading the catalog holds it; comparing the images does not, so
     /// other pages stay responsive meanwhile.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held while the report is made, so one is made at a time"
+    )]
     pub(crate) async fn dupes(self: &Arc<Self>, fresh: bool) -> Result<Arc<DupeReport>, AppError> {
         let mut cached = self.dupes.lock().await;
         if let Some(c) = cached.as_mut() {
             if !fresh || c.made.elapsed() < DUPES_REFRESH {
                 return Ok(Arc::clone(&c.report));
             }
-            if self.query(|catalog| catalog.data_version()).await? == c.version {
+            if self.query(super::catalog::Catalog::data_version).await? == c.version {
                 c.made = Instant::now();
                 return Ok(Arc::clone(&c.report));
             }
         }
-        let version = self.query(|catalog| catalog.data_version()).await?;
+        let version = self.query(super::catalog::Catalog::data_version).await?;
         let (libraries, similar) = (self.libraries.clone(), self.similarity.images);
         let input = self
             .query(move |catalog| load_dupes(catalog, &libraries, similar))
@@ -216,7 +221,7 @@ pub fn run(config: Config, ready: impl FnOnce(&str)) -> Result<(), Error> {
         // The port the OS picked, if it was 0.
         let port = listener.local_addr()?.port();
         let app = router(Arc::new(AppState::new(config, port, ffmpeg, ffprobe)));
-        ready(&format!("http://127.0.0.1:{}/", port));
+        ready(&format!("http://127.0.0.1:{port}/"));
         axum::serve(listener, app).await?;
         Ok(())
     })
@@ -224,7 +229,7 @@ pub fn run(config: Config, ready: impl FnOnce(&str)) -> Result<(), Error> {
 
 impl AppState {
     fn new(config: Config, port: u16, ffmpeg: Option<PathBuf>, ffprobe: Option<PathBuf>) -> Self {
-        AppState {
+        Self {
             catalog: Mutex::new(config.catalog),
             libraries: config.libraries,
             thumbs: Thumbnailer::new(config.cache_dir, ffmpeg),
@@ -265,10 +270,7 @@ fn check_cache_outside_libraries(catalog: &Catalog, cache_dir: &Path) -> Result<
 fn find_tool(name: &str) -> Option<PathBuf> {
     let found = crate::decode::find_tool(name);
     if found.is_none() {
-        eprintln!(
-            "{} not found on PATH; some thumbnails will be placeholders",
-            name
-        );
+        eprintln!("{name} not found on PATH; some thumbnails will be placeholders");
     }
     found
 }
@@ -323,7 +325,8 @@ async fn log_request(req: Request, next: Next) -> Response {
 /// escaped.
 fn describe_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> String {
     let decoded = |text: &str| {
-        let text = urlencoding::decode(text).map_or_else(|_| text.into(), |t| t.into_owned());
+        let text =
+            urlencoding::decode(text).map_or_else(|_| text.into(), std::borrow::Cow::into_owned);
         printable(&text).into_owned()
     };
     let target = uri.path_and_query().map_or("/", |p| p.as_str());
@@ -340,7 +343,7 @@ fn describe_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> String {
         })
         .collect();
     if !htmx.is_empty() {
-        line.push_str(&format!(" [{}]", htmx.join(", ")));
+        let _ = write!(line, " [{}]", htmx.join(", "));
     }
     line
 }
@@ -362,7 +365,9 @@ async fn check_host(State(state): State<Arc<AppState>>, req: Request, next: Next
     if !(host.is_some_and(allowed) && authority_ok) {
         return (StatusCode::MISDIRECTED_REQUEST, "Unknown host").into_response();
     }
-    let site = headers.get("sec-fetch-site").map(|site| site.as_bytes());
+    let site = headers
+        .get("sec-fetch-site")
+        .map(axum::http::HeaderValue::as_bytes);
     if site.is_some_and(|site| site != b"same-origin" && site != b"none") {
         return (
             StatusCode::FORBIDDEN,
@@ -374,6 +379,7 @@ async fn check_host(State(state): State<Arc<AppState>>, req: Request, next: Next
 }
 
 /// A compiled-in asset.
+#[allow(clippy::unused_async, reason = "an axum handler")]
 async fn asset(body: &'static str, content_type: &'static str) -> Response {
     (
         [
@@ -609,7 +615,7 @@ mod tests {
         let lib = f.library_id;
         let res = get(
             &f.app,
-            &format!("/media/{}/sub%20dir/red%20%C3%A9.png", lib),
+            &format!("/media/{lib}/sub%20dir/red%20%C3%A9.png"),
             host,
         )
         .await;
@@ -617,10 +623,10 @@ mod tests {
         assert_eq!(res.headers()[header::CONTENT_TYPE], "image/png");
 
         for uri in [
-            format!("/media/{}/secret.txt", lib),
-            format!("/media/{}/sub%20dir/../secret.txt", lib),
-            format!("/media/{}/..%2Fsecret.txt", lib),
-            format!("/media/{}/%2E%2E/%2E%2E/etc/passwd", lib),
+            format!("/media/{lib}/secret.txt"),
+            format!("/media/{lib}/sub%20dir/../secret.txt"),
+            format!("/media/{lib}/..%2Fsecret.txt"),
+            format!("/media/{lib}/%2E%2E/%2E%2E/etc/passwd"),
             format!("/media/{}/sub%20dir/red%20%C3%A9.png", lib + 1),
         ] {
             assert_eq!(
@@ -689,13 +695,13 @@ mod tests {
         let lib = f.library_id;
         for uri in [
             String::from("/"),
-            format!("/folders/{}", lib),
-            format!("/folders/{}/sub%20dir", lib),
-            format!("/folders/{}/sub%20dir?type=image&page=1&partial=1", lib),
+            format!("/folders/{lib}"),
+            format!("/folders/{lib}/sub%20dir"),
+            format!("/folders/{lib}/sub%20dir?type=image&page=1&partial=1"),
             String::from("/dates/1970-01"),
             String::from("/dupes"),
-            format!("/view/{}/sub%20dir/red%20%C3%A9.png", lib),
-            format!("/view/{}/photo.heic?from=date", lib),
+            format!("/view/{lib}/sub%20dir/red%20%C3%A9.png"),
+            format!("/view/{lib}/photo.heic?from=date"),
             String::from("/static/htmx-4.0.0.min.js"),
         ] {
             let res = get(&f.app, &uri, "localhost:2635").await;

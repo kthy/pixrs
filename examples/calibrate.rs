@@ -148,7 +148,7 @@ fn main() {
 
 /// Exit with a message.
 fn die(msg: &str) -> ! {
-    eprintln!("{}", msg);
+    eprintln!("{msg}");
     exit(1)
 }
 
@@ -157,7 +157,7 @@ fn check_outside(out: &Path, roots: &[String]) {
     let out = resolve(out).unwrap_or_else(|e| die(&e.to_string()));
     for root in roots {
         if out.starts_with(root) {
-            die(&format!("--out must be outside the library {}", root));
+            die(&format!("--out must be outside the library {root}"));
         }
     }
 }
@@ -171,6 +171,10 @@ fn image_id(image: &HashedImage) -> String {
 }
 
 /// Mean, 90th, 95th and 99th percentile, and largest of sorted differences.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "statistics over counts far below 2^52"
+)]
 fn metrics(diffs: &[u8]) -> [f64; 5] {
     if diffs.is_empty() {
         return [255.0; 5];
@@ -283,7 +287,7 @@ fn sample_variants(
     let step = (images.len() / opt.sample.max(1)).max(1);
     let sample: Vec<&HashedImage> = images.iter().step_by(step).take(opt.sample).collect();
     let workers = std::thread::available_parallelism()
-        .map_or(1, |w| w.get())
+        .map_or(1, std::num::NonZero::get)
         .min(8);
     let chunk = sample.len().div_ceil(workers).max(1);
     let results = std::thread::scope(|scope| {
@@ -356,7 +360,7 @@ fn print_variants(variants: &[Vec<(u32, [f64; 5])>]) {
             format!("{} max", m)
         );
     }
-    println!("{}", header);
+    println!("{header}");
     for (v, name) in VARIANTS.iter().enumerate() {
         let mut hashes: Vec<f64> = variants[v].iter().map(|(d, _)| f64::from(*d)).collect();
         let mut line = format!(
@@ -374,7 +378,7 @@ fn print_variants(variants: &[Vec<(u32, [f64; 5])>]) {
                 percentile(&mut values, 100)
             );
         }
-        println!("{}", line);
+        println!("{line}");
     }
 }
 
@@ -393,16 +397,20 @@ fn print_spread(title: &str, all: impl Iterator<Item = [f64; 5]>) {
     );
     for (m, name) in METRICS.iter().enumerate() {
         let mut values: Vec<f64> = all.iter().map(|ms| ms[m]).collect();
-        let mut line = format!("{:<6}", name);
+        let mut line = format!("{name:<6}");
         for p in [1, 5, 10, 25, 50, 75, 90] {
             let _ = write!(line, " {:>7.1}", percentile(&mut values, p));
         }
-        println!("{}", line);
+        println!("{line}");
     }
 }
 
 /// Measure each metric against the answers from the review page: for each limit, the share of
 /// synthetic copies kept, and how many answered pairs land on each side.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "statistics over counts far below 2^52"
+)]
 fn print_labels(
     path: &Path,
     images: &[HashedImage],
@@ -492,6 +500,10 @@ fn fingerprint_at(upright: &DynamicImage, side: u32) -> Vec<u8> {
 
 /// For each fingerprint size: how well each metric separates the answered pairs, with synthetic
 /// copies standing in for "same picture" answers (there are few of those).
+#[allow(
+    clippy::too_many_lines,
+    reason = "a calibration run, read top to bottom"
+)]
 fn compare_sizes(
     opt: &Opt,
     path: &Path,
@@ -519,9 +531,13 @@ fn compare_sizes(
     let decode_all = |list: &[usize]| -> HashMap<usize, DynamicImage> {
         std::thread::scope(|scope| {
             let workers = std::thread::available_parallelism()
-                .map_or(1, |w| w.get())
+                .map_or(1, std::num::NonZero::get)
                 .min(8);
             let chunk = list.len().div_ceil(workers).max(1);
+            #[allow(
+                clippy::needless_collect,
+                reason = "every thread must start before any is joined"
+            )]
             let handles: Vec<_> = list
                 .chunks(chunk)
                 .map(|part| {
@@ -611,6 +627,10 @@ fn compare_sizes(
 
 /// Write `DIR/index.html`, `DIR/thumbs/` and `DIR/large/` with candidate pairs, grouped by the
 /// review metric so the page covers its whole range.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "statistics over counts far below 2^52"
+)]
 fn write_review(
     opt: &Opt,
     images: &[HashedImage],
@@ -639,7 +659,7 @@ fn write_review(
                 }
             }
         }
-        (format!("thumbs/{}", name), format!("large/{}", name))
+        (format!("thumbs/{name}"), format!("large/{name}"))
     };
 
     let mut order: Vec<&Candidate> = candidates.iter().collect();

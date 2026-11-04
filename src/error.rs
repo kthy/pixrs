@@ -21,11 +21,11 @@ pub enum Error {
 
 impl Error {
     /// The process exit code for this error.
-    pub fn exit_code(&self) -> i32 {
+    pub const fn exit_code(&self) -> i32 {
         match self {
-            Error::Usage(_) => exitcode::USAGE,
-            Error::Io(_) => exitcode::IOERR,
-            Error::Catalog(_) => exitcode::SOFTWARE,
+            Self::Usage(_) => exitcode::USAGE,
+            Self::Io(_) => exitcode::IOERR,
+            Self::Catalog(_) => exitcode::SOFTWARE,
         }
     }
 }
@@ -33,9 +33,9 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Usage(msg) => write!(f, "{}", msg),
-            Error::Io(e) => write!(f, "{}", e),
-            Error::Catalog(e) => write!(f, "catalog error: {}", e),
+            Self::Usage(msg) => write!(f, "{msg}"),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Catalog(e) => write!(f, "catalog error: {e}"),
         }
     }
 }
@@ -43,21 +43,21 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Usage(_) => None,
-            Error::Io(e) => Some(e),
-            Error::Catalog(e) => Some(e),
+            Self::Usage(_) => None,
+            Self::Io(e) => Some(e),
+            Self::Catalog(e) => Some(e),
         }
     }
 }
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
-        Error::Io(e)
+        Self::Io(e)
     }
 }
 
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
-        Error::Catalog(e)
+        Self::Catalog(e)
     }
 }

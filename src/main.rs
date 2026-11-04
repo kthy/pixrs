@@ -61,7 +61,7 @@ fn main() {
     // Short circuit to license display. Long texts are often piped to a pager; quitting it
     // early is not an error.
     if cli.license {
-        let _ = writeln!(io::stdout(), "{}", LICENSE);
+        let _ = writeln!(io::stdout(), "{LICENSE}");
         exit(exitcode::OK);
     }
     if cli.third_party_notices {
@@ -70,11 +70,11 @@ fn main() {
     }
 
     match cli.command {
-        Some(Command::Apply(opt)) => apply(opt),
+        Some(Command::Apply(opt)) => apply(&opt),
         Some(Command::Dupes(opt)) => dupes(opt),
         Some(Command::Organize(opt)) => organize(opt),
         Some(Command::Relocate(opt)) => relocate(opt),
-        Some(Command::Undo(opt)) => undo(opt),
+        Some(Command::Undo(opt)) => undo(&opt),
         Some(Command::Scan(opt)) => scan(opt, now),
         Some(Command::Serve(opt)) => serve(opt),
         None => {
@@ -93,8 +93,12 @@ fn catalog_path(given: Option<PathBuf>) -> PathBuf {
 }
 
 /// Print an error and exit with its exit code. The message can quote names from a library.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "takes the error it ends the program with"
+)]
 fn fail(context: &str, e: pixrs::error::Error) -> ! {
-    debug!("{:?}", e);
+    debug!("{e:?}");
     eprintln!("{}: {}", context, printable_lines(&e.to_string()));
     exit(e.exit_code())
 }
@@ -116,27 +120,26 @@ fn library_ids(catalog: &Catalog, libraries: &[PathBuf], context: &str) -> Vec<i
             Ok(id) => id.flatten(),
             Err(e) => fail(context, e.into()),
         };
-        match id {
-            Some(id) => ids.push(id),
-            None => {
-                let containing = path
-                    .as_deref()
-                    .and_then(|path| catalog.containing_library(path).ok().flatten());
-                if let Some((_, root)) = containing {
-                    eprintln!(
-                        "{} is part of the library {}. Pass the library instead.",
-                        library.display(),
-                        display_root(&root)
-                    );
-                    exit(exitcode::USAGE)
-                }
+        if let Some(id) = id {
+            ids.push(id);
+        } else {
+            let containing = path
+                .as_deref()
+                .and_then(|path| catalog.containing_library(path).ok().flatten());
+            if let Some((_, root)) = containing {
                 eprintln!(
-                    "{} has not been scanned. Run `pixrs scan {}` first.",
+                    "{} is part of the library {}. Pass the library instead.",
                     library.display(),
-                    library.display()
+                    display_root(&root)
                 );
                 exit(exitcode::USAGE)
             }
+            eprintln!(
+                "{} has not been scanned. Run `pixrs scan {}` first.",
+                library.display(),
+                library.display()
+            );
+            exit(exitcode::USAGE)
         }
     }
     ids
@@ -167,7 +170,7 @@ fn dupes(opt: DupesOpt) {
         Format::Json => write_json(&report, &mut out),
         Format::Csv => write_csv(&report, &mut out),
     }
-    .and_then(|_| out.flush());
+    .and_then(|()| out.flush());
     if let Err(e) = written {
         fail("Dupes failed", e.into());
     }
@@ -175,9 +178,8 @@ fn dupes(opt: DupesOpt) {
     let unhashed = report.summary.unhashed_candidates;
     if unhashed > 0 {
         eprintln!(
-            "Note: {} files share their size with another file but are not hashed yet, so \
-             there may be more duplicates. Scan their libraries again to hash them.",
-            unhashed
+            "Note: {unhashed} files share their size with another file but are not hashed yet, so \
+             there may be more duplicates. Scan their libraries again to hash them."
         );
     }
 }
@@ -253,7 +255,7 @@ fn organize(opt: OrganizeOpt) {
 }
 
 /// Carry out a plan file.
-fn apply(opt: ApplyOpt) {
+fn apply(opt: &ApplyOpt) {
     let context = "Apply failed";
     let plan = read_plan(&opt.plan).unwrap_or_else(|e| fail(context, e));
     let summary = pixrs::apply::apply(&opt.plan, &plan).unwrap_or_else(|e| {
@@ -285,7 +287,7 @@ fn apply(opt: ApplyOpt) {
 }
 
 /// Reverse an applied plan from its journal.
-fn undo(opt: UndoOpt) {
+fn undo(opt: &UndoOpt) {
     let summary = pixrs::apply::undo(&opt.journal).unwrap_or_else(|e| fail("Undo failed", e));
     for warning in &summary.warnings {
         println!("Warning: {}", printable(warning));
@@ -309,10 +311,7 @@ fn relocate(opt: RelocateOpt) {
         opt.new.display()
     );
     for root in &s.folded {
-        println!(
-            "Folded the library {} into this one, with its hashes.",
-            root
-        );
+        println!("Folded the library {root} into this one, with its hashes.");
     }
     println!(
         "The catalog lists the {} {} in the library {} now. Scan it to pick up any changes.",
@@ -332,10 +331,7 @@ fn scan(opt: ScanOpt, now: Instant) {
     match pixrs::scan::scan(&opt.library, &catalog, options) {
         Ok(s) => {
             for root in &s.folded {
-                println!(
-                    "Folded the library {} into this one, with its hashes.",
-                    root
-                );
+                println!("Folded the library {root} into this one, with its hashes.");
             }
             if let Some(root) = &s.part_of {
                 println!(
@@ -407,12 +403,12 @@ fn serve(opt: ServeOpt) {
         },
     };
     let ready = |url: &str| {
-        println!("Serving the catalog at {}", url);
+        println!("Serving the catalog at {url}");
         println!("Press Ctrl-C to stop.");
         if opt.open {
             open::that(url).unwrap_or_else(|e| {
-                error!("{:?}", e);
-                eprintln!("Unable to open a browser: {}", e);
+                error!("{e:?}");
+                eprintln!("Unable to open a browser: {e}");
             });
         }
     };

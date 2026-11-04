@@ -98,7 +98,7 @@ pub struct ScanOptions {
 
 impl ScanOptions {
     /// No progress bars, and an empty walk is refused.
-    pub const QUIET: Self = ScanOptions {
+    pub const QUIET: Self = Self {
         quiet: true,
         allow_empty: false,
     };
@@ -146,6 +146,7 @@ pub fn scan(
 }
 
 /// `scan`, with the external tools given instead of looked up on `PATH`.
+#[allow(clippy::too_many_lines, reason = "to be split by phase")]
 pub fn scan_with(
     library: &Path,
     catalog_path: &Path,
@@ -222,7 +223,10 @@ pub fn scan_with(
             }
         };
         if entry.file_type().is_dir() {
-            let dir = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+            let dir = entry
+                .path()
+                .strip_prefix(&root)
+                .unwrap_or_else(|_| entry.path());
             walk.set_message(shown(dir).to_string());
             continue;
         }
@@ -340,7 +344,7 @@ pub fn scan_with(
                     eprintln!(
                         "Cataloging {} without metadata: the metadata parser crashed on it",
                         shown(&file.path)
-                    )
+                    );
                 });
                 MediaMeta::default()
             }
@@ -360,7 +364,7 @@ pub fn scan_with(
         }
         pb.inc(1);
     }
-    finish_step(&pb, format!("Read {} files", HumanCount(pb.position())));
+    finish_step(&pb, &format!("Read {} files", HumanCount(pb.position())));
 
     for rel in known.keys() {
         if !seen.contains(rel) && !unreadable.iter().any(|dir| is_within(rel, dir)) {
@@ -411,7 +415,7 @@ pub fn scan_with(
     })?;
     finish_step(
         &pb,
-        format!(
+        &format!(
             "Hashed {} files, {}",
             HumanCount(done as u64),
             HumanBytes(pb.position())
@@ -438,9 +442,8 @@ pub fn scan_with(
                     // than wrong ones.
                     if !warned_heic {
                         eprintln!(
-                            "ffmpeg {} is older than 7.1 and may decode HEIC photos only in \
-                             part, so HEIC and AVIF images are not hashed.",
-                            version
+                            "ffmpeg {version} is older than 7.1 and may decode HEIC photos only in \
+                             part, so HEIC and AVIF images are not hashed."
                         );
                         warned_heic = true;
                     }
@@ -456,12 +459,11 @@ pub fn scan_with(
         };
         match current {
             Some(current) if stored.as_ref() != Some(&current) => {
-                to_decode.push((rel, media_type, current))
+                to_decode.push((rel, media_type, current));
             }
-            Some(_) => {}
             // Hashes made earlier, e.g. with an `ffmpeg` that is gone now, are kept.
             None if stored.is_none() => summary.media_without_decoder += 1,
-            None => {}
+            Some(_) | None => {}
         }
     }
     let pb = progress_bar(to_decode.len() as u64, "[4/4] Decoding", false, quiet);
@@ -501,7 +503,7 @@ pub fn scan_with(
                         "Cannot decode {}: {}",
                         shown(&path),
                         printable(&e.to_string())
-                    )
+                    );
                 });
                 if !root.is_dir() {
                     tx.take().expect("a transaction is open").commit()?;
@@ -519,7 +521,7 @@ pub fn scan_with(
         }
         Ok(())
     })?;
-    finish_step(&pb, format!("Decoded {} files", HumanCount(pb.position())));
+    finish_step(&pb, &format!("Decoded {} files", HumanCount(pb.position())));
     if part.is_empty() {
         catalog.mark_scanned(library_id)?;
     }
@@ -612,7 +614,7 @@ fn in_parallel<T: Sync, R: Send>(
     mut record: impl FnMut(usize, R) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let workers = available_parallelism()
-        .map_or(1, |n| n.get())
+        .map_or(1, std::num::NonZero::get)
         .min(max_workers)
         .min(items.len().max(1));
     let next = AtomicUsize::new(0);
@@ -753,6 +755,10 @@ fn relative_path(root: &Path, path: &Path) -> Option<String> {
 }
 
 /// Size and modification time of a file.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "nanoseconds since 1970 fit in i64 until 2262"
+)]
 pub(crate) fn stamp(meta: &FsMetadata) -> io::Result<Stamp> {
     let mtime_ns = match meta.modified()?.duration_since(UNIX_EPOCH) {
         Ok(after) => after.as_nanos() as i64,
@@ -798,7 +804,7 @@ pub(crate) fn progress_bar(
 
 /// Clear a finished step's progress bar and print what the step did and how long it took, as
 /// the walk does, unless the bars are hidden.
-fn finish_step(pb: &ProgressBar, done: String) {
+fn finish_step(pb: &ProgressBar, done: &str) {
     pb.finish_and_clear();
     // Not `pb.println`, which pads the line to the terminal width instead of ending it.
     if !pb.is_hidden() {
@@ -930,6 +936,11 @@ fn dimension(value: &EntryValue) -> Option<u32> {
         .or_else(|| value.as_u64().and_then(|n| u32::try_from(n).ok()))
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "test fixtures with small values"
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,7 +959,7 @@ mod tests {
         fn new() -> Self {
             let dir = tempdir().unwrap();
             create_dir_all(dir.path().join("lib")).unwrap();
-            Fixture { dir }
+            Self { dir }
         }
 
         fn lib(&self) -> PathBuf {
@@ -1046,7 +1057,7 @@ mod tests {
     /// A minimal MP4: a file type box and a movie box with only a movie header, created at
     /// `created` (seconds since 1904, or since 1970 as some encoders write it).
     fn mp4_created_at(created: u32) -> Vec<u8> {
-        fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        fn mp4_box(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
             let mut b = ((8 + body.len()) as u32).to_be_bytes().to_vec();
             b.extend(kind);
             b.extend(body);
@@ -1059,10 +1070,10 @@ mod tests {
         mvhd.extend(1000u32.to_be_bytes()); // Duration.
         mvhd.extend([0; 76]); // Rate, volume, matrix and so on.
         mvhd.extend(2u32.to_be_bytes()); // Next track ID.
-        let mut mp4 = mp4_box(b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
-        mp4.extend(mp4_box(b"moov", &mp4_box(b"mvhd", &mvhd)));
+        let mut mp4 = mp4_box(*b"ftyp", b"isom\0\0\x02\0isomiso2mp41");
+        mp4.extend(mp4_box(*b"moov", &mp4_box(*b"mvhd", &mvhd)));
         // nom-exif sniffs the type from the first 128 bytes.
-        mp4.extend(mp4_box(b"free", &[0; 128]));
+        mp4.extend(mp4_box(*b"free", &[0; 128]));
         mp4
     }
 
@@ -1283,7 +1294,7 @@ mod tests {
         for i in 0..n {
             fx.write(
                 &format!("d{}/{:05}.jpg", i % 7, i),
-                format!("{:05}", i).as_bytes(),
+                format!("{i:05}").as_bytes(),
             );
         }
         let summary = fx.scan();
@@ -1540,7 +1551,7 @@ mod tests {
         );
         let files = fx.files();
         let mut expected = vec![nfd.as_str(), other_nfd.as_str(), "plain.jpg"];
-        expected.sort();
+        expected.sort_unstable();
         assert_eq!(paths(&files), expected);
         let row = |path: &str| files.iter().find(|f| f.path == path).unwrap();
         // The unchanged file keeps its hash; the changed one is read again.
@@ -1571,7 +1582,7 @@ mod tests {
             (0, 0, 1)
         );
         let mut expected = vec![nfd.as_str(), "elsewhere.jpg"];
-        expected.sort();
+        expected.sort_unstable();
         assert_eq!(paths(&fx.files()), expected);
     }
 
@@ -1598,7 +1609,7 @@ mod tests {
             (1, 1, 0)
         );
         let mut expected = vec![nfc.as_str(), nfd.as_str()];
-        expected.sort();
+        expected.sort_unstable();
         assert_eq!(paths(&fx.files()), expected);
     }
 
@@ -1631,8 +1642,7 @@ mod tests {
         let result = scan(&fx.lib(), &fx.catalog(), ScanOptions::QUIET);
         assert!(
             matches!(&result, Err(Error::Usage(m)) if m.contains("--allow-empty")),
-            "{:?}",
-            result
+            "{result:?}"
         );
         assert_eq!(paths(&fx.files()), vec!["a.jpg"]);
     }
@@ -1731,8 +1741,7 @@ mod tests {
         std::fs::set_permissions(&lib, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             matches!(&result, Err(Error::Usage(m)) if m.starts_with("Cannot list")),
-            "{:?}",
-            result
+            "{result:?}"
         );
         assert_eq!(paths(&fx.files()), vec!["a.jpg"]);
     }

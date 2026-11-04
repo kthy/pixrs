@@ -15,7 +15,7 @@ static BAR: Mutex<Option<WeakProgressBar>> = Mutex::new(None);
 /// What is logged without `RUST_LOG`: pixrs's own errors, or with `debug` (`--debug`) its debug
 /// output too. Dependencies log errors pixrs already reports (nom-exif on truncated files), so
 /// they are left out. `--debug` only counts in debug builds.
-pub fn default_filter(debug: bool) -> &'static str {
+pub const fn default_filter(debug: bool) -> &'static str {
     if debug && cfg!(debug_assertions) {
         "pixrs=debug"
     } else {

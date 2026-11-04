@@ -73,8 +73,8 @@ impl Context {
         with_query(
             &file_url("view", library_id, path),
             &[
-                ("from", self.from_date.then(|| String::from("date"))),
-                ("type", type_param(self.media_type)),
+                ("from", self.from_date.then_some("date")),
+                ("type", self.media_type.map(MediaType::as_str)),
             ],
         )
     }
@@ -101,14 +101,14 @@ fn thumb_url(library_id: i64, path: &str, mtime_ns: i64) -> String {
 /// URL of a folder; `""` is the library root.
 fn folder_url(library_id: i64, dir: &str) -> String {
     if dir.is_empty() {
-        format!("/folders/{}", library_id)
+        format!("/folders/{library_id}")
     } else {
         format!("/folders/{}/{}", library_id, encode_path(dir))
     }
 }
 
 /// `base` with the query parameters that have a value.
-fn with_query(base: &str, params: &[(&str, Option<String>)]) -> String {
+fn with_query(base: &str, params: &[(&str, Option<&str>)]) -> String {
     let query: Vec<String> = params
         .iter()
         .filter_map(|(key, value)| {
@@ -124,10 +124,6 @@ fn with_query(base: &str, params: &[(&str, Option<String>)]) -> String {
     }
 }
 
-fn type_param(media_type: Option<MediaType>) -> Option<String> {
-    media_type.map(|t| String::from(t.as_str()))
-}
-
 /// The last part of a path.
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -139,7 +135,7 @@ fn layout(
     title: &str,
     here: Option<&str>,
     media_type: Option<MediaType>,
-    content: Markup,
+    content: &Markup,
 ) -> Markup {
     let types = [
         ("all", None),
@@ -171,7 +167,7 @@ fn layout(
                     @if let Some(here) = here {
                         nav.types {
                             @for (label, kind) in types {
-                                a href=(with_query(here, &[("type", type_param(kind))]))
+                                a href=(with_query(here, &[("type", kind.map(MediaType::as_str))]))
                                     class=[(kind == media_type).then_some("active")] { (label) }
                             }
                         }
@@ -221,7 +217,11 @@ fn respond(query: &ListQuery, items: Markup, page: impl FnOnce(Markup) -> Markup
 
 /// The offset and one extra row, to find out whether there is a next page. `page` is at most
 /// `MAX_PAGE`.
-fn page_slice(page: usize, size: usize) -> Page {
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "page numbers and sizes are small"
+)]
+const fn page_slice(page: usize, size: usize) -> Page {
     Page {
         limit: size as i64 + 1,
         offset: ((page - 1) * size) as i64,
@@ -233,7 +233,9 @@ pub async fn libraries(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Response, AppError> {
-    let libraries = state.query(|catalog| catalog.libraries()).await?;
+    let libraries = state
+        .query(super::super::catalog::Catalog::libraries)
+        .await?;
     let media_type = query.media_type();
     let content = html! {
         h1 { "Libraries" }
@@ -244,7 +246,7 @@ pub async fn libraries(
         ul.folders {
             @for library in shown {
                 li {
-                    a href=(with_query(&folder_url(library.id, ""), &[("type", type_param(media_type))])) {
+                    a href=(with_query(&folder_url(library.id, ""), &[("type", media_type.map(MediaType::as_str))])) {
                         (display_root(&library.root))
                     }
                     span.count { (library.files) " files" }
@@ -255,7 +257,7 @@ pub async fn libraries(
             }
         }
     };
-    Ok(Html(layout("Libraries", Some("/"), media_type, content).into_string()).into_response())
+    Ok(Html(layout("Libraries", Some("/"), media_type, &content).into_string()).into_response())
 }
 
 /// `/folders/{lib}`: the root folder of a library.
@@ -319,8 +321,8 @@ async fn folder_page(
         with_query(
             &here,
             &[
-                ("type", type_param(media_type)),
-                ("page", Some((page + 1).to_string())),
+                ("type", media_type.map(MediaType::as_str)),
+                ("page", Some(&(page + 1).to_string())),
             ],
         )
     });
@@ -354,20 +356,20 @@ async fn folder_page(
             nav.crumbs {
                 a href="/" { "Libraries" }
                 " / "
-                a href=(with_query(&folder_url(library_id, ""), &[("type", type_param(media_type))])) {
+                a href=(with_query(&folder_url(library_id, ""), &[("type", media_type.map(MediaType::as_str))])) {
                     (display_root(&root))
                 }
                 @for (url, part) in &crumbs {
                     " / "
-                    a href=(with_query(url, &[("type", type_param(media_type))])) { (part) }
+                    a href=(with_query(url, &[("type", media_type.map(MediaType::as_str))])) { (part) }
                 }
             }
             @if !subfolders.is_empty() {
                 ul.folders {
                     @for (name, count) in &subfolders {
-                        @let sub = if dir.is_empty() { name.clone() } else { format!("{}/{}", dir, name) };
+                        @let sub = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
                         li {
-                            a href=(with_query(&folder_url(library_id, &sub), &[("type", type_param(media_type))])) {
+                            a href=(with_query(&folder_url(library_id, &sub), &[("type", media_type.map(MediaType::as_str))])) {
                                 (name)
                             }
                             span.count { (count) }
@@ -380,7 +382,7 @@ async fn folder_page(
             }
             div.grid { (items) }
         };
-        layout(&title, Some(&here), media_type, content)
+        layout(&title, Some(&here), media_type, &content)
     }))
 }
 
@@ -395,19 +397,18 @@ pub async fn dates_latest(
         media_type,
     };
     let months = state.query(move |catalog| catalog.months(&filter)).await?;
-    match months.first() {
-        Some((month, _)) => Ok(Redirect::to(&with_query(
-            &format!("/dates/{}", month),
-            &[("type", type_param(media_type))],
+    if let Some((month, _)) = months.first() {
+        Ok(Redirect::to(&with_query(
+            &format!("/dates/{month}"),
+            &[("type", media_type.map(MediaType::as_str))],
         ))
-        .into_response()),
-        None => {
-            let content = html! { h1 { "Dates" } p { "No files." } };
-            Ok(
-                Html(layout("Dates", Some("/dates"), media_type, content).into_string())
-                    .into_response(),
-            )
-        }
+        .into_response())
+    } else {
+        let content = html! { h1 { "Dates" } p { "No files." } };
+        Ok(
+            Html(layout("Dates", Some("/dates"), media_type, &content).into_string())
+                .into_response(),
+        )
     }
 }
 
@@ -433,7 +434,7 @@ fn month_label(month: &str) -> Option<String> {
     }
     let index: usize = number.parse().ok()?;
     let name = NAMES.get(index.checked_sub(1)?)?;
-    Some(format!("{} {}", name, year))
+    Some(format!("{name} {year}"))
 }
 
 /// `/dates/{month}`: the files dated in a month, newest first, with all months alongside.
@@ -454,10 +455,10 @@ pub async fn dates(
     let (months, mut files) = state
         .query(move |catalog| {
             // The sidebar and the month's count, for whole pages.
-            let months = if !partial {
-                catalog.months(&filter)?
-            } else {
+            let months = if partial {
                 vec![]
+            } else {
+                catalog.months(&filter)?
             };
             let files =
                 catalog.month_files(&filter, &queried_month, page_slice(page, PAGE_SIZE))?;
@@ -465,15 +466,15 @@ pub async fn dates(
         })
         .await?;
 
-    let here = format!("/dates/{}", month);
+    let here = format!("/dates/{month}");
     let has_more = files.len() > PAGE_SIZE;
     files.truncate(PAGE_SIZE);
     let next = has_more.then(|| {
         with_query(
             &here,
             &[
-                ("type", type_param(media_type)),
-                ("page", Some((page + 1).to_string())),
+                ("type", media_type.map(MediaType::as_str)),
+                ("page", Some(&(page + 1).to_string())),
             ],
         )
     });
@@ -512,7 +513,7 @@ pub async fn dates(
                         ul {
                             @for (m, n) in list {
                                 li class=[(*m == month).then_some("active")] {
-                                    a href=(with_query(&format!("/dates/{}", urlencoding::encode(m)), &[("type", type_param(media_type))])) {
+                                    a href=(with_query(&format!("/dates/{}", urlencoding::encode(m)), &[("type", media_type.map(MediaType::as_str))])) {
                                         (month_label(m).unwrap_or_else(|| String::from(*m)))
                                     }
                                     " " span.count { (n) }
@@ -528,7 +529,7 @@ pub async fn dates(
                 }
             }
         };
-        layout(&label, Some(&here), media_type, content)
+        layout(&label, Some(&here), media_type, &content)
     }))
 }
 
@@ -587,7 +588,7 @@ pub async fn dupes(
     let groups = report.groups.get(start..).unwrap_or_default();
     let has_more = groups.len() > DUPE_PAGE_SIZE;
     let groups = &groups[..groups.len().min(DUPE_PAGE_SIZE)];
-    let next = has_more.then(|| with_query("/dupes", &[("page", Some((page + 1).to_string()))]));
+    let next = has_more.then(|| with_query("/dupes", &[("page", Some(&(page + 1).to_string()))]));
     let items = html! {
         @for group in groups { (dupe_group(group)) }
         (more(next))
@@ -626,11 +627,12 @@ pub async fn dupes(
             }
             div.groups { (items) }
         };
-        layout("Duplicates", None, None, content)
+        layout("Duplicates", None, None, &content)
     }))
 }
 
 /// `/view/{lib}/{*path}`: one file, full size, with its details and prev/next links.
+#[allow(clippy::too_many_lines, reason = "to be split into page parts")]
 pub async fn view(
     State(state): State<Arc<AppState>>,
     UrlPath((library_id, path)): UrlPath<(i64, String)>,
@@ -759,7 +761,7 @@ pub async fn view(
         }
         p { a href=(media_url) { "Open original" } }
     };
-    Ok(Html(layout(file_name(&file.path), None, None, content).into_string()).into_response())
+    Ok(Html(layout(file_name(&file.path), None, None, &content).into_string()).into_response())
 }
 
 #[cfg(test)]
@@ -776,10 +778,7 @@ mod tests {
         );
         assert_eq!(folder_url(1, ""), "/folders/1");
         assert_eq!(
-            with_query(
-                "/x",
-                &[("type", Some(String::from("image"))), ("page", None)]
-            ),
+            with_query("/x", &[("type", Some("image")), ("page", None)]),
             "/x?type=image"
         );
     }

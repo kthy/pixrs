@@ -241,7 +241,7 @@ mod tests {
             vec!["pixrs", "undo", "journal.jsonl", "--debug"],
         ] {
             let cli = Cli::try_parse_from(&args).unwrap();
-            assert!(cli.debug, "{:?}", args);
+            assert!(cli.debug, "{args:?}");
         }
         assert!(!Cli::try_parse_from(["pixrs", "scan", "lib"]).unwrap().debug);
     }

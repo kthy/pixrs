@@ -57,8 +57,8 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     /// `é` composed (NFC) and decomposed (NFD).
-    pub(crate) const NFC: &str = "Caf\u{e9}";
-    pub(crate) const NFD: &str = "Cafe\u{301}";
+    pub const NFC: &str = "Caf\u{e9}";
+    pub const NFD: &str = "Cafe\u{301}";
 
     #[test]
     fn test_nfc() {
@@ -78,9 +78,9 @@ pub(crate) mod tests {
     fn test_respelled_path() {
         let dir = tempdir().unwrap();
         create_dir_all(dir.path().join(NFD)).unwrap();
-        write(dir.path().join(NFD).join(format!("{}.jpg", NFD)), b"x").unwrap();
+        write(dir.path().join(NFD).join(format!("{NFD}.jpg")), b"x").unwrap();
 
-        let rel = format!("{}/{}.jpg", NFC, NFC);
+        let rel = format!("{NFC}/{NFC}.jpg");
         // On a file system that ignores normalization (macOS), the name as given is there too.
         let found = respelled_path(dir.path(), &rel).unwrap();
         assert_eq!(fs::read(found).unwrap(), b"x");

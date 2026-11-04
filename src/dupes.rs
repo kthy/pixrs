@@ -44,11 +44,11 @@ pub enum Tier {
 
 impl Tier {
     /// The name used in reports.
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Tier::Exact => "exact",
-            Tier::SamePixels => "same-pixels",
-            Tier::Similar => "similar",
+            Self::Exact => "exact",
+            Self::SamePixels => "same-pixels",
+            Self::Similar => "similar",
         }
     }
 }
@@ -228,9 +228,13 @@ fn pairs_by_row(
     rows: usize,
     row: impl Fn(usize, &mut Vec<(usize, usize)>) + Sync,
 ) -> Vec<(usize, usize)> {
-    let workers = available_parallelism().map_or(1, |n| n.get());
+    let workers = available_parallelism().map_or(1, std::num::NonZero::get);
     let row = &row;
     thread::scope(|scope| {
+        #[allow(
+            clippy::needless_collect,
+            reason = "every thread must start before any is joined"
+        )]
         let handles: Vec<_> = (0..workers)
             .map(|w| {
                 scope.spawn(move || {
@@ -419,7 +423,7 @@ pub struct Similarity {
 
 impl Default for Similarity {
     fn default() -> Self {
-        Similarity {
+        Self {
             threshold: DEFAULT_THRESHOLD,
             images: false,
         }
@@ -428,8 +432,8 @@ impl Default for Similarity {
 
 impl Similarity {
     /// With similar images too.
-    pub fn with_images(threshold: u32) -> Self {
-        Similarity {
+    pub const fn with_images(threshold: u32) -> Self {
+        Self {
             threshold,
             images: true,
         }
@@ -437,6 +441,7 @@ impl Similarity {
 }
 
 /// The grouping half of `find_dupes`, for input from `load_dupes`.
+#[allow(clippy::too_many_lines, reason = "to be split by phase")]
 pub fn group_dupes(input: DupeInput, libraries: &[i64], similarity: Similarity) -> DupeReport {
     let mut nodes: Vec<Node> = vec![];
     let mut index: HashMap<(i64, String), usize> = HashMap::new();
@@ -679,8 +684,8 @@ pub fn write_text(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
                 HumanBytes(group.files[0].size),
                 sha256.get(..12).unwrap_or(sha256)
             )?,
-            (Tier::SamePixels, _) => writeln!(out, "{} images with the same pixels:", n)?,
-            _ => writeln!(out, "{} similar files:", n)?,
+            (Tier::SamePixels, _) => writeln!(out, "{n} images with the same pixels:")?,
+            _ => writeln!(out, "{n} similar files:")?,
         }
         for file in &group.files {
             write!(
@@ -693,7 +698,7 @@ pub fn write_text(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
             match (group.tier, file.matches) {
                 (Tier::Exact, _) => writeln!(out)?,
                 (_, Some(matches)) => {
-                    writeln!(out, "  {}  {}", HumanBytes(file.size), matches.as_str())?
+                    writeln!(out, "  {}  {}", HumanBytes(file.size), matches.as_str())?;
                 }
                 (_, None) => writeln!(out, "  {}", HumanBytes(file.size))?,
             }
@@ -717,7 +722,7 @@ pub fn write_text(report: &DupeReport, out: &mut impl Write) -> io::Result<()> {
 }
 
 /// `one` if `n` is 1, else `many`.
-pub fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+pub const fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 {
         one
     } else {
@@ -790,7 +795,7 @@ mod tests {
         fn new() -> Self {
             let dir = tempdir().unwrap();
             let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
-            Fixture { _dir: dir, catalog }
+            Self { _dir: dir, catalog }
         }
 
         fn add(&self, root: &str, path: &str, size: u64, mtime_s: i64, sha256: Option<&str>) {
@@ -1009,7 +1014,7 @@ mod tests {
         let mut out = vec![];
         write_text(&fx.report(), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains(['\u{1b}', '\u{7}']), "{:?}", text);
+        assert!(!text.contains(['\u{1b}', '\u{7}']), "{text:?}");
         assert!(
             text.contains("b\\u{1b}]0;owned\\u{7}\\n  keep  c.jpg"),
             "{}",
@@ -1143,7 +1148,7 @@ mod tests {
             .iter()
             .map(|g| {
                 let mut paths: Vec<&str> = g.files.iter().map(|f| f.path.as_str()).collect();
-                paths.sort();
+                paths.sort_unstable();
                 (g.tier, paths)
             })
             .collect();
@@ -1315,7 +1320,7 @@ mod tests {
             .iter()
             .map(|f| f.path.as_str())
             .collect();
-        paths.sort();
+        paths.sort_unstable();
         assert_eq!(paths, ["wide copy.jpg", "wide.jpg"]);
     }
 
@@ -1487,7 +1492,7 @@ mod tests {
             .iter()
             .map(|f| f.path.as_str())
             .collect();
-        paths.sort();
+        paths.sort_unstable();
         assert_eq!(paths, vec!["a.jpg", "backup/a.jpg"]);
     }
 }

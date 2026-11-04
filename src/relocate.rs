@@ -190,7 +190,7 @@ mod tests {
                 create_dir_all(path.parent().unwrap()).unwrap();
                 write(path, contents).unwrap();
             }
-            let fx = Fixture { dir };
+            let fx = Self { dir };
             crate::scan::scan(
                 &fx.path("old"),
                 &fx.catalog(),
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(
             fx.rows(),
             vec![(
-                new_root.clone(),
+                new_root,
                 vec![
                     (String::from("a.jpg"), true),
                     (String::from("sub/b.jpg"), true)
@@ -274,15 +274,15 @@ mod tests {
     #[test]
     fn test_relocate_finds_names_in_another_normalization() {
         use crate::names::tests::{NFC, NFD};
-        let nfd = format!("{}/{}.jpg", NFD, NFD);
+        let nfd = format!("{NFD}/{NFD}.jpg");
         let fx = Fixture::new(&[(&nfd, b"decomposed")]);
         // Copied to a system that composes the accents.
         rename(fx.path("old"), fx.path("new")).unwrap();
         rename(fx.path("new").join(NFD), fx.path("new").join(NFC)).unwrap();
         let dir = fx.path("new").join(NFC);
         rename(
-            dir.join(format!("{}.jpg", NFD)),
-            dir.join(format!("{}.jpg", NFC)),
+            dir.join(format!("{NFD}.jpg")),
+            dir.join(format!("{NFC}.jpg")),
         )
         .unwrap();
 
