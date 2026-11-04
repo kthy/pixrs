@@ -594,7 +594,7 @@ impl Catalog {
     }
 
     /// Every video with a signature and every audio file with a fingerprint, in any library.
-    /// A video whose stored frames cannot be read is left out.
+    /// A file whose stored signature cannot be read is left out.
     pub fn hashed_av(&self) -> rusqlite::Result<Vec<HashedAv>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256, f.duration_ms,
@@ -614,11 +614,12 @@ impl Catalog {
                     })
                 })
             } else {
-                row.get::<_, Option<Vec<u8>>>(10)?.map(|values| {
-                    AvSignature::Audio(AudioFingerprint {
+                row.get::<_, Option<Vec<u8>>>(10)?.and_then(|values| {
+                    let values = values_from_bytes(&values)?;
+                    Some(AvSignature::Audio(AudioFingerprint {
                         duration_ms,
-                        values: values_from_bytes(&values),
-                    })
+                        values,
+                    }))
                 })
             };
             let Some(signature) = signature else {

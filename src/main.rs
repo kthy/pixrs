@@ -24,7 +24,7 @@ use indicatif::{HumanCount, HumanDuration};
 use log::{debug, error};
 use pixrs::catalog::{cataloged_spelling, Catalog};
 use pixrs::dupes::{
-    find_dupes, plural, write_csv, write_json, write_text, DupeReport, Similarity, Tier,
+    find_dupes, plural, write_csv, write_json, write_text, DupeReport, Role, Similarity, Tier,
 };
 use pixrs::error::Error;
 use pixrs::plan::{
@@ -197,7 +197,7 @@ fn quarantine(
         .groups
         .iter()
         .flat_map(|g| &g.files)
-        .filter(|f| f.matches == Some(Tier::Similar))
+        .filter(|f| f.role == Role::Copy(Tier::Similar))
         .count();
     if similar > 0 {
         println!(
