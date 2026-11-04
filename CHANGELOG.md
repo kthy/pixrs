@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors were before), 65 for a plan, journal or catalog file pixrs cannot use, 74 for a file
   or folder that cannot be read or written (a library that disappears during a scan, a folder
   that cannot be listed), 75 while another `apply`, `undo` or `relocate` holds the lock, and 70
-  for a catalog database error.
+  for a catalog database error. A library folder `pixrs scan` cannot resolve for another reason
+  than that it does not exist, such as permissions, is reported with that reason (74) instead
+  of as "not a directory".
 - Ctrl-C exits with 130, as shells report an interrupted program, instead of 0.
 - New plan and journal format (version 3). Plans made and journals written by earlier versions
   are refused with a message: plan again, and undo an earlier `apply` with the version that

@@ -456,14 +456,19 @@ impl Catalog {
     pub fn unhashed_with_shared_size(
         &self,
         library_id: i64,
-    ) -> rusqlite::Result<Vec<(String, u64)>> {
+    ) -> rusqlite::Result<Vec<UnhashedFile>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, size FROM files
              WHERE library_id = ?1 AND sha256 IS NULL
                AND size IN (SELECT size FROM files GROUP BY size HAVING count(*) > 1)
              ORDER BY path",
         )?;
-        let rows = stmt.query_map([library_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map([library_id], |row| {
+            Ok(UnhashedFile {
+                path: row.get(0)?,
+                size: row.get(1)?,
+            })
+        })?;
         rows.collect()
     }
 
@@ -1121,6 +1126,13 @@ pub struct Relocated {
     pub folded: Vec<String>,
 }
 
+/// A cataloged file with no content hash yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnhashedFile {
+    pub path: String,
+    pub size: u64,
+}
+
 /// A media file with the versions the hash pass decoded it with, if it has.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HashVersion {
@@ -1771,7 +1783,10 @@ mod tests {
         catalog.upsert(id, &record("c.jpg", 2)).unwrap();
         assert_eq!(
             catalog.unhashed_with_shared_size(id).unwrap(),
-            vec![(String::from("c.jpg"), 2)]
+            vec![UnhashedFile {
+                path: String::from("c.jpg"),
+                size: 2
+            }]
         );
 
         catalog.remove(id, "a.jpg").unwrap();

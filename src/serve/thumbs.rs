@@ -69,7 +69,7 @@ enum Decoder {
 
 /// The lowercase extension of a cataloged file.
 fn extension(file: &FileRecord) -> String {
-    decode::extension(&file.path)
+    crate::media::extension(Path::new(&file.path)).unwrap_or_default()
 }
 
 /// What the viewer shows for an image.
@@ -97,7 +97,7 @@ pub fn view_source(file: &FileRecord) -> ViewSource {
 fn decoder(file: &FileRecord) -> Option<Decoder> {
     match file.media_type {
         MediaType::Image => match image_decoder(&file.path)? {
-            decode::Decoder::InProcess => Some(Decoder::InProcess),
+            decode::Decoder::InProcess(_) => Some(Decoder::InProcess),
             decode::Decoder::Ffmpeg => Some(Decoder::FfmpegImage),
         },
         MediaType::Video => Some(Decoder::FfmpegVideo),

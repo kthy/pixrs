@@ -9,7 +9,7 @@ use crate::apply::Lock;
 use crate::catalog::{display_root, library_path, Catalog, Library};
 use crate::error::{utf8, Error};
 use crate::names::{nfc, respelled_path};
-use crate::scan::{progress_bar, resolve, stamp};
+use crate::scan::{progress_bar, resolve, stamp, Unit};
 use same_file::is_same_file;
 use std::fs;
 use std::path::{absolute, Path, PathBuf};
@@ -86,7 +86,7 @@ pub fn relocate(
     let files = catalog.files(library.id)?;
     let step = files.len().div_ceil(SAMPLE).max(1);
     let sample: Vec<_> = files.iter().step_by(step).collect();
-    let pb = progress_bar(sample.len() as u64, "Comparing", false, false);
+    let pb = progress_bar(sample.len() as u64, "Comparing", Unit::Files, false);
     let matching = AtomicUsize::new(0);
     thread::scope(|s| {
         for chunk in sample.chunks(sample.len().div_ceil(COMPARERS).max(1)) {
