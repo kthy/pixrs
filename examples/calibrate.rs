@@ -1082,6 +1082,17 @@ const REVIEW_TAIL: &str = r#"
 <script>
 const sections = [...document.querySelectorAll("section")];
 const pairs = [...document.querySelectorAll(".pair")];
+// Ticks are kept in the browser, so a reload or a closed tab does not lose them.
+const KEY = "pixrs-review:" + location.pathname;
+const pairKey = p => p.dataset.a + "/" + p.dataset.b;
+let saved = {};
+try { saved = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
+pairs.forEach(p => { if (saved[pairKey(p)]) p.querySelector("input").checked = true; });
+function save() {
+  const ticked = {};
+  pairs.forEach(p => { if (p.querySelector("input").checked) ticked[pairKey(p)] = true; });
+  try { localStorage.setItem(KEY, JSON.stringify(ticked)); } catch (e) {}
+}
 function results() {
   return pairs.map(p => ({ a: p.dataset.a, b: p.dataset.b,
                            different: p.querySelector("input").checked }));
@@ -1096,6 +1107,7 @@ function update() {
   pairs.forEach(p => p.classList.toggle("different", p.querySelector("input").checked));
   // Clipboard access can be refused for local files; the JSON is also shown to copy by hand.
   document.getElementById("json").textContent = JSON.stringify(results());
+  save();
 }
 document.addEventListener("change", update);
 document.getElementById("copy").addEventListener("click", () =>
