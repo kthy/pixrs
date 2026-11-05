@@ -11,7 +11,8 @@ use crate::avhash::{
 use crate::catalog::{
     extra_rows, library_path, AvSignature, Catalog, HashedAv, HashedFile, HashedImage,
 };
-use crate::imagehash::{distance, fingerprints_match, Visual};
+use crate::dates::Taken;
+use crate::imagehash::{distance, same_picture, Sizes, Visual};
 use crate::library::LibraryId;
 use crate::media::Dimensions;
 use crate::text::shown;
@@ -233,6 +234,7 @@ struct Node<'a> {
     pixel_hash: Option<&'a str>,
     visual: Option<&'a Visual>,
     dimensions: Option<Dimensions>,
+    taken: Option<Taken>,
 }
 
 impl<'a> Node<'a> {
@@ -242,6 +244,7 @@ impl<'a> Node<'a> {
             pixel_hash: None,
             visual: None,
             dimensions: None,
+            taken: None,
         }
     }
 
@@ -331,11 +334,27 @@ pub fn aspects_match(a: Option<Dimensions>, b: Option<Dimensions>) -> bool {
     }
 }
 
+/// Whether two images are the same size, either way round.
+fn sizes(a: Option<Dimensions>, b: Option<Dimensions>) -> Sizes {
+    match (a, b) {
+        (Some(a), Some(b)) if a == b || a == b.transposed() => Sizes::Same,
+        _ => Sizes::Different,
+    }
+}
+
+/// Whether both photos say when they were taken and the times differ: burst shots, since copies
+/// keep the time they were taken (or lose it). Times are to the second, so shots taken within
+/// the same second are left to the fingerprints.
+fn taken_apart(a: Option<Taken>, b: Option<Taken>) -> bool {
+    a.zip(b).is_some_and(|(a, b)| a != b)
+}
+
 /// What similar images are compared by.
 struct ImageKey<'a> {
     node: usize,
     phash: u64,
     dimensions: Option<Dimensions>,
+    taken: Option<Taken>,
     fingerprint: &'a [u8],
 }
 
@@ -396,19 +415,50 @@ fn this_and_rest<T>(items: &[T], i: usize) -> Option<(&T, &[T])> {
     items.get(i..)?.split_first()
 }
 
-/// Pairs of nodes of similar images: perceptual hashes at most `threshold` bits apart, matching
-/// aspect ratios, and matching fingerprints. Compares every pair, on all cores.
+impl<'a> ImageKey<'a> {
+    /// What `image` is compared by, as node 0. `None` without a perceptual hash.
+    fn of(image: &'a HashedImage) -> Option<Self> {
+        image.visual.as_ref().map(|visual| ImageKey {
+            node: 0,
+            phash: visual.phash,
+            dimensions: image.dimensions,
+            taken: image.taken,
+            fingerprint: &visual.fingerprint,
+        })
+    }
+
+    /// Whether two images are similar: perceptual hashes at most `threshold` bits apart,
+    /// matching aspect ratios, not taken at different times, and fingerprints of the same
+    /// picture (`same_picture`).
+    fn similar(&self, other: &Self, threshold: u32) -> bool {
+        // Cheapest test first: most pairs fail on the hash.
+        distance(self.phash, other.phash) <= threshold
+            && aspects_match(self.dimensions, other.dimensions)
+            && !taken_apart(self.taken, other.taken)
+            && same_picture(
+                self.fingerprint,
+                other.fingerprint,
+                sizes(self.dimensions, other.dimensions),
+            )
+    }
+}
+
+/// Whether two images are similar, by the test `dupes --similar` applies to every pair of
+/// images. False for images without perceptual hashes.
+pub fn images_similar(a: &HashedImage, b: &HashedImage, threshold: u32) -> bool {
+    ImageKey::of(a)
+        .zip(ImageKey::of(b))
+        .is_some_and(|(a, b)| a.similar(&b, threshold))
+}
+
+/// Pairs of nodes of similar images (`ImageKey::similar`). Compares every pair, on all cores.
 fn similar_images(images: &[ImageKey], threshold: u32) -> Vec<(usize, usize)> {
     pairs_by_row(images.len(), |i, pairs| {
         let Some((a, rest)) = this_and_rest(images, i) else {
             return;
         };
         for b in rest {
-            // Cheapest test first: most pairs fail on the hash.
-            if distance(a.phash, b.phash) <= threshold
-                && aspects_match(a.dimensions, b.dimensions)
-                && fingerprints_match(a.fingerprint, b.fingerprint)
-            {
+            if a.similar(b, threshold) {
                 pairs.push((a.node, b.node));
             }
         }
@@ -617,6 +667,7 @@ impl<'a> Graph<'a> {
             node.pixel_hash = Some(&image.pixel_hash);
             node.visual = image.visual.as_ref();
             node.dimensions = image.dimensions;
+            node.taken = image.taken;
         }
         // Videos and audio have dimensions for the keeper rule (largest first).
         for item in &av {
@@ -686,6 +737,7 @@ impl<'a> Graph<'a> {
                     node,
                     phash: visual.phash,
                     dimensions: n.dimensions,
+                    taken: n.taken,
                     fingerprint: &visual.fingerprint,
                 })
             })
@@ -1427,7 +1479,7 @@ mod tests {
         fx.add("/lib", "c.jpg", 50, 5, None);
         let id = fx.catalog.find_library("/lib").unwrap().unwrap();
         let set = |path: &str, pixels: &str, perceptual: u64, side: u32| {
-            let hashes = image_hashes(pixels, Some(perceptual), vec![100; 16], side, side);
+            let hashes = image_hashes(pixels, Some(perceptual), vec![100; 1024], side, side);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
@@ -1479,7 +1531,7 @@ mod tests {
         fx.add("/lib", "burst.jpg", 90, 3, None);
         let id = fx.catalog.find_library("/lib").unwrap().unwrap();
         let set = |path: &str, pixels: &str, perceptual: u64| {
-            let hashes = image_hashes(pixels, Some(perceptual), vec![100; 16], 10, 10);
+            let hashes = image_hashes(pixels, Some(perceptual), vec![100; 1024], 10, 10);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
@@ -1537,7 +1589,7 @@ mod tests {
         fx.add("/lib", "flat too.jpg", 60, 5, None);
         let id = fx.catalog.find_library("/lib").unwrap().unwrap();
         let set = |path: &str, perceptual: Option<u64>, width: u32, height: u32| {
-            let hashes = image_hashes(path, perceptual, vec![100; 16], width, height);
+            let hashes = image_hashes(path, perceptual, vec![100; 1024], width, height);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();
@@ -1559,6 +1611,28 @@ mod tests {
             .collect();
         paths.sort_unstable();
         assert_eq!(paths, ["wide copy.jpg", "wide.jpg"]);
+    }
+
+    #[test]
+    fn test_similar_images_are_not_taken_at_different_times() {
+        let fingerprint = vec![100u8; 1024];
+        let at = |time: &str| crate::dates::from_taken_at(time);
+        let key = |node: usize, taken: Option<Taken>| ImageKey {
+            node,
+            phash: 0,
+            dimensions: Dimensions::new(Some(40), Some(30)),
+            taken,
+            fingerprint: &fingerprint,
+        };
+        let pairs = |a: Option<Taken>, b: Option<Taken>| {
+            similar_images(&[key(0, a), key(1, b)], DEFAULT_THRESHOLD)
+        };
+        let shot = at("2024-05-01T12:00:00");
+        // Burst shots a second apart.
+        assert_eq!(pairs(shot, at("2024-05-01T12:00:01")), vec![]);
+        // The same second, in either stored format, or a copy that lost the time.
+        assert_eq!(pairs(shot, at("2024-05-01T12:00:00+02:00")), vec![(0, 1)]);
+        assert_eq!(pairs(shot, None), vec![(0, 1)]);
     }
 
     #[test]
@@ -1592,7 +1666,7 @@ mod tests {
         let id = fx.catalog.find_library("/lib").unwrap().unwrap();
         for path in ["a.jpg", "c.jpg"] {
             let phash = path.len() as u64 * 0xffff;
-            let hashes = image_hashes("p", Some(phash), vec![100; 16], 10, 10);
+            let hashes = image_hashes("p", Some(phash), vec![100; 1024], 10, 10);
             fx.catalog
                 .set_image_hashes(id, path, "v", Some(&hashes))
                 .unwrap();

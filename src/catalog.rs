@@ -709,17 +709,19 @@ impl Catalog {
         };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT f.library_id, l.root, f.path, f.size, f.mtime_ns, f.sha256, f.pixel_hash,
-                    f.width, f.height, {visual_columns}
+                    f.width, f.height, {visual_columns}, f.taken_at
              FROM files f JOIN libraries l ON l.id = f.library_id
              WHERE f.pixel_hash IS NOT NULL"
         ))?;
         let rows = stmt.query_map([], |row| {
             let phash: Option<i64> = row.get(9)?;
             let fingerprint: Option<Vec<u8>> = row.get(10)?;
+            let taken_at: Option<String> = row.get(11)?;
             Ok(HashedImage {
                 file: hashed_file(row)?,
                 pixel_hash: row.get(6)?,
                 dimensions: Dimensions::new(row.get(7)?, row.get(8)?),
+                taken: taken_at.as_deref().and_then(from_taken_at),
                 visual: phash.zip(fingerprint).map(|(phash, fingerprint)| Visual {
                     phash: phash.cast_unsigned(),
                     fingerprint,
@@ -1052,6 +1054,8 @@ pub struct HashedImage {
     pub pixel_hash: String,
     /// Size of the upright image, if known.
     pub dimensions: Option<Dimensions>,
+    /// When the photo was taken, if the metadata says.
+    pub taken: Option<Taken>,
     /// `None` for images with almost no detail, and when not read.
     pub visual: Option<Visual>,
 }

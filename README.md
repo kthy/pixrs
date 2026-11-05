@@ -155,8 +155,8 @@ Options:
 
       --similar
           Also find similar images (resized or recompressed copies) and videos
-          under 4 seconds. Expect burst shots among them. Longer similar videos
-          and similar audio are always found
+          under 4 seconds. A few burst shots may remain among them. Longer
+          similar videos and similar audio are always found
 
       --threshold <THRESHOLD>
           How many of the 64 perceptual hash bits two images or video frames may
@@ -184,9 +184,11 @@ Duplicates are found in any scanned library, in three tiers:
   steady tones are never similar. With `--similar`, also videos under 4 seconds (such as Live Photo
   clips), and images with the same shape (aspect ratio) whose perceptual hashes are within
   `--threshold` and whose small grayscale fingerprints match, for example resized or recompressed
-  copies. Expect burst shots among them: photos taken a moment apart can look alike even to the
-  fingerprint check, so look at similar groups before acting on them. Images with almost no detail,
-  like black frames or blank scans, are never similar.
+  copies. Photos whose metadata says they were taken at different times are never similar, and
+  images of the same size must match more closely than resized ones, which keeps out most burst
+  shots. Copies with changed colors or contrast are not similar either. A few burst shots taken
+  within the same second can remain, so look at similar groups before acting on them. Images with
+  almost no detail, like black frames or blank scans, are never similar.
 
 Files linked through other files form one group, which gets the weakest tier among them, and each
 file shows how it matches the kept one. In each group the file with the earliest modification time
@@ -218,9 +220,9 @@ Options:
       --cache <CACHE>          The thumbnail cache folder [default: thumbnails
                                in the OS cache directory]
       --similar                Also find similar images (resized or recompressed
-                               copies) and videos under 4 seconds. Expect burst
-                               shots among them. Longer similar videos and
-                               similar audio are always found
+                               copies) and videos under 4 seconds. A few burst
+                               shots may remain among them. Longer similar
+                               videos and similar audio are always found
       --threshold <THRESHOLD>  How many of the 64 perceptual hash bits two
                                images or video frames may differ in to count as
                                similar (at most 16) [default: 6]

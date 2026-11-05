@@ -72,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a batch of files into the same folders asks the file system far fewer questions: 200 moves
   on a drive mounted in WSL took 1.5 s instead of 4 s, and on a network share, where every
   question is a round trip, the difference is larger.
+- `--similar` lets in far fewer burst shots. Photos whose metadata says they were taken at
+  different times are never similar; images must also look alike in structure, not just
+  brightness; and images of the same size, which can only be recompressed copies, must match
+  more closely than resized ones. Copies with changed colors or contrast no longer count as
+  similar. On 200 pairs of the owner's photos labelled by eye and not used to choose the
+  limits, it kept all 122 copies and let in 4 of 48 burst shots, where it let in all 48 before.
+  `--similar` stays opt-in.
 
 ### Fixed
 
