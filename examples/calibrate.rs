@@ -82,6 +82,10 @@ struct Opt {
     /// Answers from earlier review pages (their JSON): pairs in them are left off the new page
     #[arg(long, value_name = "LABELS")]
     skip: Vec<PathBuf>,
+    /// With --labels: write every answered pair and synthetic copy with all its measures to
+    /// this CSV file (image IDs only, no file names), to try rules that combine measures
+    #[arg(long, value_name = "CSV")]
+    dump: Option<PathBuf>,
 }
 
 /// Transformations that should still count as the same picture.
@@ -470,6 +474,9 @@ fn main() {
     if let Some(path) = &opt.labels {
         let labels = read_labels(path);
         print_labels(&labels, &images, &candidates, &variants);
+        if let Some(csv) = &opt.dump {
+            dump(csv, &labels, &images, &candidates, &variants);
+        }
         if !opt.sizes.is_empty() {
             compare_sizes(&opt, &labels, &images, ffmpeg.as_deref());
         }
@@ -861,6 +868,64 @@ fn print_labels(
         "Largest perceptual hash distance among pairs answered the same or edited: {}",
         percentile(&mut hash_of_same, 100)
     );
+}
+
+/// Write answered pairs and synthetic copies with their measures as CSV: `kind` is `pair` or
+/// `copy`, `answer` the answer or the variant.
+fn dump(
+    path: &Path,
+    labels: &[Label],
+    images: &[HashedImage],
+    candidates: &[Candidate],
+    variants: &[VariantResults],
+) {
+    let ids: Vec<String> = images.iter().map(image_id).collect();
+    let by_pair: HashMap<(&str, &str), &Candidate> = candidates
+        .iter()
+        .map(|c| ((ids[c.a].as_str(), ids[c.b].as_str()), c))
+        .collect();
+    let mut csv = String::from("kind,answer,a,b,hash");
+    for metric in Metric::ALL {
+        let _ = write!(csv, ",{}", metric.name());
+    }
+    csv.push('\n');
+    let mut row = |kind: &str, answer: &str, a: &str, b: &str, hash: u32, metrics: Metrics| {
+        let _ = write!(csv, "{kind},{answer},{a},{b},{hash}");
+        for metric in Metric::ALL {
+            let _ = write!(csv, ",{}", metrics.get(metric));
+        }
+        csv.push('\n');
+    };
+    for label in labels {
+        let found = by_pair
+            .get(&(label.a.as_str(), label.b.as_str()))
+            .or_else(|| by_pair.get(&(label.b.as_str(), label.a.as_str())));
+        if let Some(c) = found {
+            let answer = Answer::of(label).name();
+            row(
+                "pair",
+                answer,
+                &label.a,
+                &label.b,
+                c.hash_distance,
+                c.metrics,
+            );
+        }
+    }
+    for result in variants {
+        for m in &result.measured {
+            row(
+                "copy",
+                result.variant.name(),
+                "",
+                "",
+                m.hash_distance,
+                m.metrics,
+            );
+        }
+    }
+    fs::write(path, csv).unwrap_or_else(|e| die(&e.to_string()));
+    println!("Measures written to {}", path.display());
 }
 
 /// Fingerprint of an upright image at `side` x `side` pixels.
