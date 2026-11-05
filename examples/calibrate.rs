@@ -34,8 +34,8 @@ use image::imageops::FilterType;
 use image::DynamicImage;
 use pixrs::catalog::{library_path, Catalog, HashedImage};
 use pixrs::decode::{decode_in_process, decode_with_ffmpeg, find_tool, image_decoder, Decoder};
-use pixrs::dupes::{aspects_match, DEFAULT_THRESHOLD};
-use pixrs::imagehash::{distance, fingerprint_differences, fingerprints_match, perceptual_hash};
+use pixrs::dupes::{aspects_match, images_similar, DEFAULT_THRESHOLD};
+use pixrs::imagehash::{distance, fingerprint_differences, perceptual_hash, ssim};
 use pixrs::paths::resolve;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -234,7 +234,7 @@ impl Metrics {
             p95: at(95),
             p99: at(99),
             max: f64::from(largest),
-            ssim: 100.0 * (1.0 - ssim(a, b, side)),
+            ssim: 100.0 * (1.0 - ssim(a, b, side).unwrap_or(0.0)),
             shift_mean: gain_mean,
             shift_p99: gain_p99,
         }
@@ -273,40 +273,6 @@ fn square_side(fingerprint: &[u8]) -> Option<usize> {
 #[expect(clippy::cast_precision_loss, reason = "counts far below 2^52")]
 fn mean_of(values: &[u8]) -> f64 {
     values.iter().map(|&v| f64::from(v)).sum::<f64>() / values.len().max(1) as f64
-}
-
-/// Mean structural similarity of two square grayscale images over 8 x 8 windows, 4 pixels apart:
-/// 1 for the same picture. Brightness and contrast changes count for little; local structure
-/// that moved counts for much.
-#[expect(clippy::cast_precision_loss, reason = "window sizes are small")]
-fn ssim(a: &[u8], b: &[u8], side: usize) -> f64 {
-    const WINDOW: usize = 8;
-    const STEP: usize = 4;
-    // The usual constants for 8-bit pixels.
-    let (c1, c2) = ((0.01 * 255.0_f64).powi(2), (0.03 * 255.0_f64).powi(2));
-    let (mut total, mut windows) = (0.0, 0);
-    for y0 in (0..=side - WINDOW).step_by(STEP) {
-        for x0 in (0..=side - WINDOW).step_by(STEP) {
-            let pixels = || {
-                (y0..y0 + WINDOW).flat_map(move |y| (x0..x0 + WINDOW).map(move |x| y * side + x))
-            };
-            let n = (WINDOW * WINDOW) as f64;
-            let mean = |f: &[u8]| pixels().map(|i| f64::from(f[i])).sum::<f64>() / n;
-            let (ma, mb) = (mean(a), mean(b));
-            let (mut va, mut vb, mut cov) = (0.0, 0.0, 0.0);
-            for i in pixels() {
-                let (da, db) = (f64::from(a[i]) - ma, f64::from(b[i]) - mb);
-                va = da.mul_add(da, va);
-                vb = db.mul_add(db, vb);
-                cov = da.mul_add(db, cov);
-            }
-            let (va, vb, cov) = (va / n, vb / n, cov / n);
-            total += ((2.0 * ma).mul_add(mb, c1) * 2.0f64.mul_add(cov, c2))
-                / (ma.mul_add(ma, mb.mul_add(mb, c1)) * (va + vb + c2));
-            windows += 1;
-        }
-    }
-    total / f64::from(windows.max(1))
 }
 
 /// How much closer `b` comes to `a` when shifted by up to `MAX_SHIFT` pixels in each direction,
@@ -456,16 +422,11 @@ fn main() {
         candidates.len(),
         opt.candidates
     );
-    let passing = |c: &Candidate| {
-        let (Some(a), Some(b)) = (&images[c.a].visual, &images[c.b].visual) else {
-            return false;
-        };
-        c.hash_distance <= DEFAULT_THRESHOLD && fingerprints_match(&a.fingerprint, &b.fingerprint)
-    };
+    let passing = |c: &Candidate| images_similar(&images[c.a], &images[c.b], DEFAULT_THRESHOLD);
     let passing_count = candidates.iter().filter(|c| passing(c)).count();
     println!(
-        "{passing_count} of them are similar by today's rule (perceptual hashes at most \
-         {DEFAULT_THRESHOLD} bits apart, fingerprints matching)"
+        "{passing_count} of them are similar by today's rule (`dupes --similar` at threshold \
+         {DEFAULT_THRESHOLD})"
     );
     let variants = sample_variants(&opt, &images, ffmpeg.as_deref());
 
@@ -802,12 +763,30 @@ fn print_labels(
         })
         .collect();
     let count = |answer: Answer| answered.iter().filter(|(_, a)| *a == answer).count();
+    let similar = |answer: Answer| {
+        answered
+            .iter()
+            .filter(|(c, a)| {
+                *a == answer && images_similar(&images[c.a], &images[c.b], DEFAULT_THRESHOLD)
+            })
+            .count()
+    };
     println!();
     println!(
         "Answers: {} pairs matched ({} the same picture, {} edited copies, {} different).",
         answered.len(),
         count(Answer::Same),
         count(Answer::Edited),
+        count(Answer::Different)
+    );
+    println!(
+        "Similar by today's rule: {} of {} the same picture, {} of {} edited copies, {} of {} \
+         different.",
+        similar(Answer::Same),
+        count(Answer::Same),
+        similar(Answer::Edited),
+        count(Answer::Edited),
+        similar(Answer::Different),
         count(Answer::Different)
     );
     println!(

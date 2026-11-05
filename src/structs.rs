@@ -238,7 +238,8 @@ impl CatalogArg {
 #[derive(Clone, Copy, Debug, Args)]
 pub struct SimilarArgs {
     /// Also find similar images (resized or recompressed copies) and videos under 4 seconds.
-    /// Expect burst shots among them. Longer similar videos and similar audio are always found
+    /// A few burst shots may remain among them. Longer similar videos and similar audio are always
+    /// found
     #[arg(long)]
     pub similar: bool,
 

@@ -152,10 +152,121 @@ pub fn perceptual_hash(upright: &DynamicImage) -> Option<Visual> {
     hash_small(&shrink(upright))
 }
 
-/// Largest fingerprint difference that still counts as a copy, see `fingerprints_match`. In
-/// calibration it kept 99.6% of resized and recompressed copies and let in about 5% of burst
-/// shots with close perceptual hashes.
+/// Largest fingerprint difference at the 99th percentile pixel that still counts as a copy, see
+/// `fingerprints_match`. The first test of `same_picture`: alone, it let in every pair of burst
+/// shots the owner labelled.
 pub const FINGERPRINT_LIMIT: u8 = 6;
+
+/// Largest difference at any fingerprint pixel between two images of the same size that still
+/// counts as a copy, see `same_picture`. Re-encoded at the same size (JPEG quality 60 and 85),
+/// copies never went above 4 in calibration; burst shots taken within the same second mostly
+/// differ by 6 or more somewhere.
+pub const SAME_SIZE_LIMIT: u8 = 4;
+
+/// Largest difference at any fingerprint pixel between two images of different sizes that still
+/// counts as a copy, see `same_picture`.
+pub const RESIZED_LIMIT: u8 = 12;
+
+/// Least structural similarity (`ssim`) of the fingerprints of two copies, see `same_picture`.
+/// Catches pictures that differ a little everywhere, like two sheets of the same patterned
+/// paper.
+pub const MIN_SSIM: f64 = 0.98;
+
+/// How the sizes of two images with close perceptual hashes compare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sizes {
+    /// The same width and height, either way round: a copy can only have been recompressed.
+    Same,
+    /// Different or unknown sizes: a copy may have been resized too.
+    Different,
+}
+
+/// Whether two images with close perceptual hashes are copies of the same picture, judged by
+/// their fingerprints: `fingerprints_match`, an `ssim` of at least `MIN_SSIM`, and no pixel
+/// differing by more than `SAME_SIZE_LIMIT` (same size) or `RESIZED_LIMIT` (resized). Burst
+/// shots differ a lot where something moved, which these catch where the 99th percentile does
+/// not. Copies with changed colors or contrast fail too: they are other versions of the
+/// picture, which `similar` is not meant to find.
+///
+/// Calibrated on pairs the owner labelled (see `AGENTS.md`). On the held-out page, with
+/// `dupes` also refusing photos taken at different times: 122 of 122 copies kept, 4 of 48 burst
+/// shots let in.
+pub fn same_picture(a: &[u8], b: &[u8], sizes: Sizes) -> bool {
+    if !fingerprints_match(a, b) {
+        return false;
+    }
+    let limit = match sizes {
+        Sizes::Same => SAME_SIZE_LIMIT,
+        Sizes::Different => RESIZED_LIMIT,
+    };
+    largest_difference(a, b).is_some_and(|largest| largest <= limit)
+        && ssim(a, b, FINGERPRINT_SIDE as usize).is_some_and(|s| s >= MIN_SSIM)
+}
+
+/// The largest of `fingerprint_differences`, without sorting. `None` if the sizes differ or the
+/// fingerprints are empty.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "differences fit in a byte"
+)]
+pub fn largest_difference(a: &[u8], b: &[u8]) -> Option<u8> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let shift = mean(a) - mean(b);
+    let largest = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| (f64::from(x) - f64::from(y) - shift).abs())
+        .fold(0.0, f64::max);
+    Some(largest.round().min(255.0) as u8)
+}
+
+/// Side of the windows `ssim` compares.
+const SSIM_WINDOW: usize = 8;
+
+/// Mean structural similarity of two `side` x `side` grayscale fingerprints over 8 x 8 windows,
+/// 4 pixels apart: 1 for the same picture. Brightness and contrast changes count for little;
+/// local structure that moved counts for much. `None` unless both are `side` x `side` and at
+/// least one window.
+#[expect(clippy::cast_precision_loss, reason = "window sizes are small")]
+pub fn ssim(a: &[u8], b: &[u8], side: usize) -> Option<f64> {
+    const STEP: usize = 4;
+    if side < SSIM_WINDOW || a.len() != side * side || b.len() != a.len() {
+        return None;
+    }
+    // The usual constants for 8-bit pixels.
+    let (c1, c2) = ((0.01 * 255.0_f64).powi(2), (0.03 * 255.0_f64).powi(2));
+    let n = (SSIM_WINDOW * SSIM_WINDOW) as f64;
+    let (mut total, mut windows) = (0.0, 0_u32);
+    for y0 in (0..=side - SSIM_WINDOW).step_by(STEP) {
+        for x0 in (0..=side - SSIM_WINDOW).step_by(STEP) {
+            let rows = (y0..y0 + SSIM_WINDOW).map(|y| y * side + x0..y * side + x0 + SSIM_WINDOW);
+            let window = |f: &'_ [u8]| -> Vec<f64> {
+                rows.clone()
+                    .filter_map(|row| f.get(row))
+                    .flatten()
+                    .map(|&v| f64::from(v))
+                    .collect()
+            };
+            let (wa, wb) = (window(a), window(b));
+            let (ma, mb) = (wa.iter().sum::<f64>() / n, wb.iter().sum::<f64>() / n);
+            let (mut va, mut vb, mut cov) = (0.0, 0.0, 0.0);
+            for (&x, &y) in wa.iter().zip(&wb) {
+                let (da, db) = (x - ma, y - mb);
+                va = da.mul_add(da, va);
+                vb = db.mul_add(db, vb);
+                cov = da.mul_add(db, cov);
+            }
+            let (va, vb, cov) = (va / n, vb / n, cov / n);
+            total += ((2.0 * ma).mul_add(mb, c1) * 2.0f64.mul_add(cov, c2))
+                / (ma.mul_add(ma, mb.mul_add(mb, c1)) * (va + vb + c2));
+            windows += 1;
+        }
+    }
+    Some(total / f64::from(windows))
+}
 
 /// Whether two images with close perceptual hashes are copies of the same picture: their
 /// fingerprints differ little even at the 99th percentile pixel. Resized and recompressed
@@ -463,6 +574,79 @@ pub(crate) mod tests {
         }
         assert!(!fingerprints_match(&[], &[]));
         assert!(!fingerprints_match(&[1, 2], &[1]));
+    }
+
+    /// A 32 x 32 fingerprint with some structure: a diagonal gradient from 0 to 186.
+    fn gradient() -> Vec<u8> {
+        (0..32 * 32)
+            .map(|i| ((i % 32 + i / 32) * 3) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn test_largest_difference_ignores_brightness() {
+        let base = gradient();
+        let brighter: Vec<u8> = base.iter().map(|v| v + 10).collect();
+        assert_eq!(largest_difference(&base, &brighter), Some(0));
+        let mut spot = base.clone();
+        spot[100] += 30;
+        assert_eq!(largest_difference(&base, &spot), Some(30));
+        assert_eq!(largest_difference(&[], &[]), None);
+        assert_eq!(largest_difference(&[1, 2], &[1]), None);
+    }
+
+    #[test]
+    fn test_ssim_is_one_for_the_same_picture_and_lower_for_another() {
+        let base = gradient();
+        assert!((ssim(&base, &base, 32).unwrap() - 1.0).abs() < 1e-9);
+        let flipped: Vec<u8> = base.iter().rev().copied().collect();
+        assert!(ssim(&base, &flipped, 32).unwrap() < 0.5);
+        // Too small for a window, or not `side` x `side`.
+        assert_eq!(ssim(&[100; 16], &[100; 16], 4), None);
+        assert_eq!(ssim(&base, &base[1..], 32), None);
+    }
+
+    #[test]
+    fn test_same_picture_is_stricter_for_images_of_the_same_size() {
+        let base = gradient();
+        let mut recompressed = base.clone();
+        for v in recompressed.iter_mut().step_by(7) {
+            *v += 3;
+        }
+        assert!(same_picture(&base, &recompressed, Sizes::Same));
+        assert!(same_picture(&base, &recompressed, Sizes::Different));
+
+        // A few pixels changed by 8, as where something moved between two burst shots: within
+        // the 99th percentile limit, but not what recompression does.
+        let mut moved = base.clone();
+        for v in moved.iter_mut().take(5) {
+            *v += 8;
+        }
+        assert!(fingerprints_match(&base, &moved));
+        assert!(!same_picture(&base, &moved, Sizes::Same));
+        assert!(same_picture(&base, &moved, Sizes::Different));
+
+        // Beyond `RESIZED_LIMIT` at one pixel.
+        let mut spot = base.clone();
+        spot[500] += RESIZED_LIMIT + 2;
+        assert!(fingerprints_match(&base, &spot));
+        assert!(!same_picture(&base, &spot, Sizes::Different));
+
+        // Structure changed everywhere a little: SSIM catches it.
+        let noisy: Vec<u8> = base
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if i % 2 == 0 {
+                    v + 6
+                } else {
+                    v.saturating_sub(5)
+                }
+            })
+            .collect();
+        assert!(largest_difference(&base, &noisy).unwrap() <= RESIZED_LIMIT);
+        assert!(ssim(&base, &noisy, 32).unwrap() < MIN_SSIM);
+        assert!(!same_picture(&base, &noisy, Sizes::Different));
     }
 
     #[test]

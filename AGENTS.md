@@ -102,7 +102,7 @@ Decided details:
   bytes, then oldest), since similar copies are often scaled down; then the oldest of its exact and
   same-pixel copies replaces it (a copy with rewritten metadata can be larger). Quarantine only
   moves files that match their keeper `exact` or `same-pixels`, never `similar` ones (similar
-  images are mostly burst shots, see "Image hashes"); exact copies in a `similar` group still move.
+  images can be burst shots, see "Image hashes"); exact copies in a `similar` group still move.
 - Organize commands: `pixrs organize` and `pixrs dupes --quarantine <DIR>` only write a plan
   file (and print a summary); `pixrs apply <PLAN>` carries out either kind of plan and
   `pixrs undo <JOURNAL>` reverses it. An interrupted `apply` is not resumed: undo it and plan
@@ -177,15 +177,24 @@ Decided details:
   changed its rotation tag counts as "same pixels". Perceptual hash = `image_hasher` gradient,
   64 bits, of the upright image shrunk to 256 px; images with almost no detail (blank, black,
   one color) get none, since their hashes are all alike. Each image also stores a 32 x 32
-  grayscale fingerprint. "Similar" = Hamming distance at most `--threshold`, aspect ratios
-  within 3%, and matching fingerprints, found by comparing all pairs on all cores. The
-  fingerprint check exists because the 64-bit hash alone cannot tell burst shots apart: on the
-  owner's library, 12 of 15 pairs at distance 0 were different pictures. Calibrated
-  (`examples/calibrate.rs`, 2,600 of the owner's photos plus synthetic copies): threshold 6
-  bits (all copies within 4), fingerprint limit 6 at the 99th percentile pixel (keeps 99.6% of
-  copies, rejects about 95% of burst pairs). Larger fingerprints (64 to 256 px) separated
-  worse. Since burst pairs still outnumber real copies in such libraries, `similar` is opt-in
-  (`--similar`) and documented as "expect burst shots". HEIC is decoded via
+  grayscale fingerprint. "Similar" (`ImageKey::similar` in `src/dupes.rs`, also used by
+  `calibrate`) = Hamming distance at most `--threshold`, aspect ratios within 3%, not both
+  dated with different `taken_at` (whole seconds: burst shots; copies keep the time or lose
+  it), and fingerprints of the same picture (`same_picture` in `src/imagehash.rs`): the
+  99th percentile pixel difference at most 6 (brightness-corrected), SSIM over 8 x 8 windows at
+  least 0.98, and the largest pixel difference at most 4 for images of the same size (either
+  way round) or 12 for resized ones. Found by comparing all pairs on all cores. The 64-bit hash
+  alone cannot tell burst shots apart: on the owner's library, 12 of 15 pairs at distance 0
+  were different pictures. Calibrated (`examples/calibrate.rs`: synthetic copies of the
+  owner's photos, and 373 candidate pairs the owner labelled on its review page as same,
+  edited copy or different): threshold 6 bits (all copies within 4). The p99 test alone let in
+  every labelled burst pair. SSIM catches patterned paper; burst shots within the same second
+  look like copies to every measure at 32 x 32 except the largest difference at the same size,
+  where same-size re-encodes (JPEG q60, q85) never exceed 4. On the held-out page (200 pairs):
+  122 of 122 copies kept, 16 of 30 edited copies (colors or contrast changed; the owner decided
+  these are not similar), 4 of 48 burst shots let in. Larger fingerprints (64 to 256 px)
+  separated worse. `similar` stays opt-in (`--similar`, "a few burst shots may remain"), by
+  the owner's decision. HEIC is decoded via
   `ffmpeg` 7.1 or later when available (older versions may decode one tile of a phone's HEIC
   grid); RAW is skipped with a note. `ffmpeg` applies the file's rotation itself, so for HEIC
   and AVIF the pixel hash is of the upright image. In-process decoding is capped at 65,536
@@ -215,7 +224,7 @@ Decided details:
   `fpcalc` gives none; it is stored empty, not as undecodable). Fingerprints with fewer than 10%
   distinct values (silence, hum, steady tones all look alike) are never compared. Both reuse the
   `similar` tier (the media type tells them apart) and are always on, since calibration showed no
-  false matches; similar images stay behind `--similar` (burst shots), and so do videos under 4 s
+  false matches; similar images stay behind `--similar` (some burst shots), and so do videos under 4 s
   (Live Photo clips shot moments apart were not in the calibration sample). `--threshold` applies
   to images and video frames. Both are skipped with a note when `ffmpeg`/`ffprobe` or `fpcalc` are
   not on `PATH`.
