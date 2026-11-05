@@ -75,6 +75,10 @@ struct Opt {
     /// its default threshold, fingerprints matching): the ones a further test must sort out
     #[arg(long)]
     passing: bool,
+    /// Only images below this folder of a library: its path relative to the library root, with
+    /// `/` separators
+    #[arg(long, value_name = "FOLDER")]
+    within: Option<String>,
 }
 
 /// Transformations that should still count as the same picture.
@@ -381,6 +385,15 @@ fn main() {
         .unwrap_or_else(|e| die(&e.to_string()))
         .into_iter()
         .filter(|image| image.visual.is_some())
+        .filter(|image| {
+            opt.within.as_deref().is_none_or(|folder| {
+                image
+                    .file
+                    .path
+                    .strip_prefix(folder.trim_end_matches('/'))
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
         .collect();
     // A fixed order, so samples and saved answers stay the same between runs.
     images.sort_by(|a, b| (&a.file.root, &a.file.path).cmp(&(&b.file.root, &b.file.path)));
