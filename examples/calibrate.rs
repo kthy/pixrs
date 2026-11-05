@@ -79,6 +79,9 @@ struct Opt {
     /// `/` separators
     #[arg(long, value_name = "FOLDER")]
     within: Option<String>,
+    /// Answers from earlier review pages (their JSON): pairs in them are left off the new page
+    #[arg(long, value_name = "LABELS")]
+    skip: Vec<PathBuf>,
 }
 
 /// Transformations that should still count as the same picture.
@@ -90,16 +93,18 @@ enum Variant {
     Jpeg60,
     HalfJpeg60,
     Fit640Jpeg50,
+    Thumb160Jpeg40,
 }
 
 impl Variant {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Half,
         Self::Fit1024,
         Self::Jpeg85,
         Self::Jpeg60,
         Self::HalfJpeg60,
         Self::Fit640Jpeg50,
+        Self::Thumb160Jpeg40,
     ];
 
     const fn name(self) -> &'static str {
@@ -110,6 +115,7 @@ impl Variant {
             Self::Jpeg60 => "JPEG q60",
             Self::HalfJpeg60 => "half + q60",
             Self::Fit640Jpeg50 => "640 px + q50",
+            Self::Thumb160Jpeg40 => "160 px + q40",
         }
     }
 
@@ -128,6 +134,7 @@ impl Variant {
             Self::Jpeg60 => recompress(img, 60),
             Self::HalfJpeg60 => recompress(&half(img), 60),
             Self::Fit640Jpeg50 => recompress(&fit(img, 640), 50),
+            Self::Thumb160Jpeg40 => recompress(&fit(img, 160), 40),
         }
     }
 }
@@ -367,6 +374,38 @@ struct Label {
     a: String,
     b: String,
     different: bool,
+    /// The same picture, one of them with colors or contrast changed. Answers from before the
+    /// page asked do not have it.
+    #[serde(default)]
+    edited: bool,
+}
+
+/// What a pair is, by an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    Same,
+    Edited,
+    Different,
+}
+
+impl Answer {
+    const ALL: [Self; 3] = [Self::Same, Self::Edited, Self::Different];
+
+    const fn of(label: &Label) -> Self {
+        match (label.different, label.edited) {
+            (true, _) => Self::Different,
+            (false, true) => Self::Edited,
+            (false, false) => Self::Same,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Same => "same picture",
+            Self::Edited => "edited copy",
+            Self::Different => "different pictures",
+        }
+    }
 }
 
 fn main() {
@@ -437,6 +476,21 @@ fn main() {
     }
     if opt.passing {
         candidates.retain(passing);
+    }
+    if !opt.skip.is_empty() {
+        let ids: Vec<String> = images.iter().map(image_id).collect();
+        let answered: std::collections::HashSet<(String, String)> = opt
+            .skip
+            .iter()
+            .flat_map(|path| read_labels(path))
+            .flat_map(|l| [(l.a.clone(), l.b.clone()), (l.b, l.a)])
+            .collect();
+        let before = candidates.len();
+        candidates.retain(|c| !answered.contains(&(ids[c.a].clone(), ids[c.b].clone())));
+        println!(
+            "{} pairs left off the review page, answered before",
+            before - candidates.len()
+        );
     }
     write_review(&opt, &images, ffmpeg.as_deref(), &candidates);
 }
@@ -731,30 +785,31 @@ fn print_labels(
         .iter()
         .map(|c| ((ids[c.a].as_str(), ids[c.b].as_str()), c))
         .collect();
-    let answered: Vec<(&Candidate, bool)> = labels
+    let answered: Vec<(&Candidate, Answer)> = labels
         .iter()
         .filter_map(|l| {
             by_pair
                 .get(&(l.a.as_str(), l.b.as_str()))
                 .or_else(|| by_pair.get(&(l.b.as_str(), l.a.as_str())))
-                .map(|c| (*c, l.different))
+                .map(|c| (*c, Answer::of(l)))
         })
         .collect();
-    let same = answered.iter().filter(|(_, d)| !d).count();
+    let count = |answer: Answer| answered.iter().filter(|(_, a)| *a == answer).count();
     println!();
     println!(
-        "Answers: {} pairs matched ({} the same picture, {} different).",
+        "Answers: {} pairs matched ({} the same picture, {} edited copies, {} different).",
         answered.len(),
-        same,
-        answered.len() - same
+        count(Answer::Same),
+        count(Answer::Edited),
+        count(Answer::Different)
     );
     println!(
-        "For each metric, limits that keep a share of the synthetic copies; same kept and \
-         different let in count answered pairs within the limit."
+        "For each metric, limits that keep a share of the synthetic copies; the other columns \
+         count answered pairs within the limit."
     );
     println!(
-        "{:<10} {:>8} {:>12} {:>10} {:>16}",
-        "metric", "limit", "copies kept", "same kept", "different let in"
+        "{:<10} {:>8} {:>12} {:>10} {:>12} {:>16}",
+        "metric", "limit", "copies kept", "same kept", "edited kept", "different let in"
     );
     for metric in Metric::ALL {
         let mut copies: Vec<f64> = variants
@@ -769,41 +824,41 @@ fn print_labels(
         for share in [950, 990, 995, 999, 1000] {
             let limit = copies[(copies.len() * share / 1000).min(copies.len() - 1)];
             let kept = copies.iter().filter(|&&v| v <= limit).count() as f64 / copies.len() as f64;
-            let within = |different: bool| {
-                answered
+            let within = |answer: Answer| {
+                let n = answered
                     .iter()
-                    .filter(|(c, d)| *d == different && c.metrics.get(metric) <= limit)
-                    .count()
+                    .filter(|(c, a)| *a == answer && c.metrics.get(metric) <= limit)
+                    .count();
+                format!("{n} of {}", count(answer))
             };
             println!(
-                "{:<10} {:>8.2} {:>11.1}% {:>6} of {:<3} {:>8} of {:<3}",
+                "{:<10} {:>8.2} {:>11.1}% {:>10} {:>12} {:>16}",
                 metric.name(),
                 limit,
                 100.0 * kept,
-                within(false),
-                same,
-                within(true),
-                answered.len() - same
+                within(Answer::Same),
+                within(Answer::Edited),
+                within(Answer::Different)
             );
         }
     }
     // How the answered pairs spread on each metric, to see where a limit could go.
-    for (title, different) in [("same picture", false), ("different pictures", true)] {
+    for answer in Answer::ALL {
         print_spread(
-            &format!("Answered pairs, {title}"),
+            &format!("Answered pairs, {}", answer.name()),
             answered
                 .iter()
-                .filter(|(_, d)| *d == different)
+                .filter(|(_, a)| *a == answer)
                 .map(|(c, _)| c.metrics),
         );
     }
     let mut hash_of_same: Vec<f64> = answered
         .iter()
-        .filter(|(_, d)| !d)
+        .filter(|(_, a)| *a != Answer::Different)
         .map(|(c, _)| f64::from(c.hash_distance))
         .collect();
     println!(
-        "Largest perceptual hash distance among pairs answered the same: {}",
+        "Largest perceptual hash distance among pairs answered the same or edited: {}",
         percentile(&mut hash_of_same, 100)
     );
 }
@@ -1018,7 +1073,10 @@ fn write_review(
                     height
                 );
             }
-            html.push_str("<label><input type=\"checkbox\"> different pictures</label></div>");
+            html.push_str(
+                "<label><input type=\"checkbox\" class=\"different\"> different pictures</label>\
+                 <label><input type=\"checkbox\" class=\"edited\"> edited copy</label></div>",
+            );
         }
         html.push_str("</section>");
         eprintln!("Review page: group {} done", n + 1);
@@ -1060,7 +1118,10 @@ body { font: 14px/1.4 system-ui, sans-serif; margin: 1rem; }
         font-size: 11px; }
 .pair { display: inline-flex; gap: 0.5rem; align-items: flex-end; margin: 0 1.5rem 1.5rem 0;
         padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; }
+.pair { flex-wrap: wrap; }
+.pair label { display: block; }
 .pair.different { background: #fde2e2; }
+.pair.edited { background: #fdf3d2; }
 figure { margin: 0; width: 240px; }
 figure img { width: 240px; height: 240px; object-fit: contain; background: #eee;
              cursor: zoom-in; }
@@ -1080,13 +1141,15 @@ figcaption { font-size: 12px; overflow-wrap: anywhere; }
 </style></head><body>
 <div id="overlay" hidden><div class="bar"><b id="o-title"></b>
 <span>Space: flip between the two in one place. Left/right: previous/next pair. D: tick
-"different". Esc: close.</span>
-<label><input type="checkbox" id="o-different"> different pictures</label></div>
+"different". E: tick "edited". Esc: close.</span>
+<label><input type="checkbox" id="o-different"> different pictures</label>
+<label><input type="checkbox" id="o-edited"> edited copy</label></div>
 <div class="images"><figure id="o-a"><img><figcaption></figcaption></figure>
 <figure id="o-b"><img><figcaption></figcaption></figure></div></div>
 <div id="summary"><p>Tick the pairs that are <b>not</b> the same picture (count burst shots
-as different). Click a thumbnail to compare the pair large. Then copy the JSON below and paste
-it back.</p>
+as different), and "edited copy" for the same picture with colors or contrast changed (a
+smaller or lower-quality copy is just the same picture). Click a thumbnail to compare the pair
+large. Then copy the JSON below and paste it back.</p>
 <table id="table"></table><button id="copy">Copy results</button>
 <pre id="json"></pre></div>
 "#;
@@ -1095,29 +1158,43 @@ const REVIEW_TAIL: &str = r#"
 <script>
 const sections = [...document.querySelectorAll("section")];
 const pairs = [...document.querySelectorAll(".pair")];
+const box = (pair, kind) => pair.querySelector("input." + kind);
 // Ticks are kept in the browser, so a reload or a closed tab does not lose them.
 const KEY = "pixrs-review:" + location.pathname;
 const pairKey = p => p.dataset.a + "/" + p.dataset.b;
 let saved = {};
 try { saved = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
-pairs.forEach(p => { if (saved[pairKey(p)]) p.querySelector("input").checked = true; });
+pairs.forEach(p => {
+  // Saved by an earlier page: `true` for "different".
+  const s = saved[pairKey(p)];
+  box(p, "different").checked = s === true || (s && s.different) || false;
+  box(p, "edited").checked = (s && s.edited) || false;
+});
 function save() {
   const ticked = {};
-  pairs.forEach(p => { if (p.querySelector("input").checked) ticked[pairKey(p)] = true; });
+  pairs.forEach(p => {
+    const different = box(p, "different").checked, edited = box(p, "edited").checked;
+    if (different || edited) ticked[pairKey(p)] = { different, edited };
+  });
   try { localStorage.setItem(KEY, JSON.stringify(ticked)); } catch (e) {}
 }
 function results() {
   return pairs.map(p => ({ a: p.dataset.a, b: p.dataset.b,
-                           different: p.querySelector("input").checked }));
+                           different: box(p, "different").checked,
+                           edited: box(p, "edited").checked }));
 }
 function update() {
   const rows = sections.map(s => {
-    const ticked = s.querySelectorAll("input:checked").length;
     const n = s.querySelectorAll(".pair").length;
-    return `<tr><td>${s.querySelector("h2").textContent}</td><td>${ticked} of ${n} different</td></tr>`;
+    const different = s.querySelectorAll("input.different:checked").length;
+    const edited = s.querySelectorAll("input.edited:checked").length;
+    return `<tr><td>${s.querySelector("h2").textContent}</td><td>${different} of ${n} different, ${edited} edited</td></tr>`;
   });
   document.getElementById("table").innerHTML = rows.join("");
-  pairs.forEach(p => p.classList.toggle("different", p.querySelector("input").checked));
+  pairs.forEach(p => {
+    p.classList.toggle("different", box(p, "different").checked);
+    p.classList.toggle("edited", box(p, "edited").checked);
+  });
   // Clipboard access can be refused for local files; the JSON is also shown to copy by hand.
   document.getElementById("json").textContent = JSON.stringify(results());
   save();
@@ -1128,7 +1205,8 @@ document.getElementById("copy").addEventListener("click", () =>
 
 // Click a thumbnail to compare its pair large.
 const overlay = document.getElementById("overlay");
-const different = document.getElementById("o-different");
+const large = { different: document.getElementById("o-different"),
+                edited: document.getElementById("o-edited") };
 let current = -1;
 function show(n) {
   if (n < 0 || n >= pairs.length) return;
@@ -1143,15 +1221,20 @@ function show(n) {
   });
   document.getElementById("o-title").textContent =
     `${pair.closest("section").querySelector("h2").textContent}, pair ${n + 1} of ${pairs.length}`;
-  different.checked = pair.querySelector("input").checked;
+  for (const kind in large) large[kind].checked = box(pair, kind).checked;
   overlay.hidden = false;
 }
 pairs.forEach((pair, n) =>
   pair.querySelectorAll("figure img").forEach(img => img.addEventListener("click", () => show(n))));
-different.addEventListener("change", () => {
-  pairs[current].querySelector("input").checked = different.checked;
+for (const kind in large) large[kind].addEventListener("change", e => {
+  e.stopPropagation();
+  box(pairs[current], kind).checked = large[kind].checked;
   update();
 });
+function toggle(kind) {
+  large[kind].checked = !large[kind].checked;
+  large[kind].dispatchEvent(new Event("change"));
+}
 document.addEventListener("keydown", e => {
   if (overlay.hidden) return;
   if (e.key === "Escape") { overlay.hidden = true; overlay.classList.remove("flip"); }
@@ -1162,8 +1245,8 @@ document.addEventListener("keydown", e => {
   }
   else if (e.key === "ArrowRight") show(current + 1);
   else if (e.key === "ArrowLeft") show(current - 1);
-  else if (e.key === "d" || e.key === "D") { different.checked = !different.checked;
-    different.dispatchEvent(new Event("change")); }
+  else if (e.key === "d" || e.key === "D") toggle("different");
+  else if (e.key === "e" || e.key === "E") toggle("edited");
 });
 update();
 </script></body></html>
