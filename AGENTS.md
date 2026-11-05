@@ -193,7 +193,9 @@ Decided details:
   where same-size re-encodes (JPEG q60, q85) never exceed 4. On the held-out page (200 pairs):
   122 of 122 copies kept, 16 of 30 edited copies (colors or contrast changed; the owner decided
   these are not similar), 4 of 48 burst shots let in. Larger fingerprints (64 to 256 px)
-  separated worse. `similar` stays opt-in (`--similar`, "a few burst shots may remain"), by
+  separated worse. EXIF sub-second times (`SubSecTimeOriginal`) were measured and left out:
+  they differ for 34 of 37 same-second burst pairs, but on top of this rule caught 1 more of
+  the 373 labelled pairs and lost 3 copies, not worth a schema change and a metadata reread. `similar` stays opt-in (`--similar`, "a few burst shots may remain"), by
   the owner's decision. HEIC is decoded via
   `ffmpeg` 7.1 or later when available (older versions may decode one tile of a phone's HEIC
   grid); RAW is skipped with a note. `ffmpeg` applies the file's rotation itself, so for HEIC
