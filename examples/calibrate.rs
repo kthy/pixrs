@@ -34,8 +34,8 @@ use image::imageops::FilterType;
 use image::DynamicImage;
 use pixrs::catalog::{library_path, Catalog, HashedImage};
 use pixrs::decode::{decode_in_process, decode_with_ffmpeg, find_tool, image_decoder, Decoder};
-use pixrs::dupes::aspects_match;
-use pixrs::imagehash::{distance, fingerprint_differences, perceptual_hash};
+use pixrs::dupes::{aspects_match, DEFAULT_THRESHOLD};
+use pixrs::imagehash::{distance, fingerprint_differences, fingerprints_match, perceptual_hash};
 use pixrs::paths::resolve;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -71,6 +71,10 @@ struct Opt {
     /// again (e.g. 32,64,128,256)
     #[arg(long, value_delimiter = ',')]
     sizes: Vec<u32>,
+    /// Review only pairs `pixrs dupes --similar` finds similar today (perceptual hashes within
+    /// its default threshold, fingerprints matching): the ones a further test must sort out
+    #[arg(long)]
+    passing: bool,
 }
 
 /// Transformations that should still count as the same picture.
@@ -124,7 +128,9 @@ impl Variant {
     }
 }
 
-/// Ways of summing up fingerprint differences into one number.
+/// Ways of telling how far two fingerprints are apart, as one number that is small for copies.
+/// The first five sum up the pixel differences; the rest are sensitive to how the pictures line
+/// up, which burst shots (a hand or a subject moved) do not quite do (#48).
 #[derive(Clone, Copy, Debug)]
 enum Metric {
     Mean,
@@ -132,10 +138,26 @@ enum Metric {
     P95,
     P99,
     Max,
+    /// 100 x (1 - mean SSIM over 8 x 8 windows).
+    Ssim,
+    /// How much lower the mean difference gets when one fingerprint is shifted by up to
+    /// `MAX_SHIFT` pixels: copies line up best unshifted.
+    ShiftMean,
+    /// The same for the 99th percentile difference.
+    ShiftP99,
 }
 
 impl Metric {
-    const ALL: [Self; 5] = [Self::Mean, Self::P90, Self::P95, Self::P99, Self::Max];
+    const ALL: [Self; 8] = [
+        Self::Mean,
+        Self::P90,
+        Self::P95,
+        Self::P99,
+        Self::Max,
+        Self::Ssim,
+        Self::ShiftMean,
+        Self::ShiftP99,
+    ];
 
     const fn name(self) -> &'static str {
         match self {
@@ -144,6 +166,9 @@ impl Metric {
             Self::P95 => "p95",
             Self::P99 => "p99",
             Self::Max => "max",
+            Self::Ssim => "ssim",
+            Self::ShiftMean => "shift-mean",
+            Self::ShiftP99 => "shift-p99",
         }
     }
 }
@@ -151,7 +176,7 @@ impl Metric {
 /// The metric the review page spreads its pairs over.
 const REVIEW_METRIC: Metric = Metric::P99;
 
-/// The fingerprint differences of two images, summed up in each way.
+/// How far the fingerprints of two images are apart, in each way.
 #[derive(Clone, Copy, Debug)]
 struct Metrics {
     mean: f64,
@@ -159,6 +184,9 @@ struct Metrics {
     p95: f64,
     p99: f64,
     max: f64,
+    ssim: f64,
+    shift_mean: f64,
+    shift_p99: f64,
 }
 
 impl Metrics {
@@ -169,30 +197,32 @@ impl Metrics {
         p95: 255.0,
         p99: 255.0,
         max: 255.0,
+        ssim: 100.0,
+        shift_mean: 255.0,
+        shift_p99: 255.0,
     };
 
-    /// Mean, 90th, 95th and 99th percentile, and largest of sorted differences.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "statistics over counts far below 2^52"
-    )]
-    fn of(diffs: &[u8]) -> Self {
+    /// Of the fingerprints of two images.
+    fn between(a: &[u8], b: &[u8]) -> Self {
+        let diffs = fingerprint_differences(a, b);
         let Some(&largest) = diffs.last() else {
             return Self::APART;
         };
+        let Some(side) = square_side(a) else {
+            return Self::APART;
+        };
         let at = |p: usize| f64::from(diffs[(diffs.len() * p / 100).min(diffs.len() - 1)]);
+        let (gain_mean, gain_p99) = shift_gains(a, b, side);
         Self {
-            mean: diffs.iter().map(|&d| f64::from(d)).sum::<f64>() / diffs.len() as f64,
+            mean: mean_of(&diffs),
             p90: at(90),
             p95: at(95),
             p99: at(99),
             max: f64::from(largest),
+            ssim: 100.0 * (1.0 - ssim(a, b, side)),
+            shift_mean: gain_mean,
+            shift_p99: gain_p99,
         }
-    }
-
-    /// Of the fingerprints of two images.
-    fn between(a: &[u8], b: &[u8]) -> Self {
-        Self::of(&fingerprint_differences(a, b))
     }
 
     const fn get(self, metric: Metric) -> f64 {
@@ -202,8 +232,107 @@ impl Metrics {
             Metric::P95 => self.p95,
             Metric::P99 => self.p99,
             Metric::Max => self.max,
+            Metric::Ssim => self.ssim,
+            Metric::ShiftMean => self.shift_mean,
+            Metric::ShiftP99 => self.shift_p99,
         }
     }
+}
+
+/// Most pixels a fingerprint is shifted by in the shift metrics.
+const MAX_SHIFT: usize = 2;
+
+/// The side of a square fingerprint, if it is square and larger than the shifts.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "fingerprint sides are small"
+)]
+fn square_side(fingerprint: &[u8]) -> Option<usize> {
+    let side = (fingerprint.len() as f64).sqrt().round() as usize;
+    (side * side == fingerprint.len() && side > 4 * MAX_SHIFT).then_some(side)
+}
+
+/// The mean of some values.
+#[expect(clippy::cast_precision_loss, reason = "counts far below 2^52")]
+fn mean_of(values: &[u8]) -> f64 {
+    values.iter().map(|&v| f64::from(v)).sum::<f64>() / values.len().max(1) as f64
+}
+
+/// Mean structural similarity of two square grayscale images over 8 x 8 windows, 4 pixels apart:
+/// 1 for the same picture. Brightness and contrast changes count for little; local structure
+/// that moved counts for much.
+#[expect(clippy::cast_precision_loss, reason = "window sizes are small")]
+fn ssim(a: &[u8], b: &[u8], side: usize) -> f64 {
+    const WINDOW: usize = 8;
+    const STEP: usize = 4;
+    // The usual constants for 8-bit pixels.
+    let (c1, c2) = ((0.01 * 255.0_f64).powi(2), (0.03 * 255.0_f64).powi(2));
+    let (mut total, mut windows) = (0.0, 0);
+    for y0 in (0..=side - WINDOW).step_by(STEP) {
+        for x0 in (0..=side - WINDOW).step_by(STEP) {
+            let pixels = || {
+                (y0..y0 + WINDOW).flat_map(move |y| (x0..x0 + WINDOW).map(move |x| y * side + x))
+            };
+            let n = (WINDOW * WINDOW) as f64;
+            let mean = |f: &[u8]| pixels().map(|i| f64::from(f[i])).sum::<f64>() / n;
+            let (ma, mb) = (mean(a), mean(b));
+            let (mut va, mut vb, mut cov) = (0.0, 0.0, 0.0);
+            for i in pixels() {
+                let (da, db) = (f64::from(a[i]) - ma, f64::from(b[i]) - mb);
+                va = da.mul_add(da, va);
+                vb = db.mul_add(db, vb);
+                cov = da.mul_add(db, cov);
+            }
+            let (va, vb, cov) = (va / n, vb / n, cov / n);
+            total += ((2.0 * ma).mul_add(mb, c1) * 2.0f64.mul_add(cov, c2))
+                / (ma.mul_add(ma, mb.mul_add(mb, c1)) * (va + vb + c2));
+            windows += 1;
+        }
+    }
+    total / f64::from(windows.max(1))
+}
+
+/// How much closer `b` comes to `a` when shifted by up to `MAX_SHIFT` pixels in each direction,
+/// as the drop in the mean and in the 99th percentile of the brightness-corrected differences.
+/// Both are compared over the same central region, so every shift sees the same pixels of `a`.
+/// Copies line up best unshifted (no drop); burst shots taken with a moving hand often do not.
+fn shift_gains(a: &[u8], b: &[u8], side: usize) -> (f64, f64) {
+    let inner = MAX_SHIFT..side - MAX_SHIFT;
+    let brightness = mean_of(a) - mean_of(b);
+    let at = |dx: isize, dy: isize| -> (f64, f64) {
+        let mut diffs: Vec<u8> = vec![];
+        for y in inner.clone() {
+            for x in inner.clone() {
+                let (bx, by) = (x.wrapping_add_signed(dx), y.wrapping_add_signed(dy));
+                let d = (f64::from(a[y * side + x]) - f64::from(b[by * side + bx]) - brightness)
+                    .abs()
+                    .round()
+                    .min(255.0);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "rounded and capped at 255"
+                )]
+                diffs.push(d as u8);
+            }
+        }
+        diffs.sort_unstable();
+        let p99 = f64::from(diffs[(diffs.len() * 99 / 100).min(diffs.len() - 1)]);
+        (mean_of(&diffs), p99)
+    };
+    let (mean0, p990) = at(0, 0);
+    let (mut best_mean, mut best_p99) = (mean0, p990);
+    let reach = isize::try_from(MAX_SHIFT).unwrap_or(0);
+    for dy in -reach..=reach {
+        for dx in -reach..=reach {
+            let (m, p) = at(dx, dy);
+            best_mean = best_mean.min(m);
+            best_p99 = best_p99.min(p);
+        }
+    }
+    (mean0 - best_mean, p990 - best_p99)
 }
 
 /// A candidate pair and how it differs.
@@ -264,12 +393,23 @@ fn main() {
         images.len()
     );
 
-    let candidates = find_candidates(&images, opt.candidates);
+    let mut candidates = find_candidates(&images, opt.candidates);
     println!(
         "{} candidate pairs: different pixels, perceptual hashes at most {} bits apart, \
          same shape",
         candidates.len(),
         opt.candidates
+    );
+    let passing = |c: &Candidate| {
+        let (Some(a), Some(b)) = (&images[c.a].visual, &images[c.b].visual) else {
+            return false;
+        };
+        c.hash_distance <= DEFAULT_THRESHOLD && fingerprints_match(&a.fingerprint, &b.fingerprint)
+    };
+    let passing_count = candidates.iter().filter(|c| passing(c)).count();
+    println!(
+        "{passing_count} of them are similar by today's rule (perceptual hashes at most \
+         {DEFAULT_THRESHOLD} bits apart, fingerprints matching)"
     );
     let variants = sample_variants(&opt, &images, ffmpeg.as_deref());
 
@@ -281,6 +421,9 @@ fn main() {
         if !opt.sizes.is_empty() {
             compare_sizes(&opt, &labels, &images, ffmpeg.as_deref());
         }
+    }
+    if opt.passing {
+        candidates.retain(passing);
     }
     write_review(&opt, &images, ffmpeg.as_deref(), &candidates);
 }
@@ -315,27 +458,63 @@ fn image_id(image: &HashedImage) -> String {
     data_encoding::HEXLOWER.encode(&digest.as_ref()[..12])
 }
 
+/// Pairs of different images whose perceptual hashes are at most `max_distance` bits apart
+/// and whose shapes match, in a fixed order. Compares all pairs on several threads, the cheap
+/// hash distance first.
 fn find_candidates(images: &[HashedImage], max_distance: u32) -> Vec<Candidate> {
-    let mut candidates = vec![];
-    for (a, x) in images.iter().enumerate() {
-        for (b, y) in images.iter().enumerate().skip(a + 1) {
+    let hashes: Vec<u64> = images
+        .iter()
+        .map(|image| image.visual.as_ref().map_or(0, |v| v.phash))
+        .collect();
+    let rows = |a: usize| -> Vec<Candidate> {
+        let (Some(x), Some(xv)) = (images.get(a), images.get(a).and_then(|x| x.visual.as_ref()))
+        else {
+            return vec![];
+        };
+        let mut found = vec![];
+        for (b, &hash) in hashes.iter().enumerate().skip(a + 1) {
+            let hash_distance = distance(xv.phash, hash);
+            if hash_distance > max_distance {
+                continue;
+            }
+            let y = &images[b];
+            let Some(yv) = &y.visual else {
+                continue;
+            };
             if x.pixel_hash == y.pixel_hash || !aspects_match(x.dimensions, y.dimensions) {
                 continue;
             }
-            let (Some(xv), Some(yv)) = (&x.visual, &y.visual) else {
-                continue;
-            };
-            let hash_distance = distance(xv.phash, yv.phash);
-            if hash_distance <= max_distance {
-                candidates.push(Candidate {
-                    a,
-                    b,
-                    hash_distance,
-                    metrics: Metrics::between(&xv.fingerprint, &yv.fingerprint),
-                });
-            }
+            found.push(Candidate {
+                a,
+                b,
+                hash_distance,
+                metrics: Metrics::between(&xv.fingerprint, &yv.fingerprint),
+            });
         }
-    }
+        found
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut candidates: Vec<Candidate> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..std::thread::available_parallelism().map_or(1, usize::from))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut found = vec![];
+                    loop {
+                        let a = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if a >= images.len() {
+                            break found;
+                        }
+                        found.extend(rows(a));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("candidate thread"))
+            .collect()
+    });
+    candidates.sort_by_key(|c| (c.a, c.b));
     candidates
 }
 
@@ -509,12 +688,12 @@ fn print_spread(title: &str, all: impl Iterator<Item = Metrics>) {
         all.len()
     );
     println!(
-        "{:<6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "{:<10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
         "metric", "p1", "p5", "p10", "p25", "p50", "p75", "p90"
     );
     for metric in Metric::ALL {
         let mut values: Vec<f64> = all.iter().map(|ms| ms.get(metric)).collect();
-        let mut line = format!("{:<6}", metric.name());
+        let mut line = format!("{:<10}", metric.name());
         for p in [1, 5, 10, 25, 50, 75, 90] {
             let _ = write!(line, " {:>7.1}", percentile(&mut values, p));
         }
@@ -557,23 +736,26 @@ fn print_labels(
         answered.len() - same
     );
     println!(
-        "For each metric and limit: copies kept is the share of synthetic copies within the \
-         limit; same kept and different let in count answered pairs within it."
+        "For each metric, limits that keep a share of the synthetic copies; same kept and \
+         different let in count answered pairs within the limit."
     );
     println!(
-        "{:<6} {:>6} {:>12} {:>10} {:>16}",
+        "{:<10} {:>8} {:>12} {:>10} {:>16}",
         "metric", "limit", "copies kept", "same kept", "different let in"
     );
     for metric in Metric::ALL {
-        for limit in [
-            2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 32.0, 48.0,
-        ] {
-            let copies: Vec<bool> = variants
-                .iter()
-                .flat_map(|r| &r.measured)
-                .map(|m| m.metrics.get(metric) <= limit)
-                .collect();
-            let kept = copies.iter().filter(|&&k| k).count() as f64 / copies.len().max(1) as f64;
+        let mut copies: Vec<f64> = variants
+            .iter()
+            .flat_map(|r| &r.measured)
+            .map(|m| m.metrics.get(metric))
+            .collect();
+        copies.sort_by(f64::total_cmp);
+        if copies.is_empty() {
+            continue;
+        }
+        for share in [950, 990, 995, 999, 1000] {
+            let limit = copies[(copies.len() * share / 1000).min(copies.len() - 1)];
+            let kept = copies.iter().filter(|&&v| v <= limit).count() as f64 / copies.len() as f64;
             let within = |different: bool| {
                 answered
                     .iter()
@@ -581,7 +763,7 @@ fn print_labels(
                     .count()
             };
             println!(
-                "{:<6} {:>6.0} {:>11.1}% {:>6} of {:<3} {:>8} of {:<3}",
+                "{:<10} {:>8.2} {:>11.1}% {:>6} of {:<3} {:>8} of {:<3}",
                 metric.name(),
                 limit,
                 100.0 * kept,
@@ -591,6 +773,16 @@ fn print_labels(
                 answered.len() - same
             );
         }
+    }
+    // How the answered pairs spread on each metric, to see where a limit could go.
+    for (title, different) in [("same picture", false), ("different pictures", true)] {
+        print_spread(
+            &format!("Answered pairs, {title}"),
+            answered
+                .iter()
+                .filter(|(_, d)| *d == different)
+                .map(|(c, _)| c.metrics),
+        );
     }
     let mut hash_of_same: Vec<f64> = answered
         .iter()
