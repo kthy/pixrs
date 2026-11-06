@@ -177,13 +177,14 @@ Decided details:
   changed its rotation tag counts as "same pixels". Perceptual hash = `image_hasher` gradient,
   64 bits, of the upright image shrunk to 256 px; images with almost no detail (blank, black,
   one color) get none, since their hashes are all alike. Each image also stores a 32 x 32
-  grayscale fingerprint. "Similar" (`ImageKey::similar` in `src/dupes.rs`, also used by
+  grayscale fingerprint. "Similar" (`ImageFeatures::similar` in `src/dupes.rs`, also used by
   `calibrate`) = Hamming distance at most `--threshold`, aspect ratios within 3%, not both
-  dated with different `taken_at` (whole seconds: burst shots; copies keep the time or lose
-  it), and fingerprints of the same picture (`same_picture` in `src/imagehash.rs`): the
-  99th percentile pixel difference at most 6 (brightness-corrected), SSIM over 8 x 8 windows at
-  least 0.98, and the largest pixel difference at most 4 for images of the same size (either
-  way round) or 12 for resized ones. Found by comparing all pairs on all cores. The 64-bit hash
+  dated with different `taken_at` (whole seconds, offsets ignored: burst shots; copies keep
+  the time or lose it), and fingerprints of the same picture (`same_picture` in
+  `src/imagehash.rs`): the 99th percentile pixel difference at most 6 (brightness-corrected),
+  SSIM over 8 x 8 windows at least 0.98, and the largest pixel difference at most 4 for images
+  of the same size (either way round) or 12 for resized ones. Found by comparing all pairs on
+  all cores. The 64-bit hash
   alone cannot tell burst shots apart: on the owner's library, 12 of 15 pairs at distance 0
   were different pictures. Calibrated (`examples/calibrate.rs`: synthetic copies of the
   owner's photos, and 373 candidate pairs the owner labelled on its review page as same,

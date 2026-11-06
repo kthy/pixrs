@@ -35,10 +35,12 @@ use image::DynamicImage;
 use pixrs::catalog::{library_path, Catalog, HashedImage};
 use pixrs::decode::{decode_in_process, decode_with_ffmpeg, find_tool, image_decoder, Decoder};
 use pixrs::dupes::{aspects_match, images_similar, DEFAULT_THRESHOLD};
-use pixrs::imagehash::{distance, fingerprint_differences, perceptual_hash, ssim};
+use pixrs::imagehash::{
+    distance, fingerprint_differences, fingerprint_side, perceptual_hash, ssim,
+};
 use pixrs::paths::resolve;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -223,7 +225,7 @@ impl Metrics {
         let Some(&largest) = diffs.last() else {
             return Self::APART;
         };
-        let Some(side) = square_side(a) else {
+        let Some(side) = fingerprint_side(a).filter(|&side| side > 4 * MAX_SHIFT) else {
             return Self::APART;
         };
         let at = |p: usize| f64::from(diffs[(diffs.len() * p / 100).min(diffs.len() - 1)]);
@@ -234,7 +236,7 @@ impl Metrics {
             p95: at(95),
             p99: at(99),
             max: f64::from(largest),
-            ssim: 100.0 * (1.0 - ssim(a, b, side).unwrap_or(0.0)),
+            ssim: 100.0 * (1.0 - ssim(a, b).unwrap_or(0.0)),
             shift_mean: gain_mean,
             shift_p99: gain_p99,
         }
@@ -256,18 +258,6 @@ impl Metrics {
 
 /// Most pixels a fingerprint is shifted by in the shift metrics.
 const MAX_SHIFT: usize = 2;
-
-/// The side of a square fingerprint, if it is square and larger than the shifts.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "fingerprint sides are small"
-)]
-fn square_side(fingerprint: &[u8]) -> Option<usize> {
-    let side = (fingerprint.len() as f64).sqrt().round() as usize;
-    (side * side == fingerprint.len() && side > 4 * MAX_SHIFT).then_some(side)
-}
 
 /// The mean of some values.
 #[expect(clippy::cast_precision_loss, reason = "counts far below 2^52")]
@@ -322,6 +312,13 @@ struct Candidate {
     b: usize,
     hash_distance: u32,
     metrics: Metrics,
+}
+
+impl Candidate {
+    /// Whether `dupes --similar` finds the pair similar at the default threshold.
+    fn passes(&self, images: &[HashedImage]) -> bool {
+        images_similar(&images[self.a], &images[self.b], DEFAULT_THRESHOLD)
+    }
 }
 
 /// How far a variant of an image is from the image.
@@ -422,8 +419,7 @@ fn main() {
         candidates.len(),
         opt.candidates
     );
-    let passing = |c: &Candidate| images_similar(&images[c.a], &images[c.b], DEFAULT_THRESHOLD);
-    let passing_count = candidates.iter().filter(|c| passing(c)).count();
+    let passing_count = candidates.iter().filter(|c| c.passes(&images)).count();
     println!(
         "{passing_count} of them are similar by today's rule (`dupes --similar` at threshold \
          {DEFAULT_THRESHOLD})"
@@ -443,18 +439,15 @@ fn main() {
         }
     }
     if opt.passing {
-        candidates.retain(passing);
+        candidates.retain(|c| c.passes(&images));
     }
     if !opt.skip.is_empty() {
         let ids: Vec<String> = images.iter().map(image_id).collect();
-        let answered: std::collections::HashSet<(String, String)> = opt
-            .skip
-            .iter()
-            .flat_map(|path| read_labels(path))
-            .flat_map(|l| [(l.a.clone(), l.b.clone()), (l.b, l.a)])
-            .collect();
+        let skipped: Vec<Label> = opt.skip.iter().flat_map(|path| read_labels(path)).collect();
+        let answered: HashSet<(&str, &str)> =
+            skipped.iter().map(|l| either_way(&l.a, &l.b)).collect();
         let before = candidates.len();
-        candidates.retain(|c| !answered.contains(&(ids[c.a].clone(), ids[c.b].clone())));
+        candidates.retain(|c| !answered.contains(&either_way(&ids[c.a], &ids[c.b])));
         println!(
             "{} pairs left off the review page, answered before",
             before - candidates.len()
@@ -483,6 +476,32 @@ fn check_outside(out: &Path, roots: &[String]) {
 fn read_labels(path: &Path) -> Vec<Label> {
     let text = fs::read_to_string(path).unwrap_or_else(|e| die(&e.to_string()));
     serde_json::from_str(&text).unwrap_or_else(|e| die(&e.to_string()))
+}
+
+/// A pair of image IDs in the same order whichever way round they come.
+fn either_way<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// The candidates the labels answer, either way round, with their labels.
+fn answered<'a>(
+    labels: &'a [Label],
+    images: &[HashedImage],
+    candidates: &'a [Candidate],
+) -> Vec<(&'a Label, &'a Candidate)> {
+    let ids: Vec<String> = images.iter().map(image_id).collect();
+    let by_pair: HashMap<(&str, &str), &Candidate> = candidates
+        .iter()
+        .map(|c| (either_way(&ids[c.a], &ids[c.b]), c))
+        .collect();
+    labels
+        .iter()
+        .filter_map(|l| Some((l, *by_pair.get(&either_way(&l.a, &l.b))?)))
+        .collect()
 }
 
 /// A stable ID for an image, used in file names and the review answers.
@@ -748,27 +767,15 @@ fn print_labels(
     candidates: &[Candidate],
     variants: &[VariantResults],
 ) {
-    let ids: Vec<String> = images.iter().map(image_id).collect();
-    let by_pair: HashMap<(&str, &str), &Candidate> = candidates
-        .iter()
-        .map(|c| ((ids[c.a].as_str(), ids[c.b].as_str()), c))
-        .collect();
-    let answered: Vec<(&Candidate, Answer)> = labels
-        .iter()
-        .filter_map(|l| {
-            by_pair
-                .get(&(l.a.as_str(), l.b.as_str()))
-                .or_else(|| by_pair.get(&(l.b.as_str(), l.a.as_str())))
-                .map(|c| (*c, Answer::of(l)))
-        })
+    let answered: Vec<(&Candidate, Answer)> = answered(labels, images, candidates)
+        .into_iter()
+        .map(|(l, c)| (c, Answer::of(l)))
         .collect();
     let count = |answer: Answer| answered.iter().filter(|(_, a)| *a == answer).count();
     let similar = |answer: Answer| {
         answered
             .iter()
-            .filter(|(c, a)| {
-                *a == answer && images_similar(&images[c.a], &images[c.b], DEFAULT_THRESHOLD)
-            })
+            .filter(|(c, a)| *a == answer && c.passes(images))
             .count()
     };
     println!();
@@ -858,11 +865,6 @@ fn dump(
     candidates: &[Candidate],
     variants: &[VariantResults],
 ) {
-    let ids: Vec<String> = images.iter().map(image_id).collect();
-    let by_pair: HashMap<(&str, &str), &Candidate> = candidates
-        .iter()
-        .map(|c| ((ids[c.a].as_str(), ids[c.b].as_str()), c))
-        .collect();
     let mut csv = String::from("kind,answer,a,b,hash");
     for metric in Metric::ALL {
         let _ = write!(csv, ",{}", metric.name());
@@ -875,21 +877,15 @@ fn dump(
         }
         csv.push('\n');
     };
-    for label in labels {
-        let found = by_pair
-            .get(&(label.a.as_str(), label.b.as_str()))
-            .or_else(|| by_pair.get(&(label.b.as_str(), label.a.as_str())));
-        if let Some(c) = found {
-            let answer = Answer::of(label).name();
-            row(
-                "pair",
-                answer,
-                &label.a,
-                &label.b,
-                c.hash_distance,
-                c.metrics,
-            );
-        }
+    for (label, c) in answered(labels, images, candidates) {
+        row(
+            "pair",
+            Answer::of(label).name(),
+            &label.a,
+            &label.b,
+            c.hash_distance,
+            c.metrics,
+        );
     }
     for result in variants {
         for m in &result.measured {
@@ -978,8 +974,8 @@ fn compare_sizes(opt: &Opt, labels: &[Label], images: &[HashedImage], ffmpeg: Op
          synthetic copies, and how many answered pairs it lets in."
     );
     println!(
-        "{:>5} {:<6} {:>7} {:>12} {:>16}",
-        "side", "metric", "limit", "same kept", "different let in"
+        "{:>5} {:<6} {:>7} {:>12} {:>12} {:>16}",
+        "side", "metric", "limit", "same kept", "edited kept", "different let in"
     );
     for &side in &opt.sizes {
         // Synthetic copies at this size.
@@ -991,13 +987,13 @@ fn compare_sizes(opt: &Opt, labels: &[Label], images: &[HashedImage], ffmpeg: Op
                 copies.push(Metrics::between(&original, &copy));
             }
         }
-        let answered: Vec<(Metrics, bool)> = labels
+        let answered: Vec<(Metrics, Answer)> = labels
             .iter()
             .filter_map(|l| {
                 let a = decoded.get(index.get(&l.a)?)?;
                 let b = decoded.get(index.get(&l.b)?)?;
                 let metrics = Metrics::between(&fingerprint_at(a, side), &fingerprint_at(b, side));
-                Some((metrics, l.different))
+                Some((metrics, Answer::of(l)))
             })
             .collect();
         print_size(side, &copies, &answered);
@@ -1005,8 +1001,7 @@ fn compare_sizes(opt: &Opt, labels: &[Label], images: &[HashedImage], ffmpeg: Op
 }
 
 /// One fingerprint size's rows of the size experiment.
-fn print_size(side: u32, copies: &[Metrics], answered: &[(Metrics, bool)]) {
-    let same = answered.iter().filter(|(_, d)| !d).count();
+fn print_size(side: u32, copies: &[Metrics], answered: &[(Metrics, Answer)]) {
     for metric in Metric::ALL {
         let mut values: Vec<f64> = copies.iter().map(|ms| ms.get(metric)).collect();
         if values.is_empty() {
@@ -1014,21 +1009,23 @@ fn print_size(side: u32, copies: &[Metrics], answered: &[(Metrics, bool)]) {
         }
         values.sort_by(f64::total_cmp);
         let limit = values[(values.len() * 995 / 1000).min(values.len() - 1)];
-        let within = |different: bool| {
-            answered
+        let within = |answer: Answer| {
+            let (n, of) = answered
                 .iter()
-                .filter(|(ms, d)| *d == different && ms.get(metric) <= limit)
-                .count()
+                .filter(|(_, a)| *a == answer)
+                .fold((0, 0), |(n, of), (ms, _)| {
+                    (n + usize::from(ms.get(metric) <= limit), of + 1)
+                });
+            format!("{n} of {of}")
         };
         println!(
-            "{:>5} {:<6} {:>7.1} {:>7} of {:<3} {:>8} of {:<3}",
+            "{:>5} {:<6} {:>7.1} {:>12} {:>12} {:>16}",
             side,
             metric.name(),
             limit,
-            within(false),
-            same,
-            within(true),
-            answered.len() - same
+            within(Answer::Same),
+            within(Answer::Edited),
+            within(Answer::Different)
         );
     }
 }

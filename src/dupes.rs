@@ -334,28 +334,28 @@ pub fn aspects_match(a: Option<Dimensions>, b: Option<Dimensions>) -> bool {
     }
 }
 
-/// Whether two images are the same size, either way round.
-fn sizes(a: Option<Dimensions>, b: Option<Dimensions>) -> Sizes {
-    match (a, b) {
-        (Some(a), Some(b)) if a == b || a == b.transposed() => Sizes::Same,
-        _ => Sizes::Different,
-    }
-}
-
 /// Whether both photos say when they were taken and the times differ: burst shots, since copies
-/// keep the time they were taken (or lose it). Times are to the second, so shots taken within
-/// the same second are left to the fingerprints.
+/// keep the time they were taken (or lose it). Dates are compared, and times of day where both
+/// have one. Times are wall-clock times to the second, offsets ignored: shots taken within the
+/// same second are left to the fingerprints, and a copy whose time a tool rewrote in another
+/// timezone counts as taken apart.
 fn taken_apart(a: Option<Taken>, b: Option<Taken>) -> bool {
-    a.zip(b).is_some_and(|(a, b)| a != b)
+    a.zip(b)
+        .is_some_and(|(a, b)| a.date != b.date || a.time.zip(b.time).is_some_and(|(a, b)| a != b))
 }
 
 /// What similar images are compared by.
-struct ImageKey<'a> {
-    node: usize,
+struct ImageFeatures<'a> {
     phash: u64,
     dimensions: Option<Dimensions>,
     taken: Option<Taken>,
     fingerprint: &'a [u8],
+}
+
+/// An image in the search for similar pairs: its node and what it is compared by.
+struct ImageKey<'a> {
+    node: usize,
+    features: ImageFeatures<'a>,
 }
 
 /// What similar videos are compared by.
@@ -415,16 +415,26 @@ fn this_and_rest<T>(items: &[T], i: usize) -> Option<(&T, &[T])> {
     items.get(i..)?.split_first()
 }
 
-impl<'a> ImageKey<'a> {
-    /// What `image` is compared by, as node 0. `None` without a perceptual hash.
-    fn of(image: &'a HashedImage) -> Option<Self> {
-        image.visual.as_ref().map(|visual| ImageKey {
-            node: 0,
+impl<'a> ImageFeatures<'a> {
+    const fn new(
+        visual: &'a Visual,
+        dimensions: Option<Dimensions>,
+        taken: Option<Taken>,
+    ) -> Self {
+        Self {
             phash: visual.phash,
-            dimensions: image.dimensions,
-            taken: image.taken,
-            fingerprint: &visual.fingerprint,
-        })
+            dimensions,
+            taken,
+            fingerprint: visual.fingerprint.as_slice(),
+        }
+    }
+
+    /// What `image` is compared by. `None` without a perceptual hash.
+    fn of(image: &'a HashedImage) -> Option<Self> {
+        image
+            .visual
+            .as_ref()
+            .map(|visual| Self::new(visual, image.dimensions, image.taken))
     }
 
     /// Whether two images are similar: perceptual hashes at most `threshold` bits apart,
@@ -438,7 +448,7 @@ impl<'a> ImageKey<'a> {
             && same_picture(
                 self.fingerprint,
                 other.fingerprint,
-                sizes(self.dimensions, other.dimensions),
+                Sizes::of(self.dimensions, other.dimensions),
             )
     }
 }
@@ -446,19 +456,19 @@ impl<'a> ImageKey<'a> {
 /// Whether two images are similar, by the test `dupes --similar` applies to every pair of
 /// images. False for images without perceptual hashes.
 pub fn images_similar(a: &HashedImage, b: &HashedImage, threshold: u32) -> bool {
-    ImageKey::of(a)
-        .zip(ImageKey::of(b))
+    ImageFeatures::of(a)
+        .zip(ImageFeatures::of(b))
         .is_some_and(|(a, b)| a.similar(&b, threshold))
 }
 
-/// Pairs of nodes of similar images (`ImageKey::similar`). Compares every pair, on all cores.
+/// Pairs of nodes of similar images (`ImageFeatures::similar`). Compares every pair, on all cores.
 fn similar_images(images: &[ImageKey], threshold: u32) -> Vec<(usize, usize)> {
     pairs_by_row(images.len(), |i, pairs| {
         let Some((a, rest)) = this_and_rest(images, i) else {
             return;
         };
         for b in rest {
-            if a.similar(b, threshold) {
+            if a.features.similar(&b.features, threshold) {
                 pairs.push((a.node, b.node));
             }
         }
@@ -732,13 +742,9 @@ impl<'a> Graph<'a> {
             .iter()
             .enumerate()
             .filter_map(|(node, n)| {
-                let visual = n.visual?;
-                Some(ImageKey {
+                n.visual.map(|visual| ImageKey {
                     node,
-                    phash: visual.phash,
-                    dimensions: n.dimensions,
-                    taken: n.taken,
-                    fingerprint: &visual.fingerprint,
+                    features: ImageFeatures::new(visual, n.dimensions, n.taken),
                 })
             })
             .collect();
@@ -1619,10 +1625,12 @@ mod tests {
         let at = |time: &str| crate::dates::from_taken_at(time);
         let key = |node: usize, taken: Option<Taken>| ImageKey {
             node,
-            phash: 0,
-            dimensions: Dimensions::new(Some(40), Some(30)),
-            taken,
-            fingerprint: &fingerprint,
+            features: ImageFeatures {
+                phash: 0,
+                dimensions: Dimensions::new(Some(40), Some(30)),
+                taken,
+                fingerprint: &fingerprint,
+            },
         };
         let pairs = |a: Option<Taken>, b: Option<Taken>| {
             similar_images(&[key(0, a), key(1, b)], DEFAULT_THRESHOLD)
@@ -1633,6 +1641,10 @@ mod tests {
         // The same second, in either stored format, or a copy that lost the time.
         assert_eq!(pairs(shot, at("2024-05-01T12:00:00+02:00")), vec![(0, 1)]);
         assert_eq!(pairs(shot, None), vec![(0, 1)]);
+        // Without a time of day, only the date counts.
+        let day = |taken: Option<Taken>| taken.map(|t| Taken { time: None, ..t });
+        assert_eq!(pairs(shot, day(shot)), vec![(0, 1)]);
+        assert_eq!(pairs(shot, day(at("2024-05-02T12:00:00"))), vec![]);
     }
 
     #[test]
