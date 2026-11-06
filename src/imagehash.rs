@@ -161,16 +161,16 @@ pub const FINGERPRINT_LIMIT: u8 = 6;
 /// counts as a copy, see `same_picture`. Re-encoded at the same size (JPEG quality 60 and 85),
 /// copies never went above 4 in calibration; burst shots taken within the same second mostly
 /// differ by 6 or more somewhere.
-pub const SAME_SIZE_LIMIT: u8 = 4;
+const SAME_SIZE_LIMIT: u8 = 4;
 
 /// Largest difference at any fingerprint pixel between two images of different sizes that still
 /// counts as a copy, see `same_picture`.
-pub const RESIZED_LIMIT: u8 = 12;
+const RESIZED_LIMIT: u8 = 12;
 
 /// Least structural similarity (`ssim`) of the fingerprints of two copies, see `same_picture`.
 /// Catches pictures that differ a little everywhere, like two sheets of the same patterned
 /// paper.
-pub const MIN_SSIM: f64 = 0.98;
+const MIN_SSIM: f64 = 0.98;
 
 /// How the sizes of two images with close perceptual hashes compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +179,16 @@ pub enum Sizes {
     Same,
     /// Different or unknown sizes: a copy may have been resized too.
     Different,
+}
+
+impl Sizes {
+    /// How the sizes of two images compare.
+    pub fn of(a: Option<Dimensions>, b: Option<Dimensions>) -> Self {
+        match (a, b) {
+            (Some(a), Some(b)) if a == b || a == b.transposed() => Self::Same,
+            _ => Self::Different,
+        }
+    }
 }
 
 /// Whether two images with close perceptual hashes are copies of the same picture, judged by
@@ -200,55 +210,53 @@ pub fn same_picture(a: &[u8], b: &[u8], sizes: Sizes) -> bool {
         Sizes::Different => RESIZED_LIMIT,
     };
     largest_difference(a, b).is_some_and(|largest| largest <= limit)
-        && ssim(a, b, FINGERPRINT_SIDE as usize).is_some_and(|s| s >= MIN_SSIM)
+        && ssim(a, b).is_some_and(|s| s >= MIN_SSIM)
 }
 
 /// The largest of `fingerprint_differences`, without sorting. `None` if the sizes differ or the
 /// fingerprints are empty.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "differences fit in a byte"
-)]
-pub fn largest_difference(a: &[u8], b: &[u8]) -> Option<u8> {
-    if a.len() != b.len() || a.is_empty() {
-        return None;
+fn largest_difference(a: &[u8], b: &[u8]) -> Option<u8> {
+    differences(a, b)?.map(to_byte).max()
+}
+
+/// The side of a square fingerprint. `None` if it is not square.
+pub const fn fingerprint_side(fingerprint: &[u8]) -> Option<usize> {
+    let side = fingerprint.len().isqrt();
+    if side * side == fingerprint.len() {
+        Some(side)
+    } else {
+        None
     }
-    let shift = mean(a) - mean(b);
-    let largest = a
-        .iter()
-        .zip(b)
-        .map(|(&x, &y)| (f64::from(x) - f64::from(y) - shift).abs())
-        .fold(0.0, f64::max);
-    Some(largest.round().min(255.0) as u8)
 }
 
 /// Side of the windows `ssim` compares.
 const SSIM_WINDOW: usize = 8;
 
-/// Mean structural similarity of two `side` x `side` grayscale fingerprints over 8 x 8 windows,
-/// 4 pixels apart: 1 for the same picture. Brightness and contrast changes count for little;
-/// local structure that moved counts for much. `None` unless both are `side` x `side` and at
-/// least one window.
+/// Pixels in a window `ssim` compares.
+const SSIM_WINDOW_PIXELS: usize = SSIM_WINDOW * SSIM_WINDOW;
+
+/// Mean structural similarity of two square grayscale fingerprints over 8 x 8 windows, 4 pixels
+/// apart: 1 for the same picture. Brightness and contrast changes count for little; local
+/// structure that moved counts for much. `None` unless both are the same square of at least one
+/// window.
 #[expect(clippy::cast_precision_loss, reason = "window sizes are small")]
-pub fn ssim(a: &[u8], b: &[u8], side: usize) -> Option<f64> {
+pub fn ssim(a: &[u8], b: &[u8]) -> Option<f64> {
     const STEP: usize = 4;
-    if side < SSIM_WINDOW || a.len() != side * side || b.len() != a.len() {
-        return None;
-    }
+    let side = fingerprint_side(a).filter(|&side| side >= SSIM_WINDOW && b.len() == a.len())?;
     // The usual constants for 8-bit pixels.
     let (c1, c2) = ((0.01 * 255.0_f64).powi(2), (0.03 * 255.0_f64).powi(2));
-    let n = (SSIM_WINDOW * SSIM_WINDOW) as f64;
+    let n = SSIM_WINDOW_PIXELS as f64;
     let (mut total, mut windows) = (0.0, 0_u32);
     for y0 in (0..=side - SSIM_WINDOW).step_by(STEP) {
         for x0 in (0..=side - SSIM_WINDOW).step_by(STEP) {
             let rows = (y0..y0 + SSIM_WINDOW).map(|y| y * side + x0..y * side + x0 + SSIM_WINDOW);
-            let window = |f: &'_ [u8]| -> Vec<f64> {
-                rows.clone()
-                    .filter_map(|row| f.get(row))
-                    .flatten()
-                    .map(|&v| f64::from(v))
-                    .collect()
+            let window = |f: &'_ [u8]| {
+                let mut pixels = [0.0; SSIM_WINDOW_PIXELS];
+                let values = rows.clone().filter_map(|row| f.get(row)).flatten();
+                for (pixel, &v) in pixels.iter_mut().zip(values) {
+                    *pixel = f64::from(v);
+                }
+                pixels
             };
             let (wa, wb) = (window(a), window(b));
             let (ma, mb) = (wa.iter().sum::<f64>() / n, wb.iter().sum::<f64>() / n);
@@ -275,16 +283,15 @@ pub fn ssim(a: &[u8], b: &[u8], side: usize) -> Option<f64> {
 /// The same test as `fingerprint_differences` sorted and indexed at the 99th percentile, without
 /// allocating or sorting: it runs for every pair of images with close perceptual hashes.
 pub fn fingerprints_match(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() || a.is_empty() {
+    let Some(differences) = differences(a, b) else {
         return false;
-    }
-    let shift = mean(a) - mean(b);
+    };
     // The 99th percentile is at most the limit when no more pixels than lie above it in sorted
     // order exceed the limit.
     let allowed = a.len() - 1 - (a.len() * 99 / 100).min(a.len() - 1);
     let mut over = 0;
-    for (&x, &y) in a.iter().zip(b) {
-        if (f64::from(x) - f64::from(y) - shift).abs().round() > f64::from(FINGERPRINT_LIMIT) {
+    for difference in differences {
+        if to_byte(difference) > FINGERPRINT_LIMIT {
             over += 1;
             if over > allowed {
                 return false;
@@ -300,29 +307,37 @@ fn mean(fingerprint: &[u8]) -> f64 {
     fingerprint.iter().map(|&v| f64::from(v)).sum::<f64>() / fingerprint.len() as f64
 }
 
-/// How two fingerprints differ: the absolute differences of their pixels after subtracting each
-/// fingerprint's mean brightness (so slightly different decoders or resizers do not count),
-/// sorted ascending. Empty if the sizes differ.
+/// The absolute differences of the pixels of two fingerprints after subtracting each
+/// fingerprint's mean brightness (so slightly different decoders or resizers do not count), in
+/// pixel order. `None` if the sizes differ or the fingerprints are empty.
+fn differences<'a>(a: &'a [u8], b: &'a [u8]) -> Option<impl Iterator<Item = f64> + 'a> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let shift = mean(a) - mean(b);
+    Some(
+        a.iter()
+            .zip(b)
+            .map(move |(&x, &y)| (f64::from(x) - f64::from(y) - shift).abs()),
+    )
+}
+
+/// A pixel difference rounded to a whole byte.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "differences fit in a byte"
+    reason = "rounded and capped at 255"
 )]
+const fn to_byte(difference: f64) -> u8 {
+    difference.round().min(255.0) as u8
+}
+
+/// How two fingerprints differ: `differences` rounded and sorted ascending. Empty if the sizes
+/// differ.
 pub fn fingerprint_differences(a: &[u8], b: &[u8]) -> Vec<u8> {
-    if a.len() != b.len() || a.is_empty() {
-        return vec![];
-    }
-    let shift = mean(a) - mean(b);
-    let mut diffs: Vec<u8> = a
-        .iter()
-        .zip(b)
-        .map(|(&x, &y)| {
-            (f64::from(x) - f64::from(y) - shift)
-                .abs()
-                .round()
-                .min(255.0) as u8
-        })
-        .collect();
+    let mut diffs: Vec<u8> = differences(a, b)
+        .map(|d| d.map(to_byte).collect())
+        .unwrap_or_default();
     diffs.sort_unstable();
     diffs
 }
@@ -598,12 +613,13 @@ pub(crate) mod tests {
     #[test]
     fn test_ssim_is_one_for_the_same_picture_and_lower_for_another() {
         let base = gradient();
-        assert!((ssim(&base, &base, 32).unwrap() - 1.0).abs() < 1e-9);
+        assert!((ssim(&base, &base).unwrap() - 1.0).abs() < 1e-9);
         let flipped: Vec<u8> = base.iter().rev().copied().collect();
-        assert!(ssim(&base, &flipped, 32).unwrap() < 0.5);
-        // Too small for a window, or not `side` x `side`.
-        assert_eq!(ssim(&[100; 16], &[100; 16], 4), None);
-        assert_eq!(ssim(&base, &base[1..], 32), None);
+        assert!(ssim(&base, &flipped).unwrap() < 0.5);
+        // Smaller than a window, not square, or not the same size.
+        assert_eq!(ssim(&[100; 16], &[100; 16]), None);
+        assert_eq!(ssim(&base[1..], &base[1..]), None);
+        assert_eq!(ssim(&base, &base[1..]), None);
     }
 
     #[test]
@@ -645,7 +661,7 @@ pub(crate) mod tests {
             })
             .collect();
         assert!(largest_difference(&base, &noisy).unwrap() <= RESIZED_LIMIT);
-        assert!(ssim(&base, &noisy, 32).unwrap() < MIN_SSIM);
+        assert!(ssim(&base, &noisy).unwrap() < MIN_SSIM);
         assert!(!same_picture(&base, &noisy, Sizes::Different));
     }
 
