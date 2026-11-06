@@ -41,9 +41,14 @@ pub struct Visual {
     pub fingerprint: Vec<u8>,
 }
 
-/// Version of the hash definitions. Bump it when `pixel_hash`, `perceptual_hash` or the
-/// fingerprint in `hash_small` change, so every image is decoded again.
-pub const HASH_VERSION: u32 = 2;
+/// Version of the image hash definitions. Bump it when `pixel_hash`, `shrink` or `hash_small`
+/// change, so every image is decoded again.
+pub const HASH_VERSION: u32 = 3;
+
+/// Version of the hash of a video frame. `ffmpeg` scales frames to fit `PERCEPTUAL_SIZE`, so
+/// `shrink` leaves them alone: bump it when `hash_small` changes, so every video is sampled
+/// again.
+pub const FRAME_HASH_VERSION: u32 = 2;
 
 /// Side of the grayscale fingerprint in pixels.
 pub const FINGERPRINT_SIDE: u32 = 32;
@@ -353,10 +358,13 @@ const fn quarter_turn(orientation: Orientation) -> bool {
     )
 }
 
-/// The image shrunk to fit `PERCEPTUAL_SIZE`, or a copy if it is that small already.
+/// The image shrunk to fit `PERCEPTUAL_SIZE`, or a copy if it is that small already. Through a
+/// triangle filter, not `thumbnail`: that one samples in whole source pixels, so a sharp edge
+/// in an image a few hundred pixels across lands a fraction of a fingerprint pixel away from
+/// where it lands in a half-size copy, enough to fail `same_picture`.
 fn shrink(img: &DynamicImage) -> DynamicImage {
     if img.width() > PERCEPTUAL_SIZE || img.height() > PERCEPTUAL_SIZE {
-        img.thumbnail(PERCEPTUAL_SIZE, PERCEPTUAL_SIZE)
+        img.resize(PERCEPTUAL_SIZE, PERCEPTUAL_SIZE, FilterType::Triangle)
     } else {
         img.clone()
     }
@@ -434,7 +442,7 @@ pub(crate) mod tests {
 
     use image::codecs::jpeg::JpegEncoder;
     use image::imageops::FilterType;
-    use image::{Rgb, RgbImage};
+    use image::{GrayImage, Luma, Rgb, RgbImage};
     use pretty_assertions::assert_eq;
     use std::fs;
     use tempfile::tempdir;
@@ -663,6 +671,27 @@ pub(crate) mod tests {
         assert!(largest_difference(&base, &noisy).unwrap() <= RESIZED_LIMIT);
         assert!(ssim(&base, &noisy).unwrap() < MIN_SSIM);
         assert!(!same_picture(&base, &noisy, Sizes::Different));
+    }
+
+    #[test]
+    fn test_half_size_copies_of_small_images_are_the_same_picture() {
+        // A sharp edge in an image a few hundred pixels high: shrinking it to `PERCEPTUAL_SIZE`
+        // must put the edge in the same place as shrinking its half-size copy does.
+        let original = DynamicImage::ImageLuma8(GrayImage::from_fn(600, 400, |x, y| {
+            let shade = x / 10;
+            Luma([if y < 211 { 40 + shade } else { 200 + shade / 2 } as u8])
+        }));
+        let half = original.resize_exact(300, 200, FilterType::Triangle);
+        let (a, b) = (
+            perceptual_hash(&original).unwrap(),
+            perceptual_hash(&half).unwrap(),
+        );
+        assert!(distance(a.phash, b.phash) <= 6);
+        assert!(same_picture(
+            &a.fingerprint,
+            &b.fingerprint,
+            Sizes::Different
+        ));
     }
 
     #[test]
