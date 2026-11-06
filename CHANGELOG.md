@@ -82,6 +82,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--similar` missed some half-size copies of images a few hundred pixels across: a sharp edge,
+  such as a horizon or a line of text, landed in a slightly different place in the copy's
+  fingerprint. Images are now shrunk with a smoothing filter before hashing. In a sample of 300
+  of the owner's photos, half-size copies missed went from 14 to 7, all of images 160 px or
+  smaller. The next `pixrs scan` decodes every image again; videos are not sampled again.
 - The thumbnail cache (`pixrs serve --cache`), the catalog and the quarantine folder are refused
   inside a library also when spelled in another letter case on a file system that ignores it
   (WSL's `/mnt/c`, SMB, exFAT): `--cache /mnt/c/photos/thumbs` no longer passes for the library

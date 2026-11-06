@@ -635,8 +635,12 @@ fn sample_variants(
                 scope.spawn(move || {
                     let mut results = empty();
                     for image in part {
-                        let (Some(upright), Some(visual)) = (decode(image, ffmpeg), &image.visual)
-                        else {
+                        // Hashed here, not taken from the catalog, so both sides are hashed
+                        // the same way whatever version the catalog's hashes are.
+                        let Some(upright) = decode(image, ffmpeg) else {
+                            continue;
+                        };
+                        let Some(visual) = perceptual_hash(&upright) else {
                             continue;
                         };
                         for result in &mut results {

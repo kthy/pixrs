@@ -7,7 +7,7 @@
  *************************************************************************************************/
 
 use crate::decode::{ffmpeg_input_options, file_url, run_with_timeout, DecodeError};
-use crate::imagehash::{distance, perceptual_hash, HASH_VERSION};
+use crate::imagehash::{distance, perceptual_hash, FRAME_HASH_VERSION};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -109,7 +109,7 @@ pub fn video_version(ffmpeg_version: &str) -> String {
     format!(
         "video {}; image hash {}; image {}; image_hasher {}; png {}; ffmpeg {}",
         AV_VERSION,
-        HASH_VERSION,
+        FRAME_HASH_VERSION,
         env!("PIXRS_CRATE_image"),
         env!("PIXRS_CRATE_image_hasher"),
         env!("PIXRS_CRATE_png"),

@@ -172,42 +172,43 @@ Decided details:
   `ffmpeg`; RAW formats and everything without a decoder get a placeholder.
 - Viewer video: no transcoding. Videos the browser cannot play show their codec (from
   `ffprobe`) and an "Open original" link.
-- Image hashes: every image is decoded, in a separate scan pass after content hashing, in
-  parallel. Pixel hash = hash of the decoded pixels before EXIF orientation, so a copy that only
-  changed its rotation tag counts as "same pixels". Perceptual hash = `image_hasher` gradient,
-  64 bits, of the upright image shrunk to 256 px; images with almost no detail (blank, black,
-  one color) get none, since their hashes are all alike. Each image also stores a 32 x 32
-  grayscale fingerprint. "Similar" (`ImageFeatures::similar` in `src/dupes.rs`, also used by
-  `calibrate`) = Hamming distance at most `--threshold`, aspect ratios within 3%, not both
-  dated with different `taken_at` (whole seconds, offsets ignored: burst shots; copies keep
-  the time or lose it), and fingerprints of the same picture (`same_picture` in
-  `src/imagehash.rs`): the 99th percentile pixel difference at most 6 (brightness-corrected),
-  SSIM over 8 x 8 windows at least 0.98, and the largest pixel difference at most 4 for images
-  of the same size (either way round) or 12 for resized ones. Found by comparing all pairs on
-  all cores. The 64-bit hash
-  alone cannot tell burst shots apart: on the owner's library, 12 of 15 pairs at distance 0
-  were different pictures. Calibrated (`examples/calibrate.rs`: synthetic copies of the
-  owner's photos, and 373 candidate pairs the owner labelled on its review page as same,
-  edited copy or different): threshold 6 bits (all copies within 4). The p99 test alone let in
-  every labelled burst pair. SSIM catches patterned paper; burst shots within the same second
-  look like copies to every measure at 32 x 32 except the largest difference at the same size,
-  where same-size re-encodes (JPEG q60, q85) never exceed 4. On the held-out page (200 pairs):
-  122 of 122 copies kept, 16 of 30 edited copies (colors or contrast changed; the owner decided
-  these are not similar), 4 of 48 burst shots let in. Larger fingerprints (64 to 256 px)
-  separated worse. EXIF sub-second times (`SubSecTimeOriginal`) were measured and left out:
-  they differ for 34 of 37 same-second burst pairs, but on top of this rule caught 1 more of
-  the 373 labelled pairs and lost 3 copies, not worth a schema change and a metadata reread. `similar` stays opt-in (`--similar`, "a few burst shots may remain"), by
-  the owner's decision. HEIC is decoded via
-  `ffmpeg` 7.1 or later when available (older versions may decode one tile of a phone's HEIC
-  grid); RAW is skipped with a note. `ffmpeg` applies the file's rotation itself, so for HEIC
-  and AVIF the pixel hash is of the upright image. In-process decoding is capped at 65,536
-  pixels per side, 512 MiB of decoded pixels and 512 MiB of file (`src/decode.rs`); a file
-  beyond that is undecodable. A file can claim any size in a few bytes, and `image`'s
-  `into_decoder` does not apply its memory limit to the pixel buffer, so pixrs reserves it.
-  Every `ffmpeg` run starts with `ffmpeg_input_options` (`src/decode.rs`): one decoding thread
-  (each thread holds frames of its own) and `-max_pixels` at the same budget, 512 MiB at 4 bytes
-  a pixel, about 134 megapixels per frame. Phones store larger HEIC and AVIF photos as grids of
-  small tiles, which stay below it.
+- Image hashes: every image is decoded, in a separate scan pass after content hashing, in parallel.
+  Pixel hash = hash of the decoded pixels before EXIF orientation, so a copy that only changed its
+  rotation tag counts as "same pixels". Perceptual hash = `image_hasher` gradient, 64 bits, of the
+  upright image shrunk to 256 px with a triangle filter (`thumbnail` samples whole pixels, so a
+  sharp edge in an image a few hundred pixels across landed elsewhere than in its half-size copy);
+  images with almost no detail (blank, black, one color) get none, since their hashes are all
+  alike. Each image also stores a 32 x 32 grayscale fingerprint. "Similar"
+  (`ImageFeatures::similar` in `src/dupes.rs`, also used by `calibrate`) = Hamming distance at most
+  `--threshold`, aspect ratios within 3%, not both dated with different `taken_at` (whole seconds,
+  offsets ignored: burst shots; copies keep the time or lose it), and fingerprints of the same
+  picture (`same_picture` in `src/imagehash.rs`): the 99th percentile pixel difference at most 6
+  (brightness-corrected), SSIM over 8 x 8 windows at least 0.98, and the largest pixel difference
+  at most 4 for images of the same size (either way round) or 12 for resized ones. Found by
+  comparing all pairs on all cores. The 64-bit hash alone cannot tell burst shots apart: on the
+  owner's library, 12 of 15 pairs at distance 0 were different pictures. Calibrated
+  (`examples/calibrate.rs`: synthetic copies of the owner's photos, and 373 candidate pairs the
+  owner labelled on its review page as same, edited copy or different): threshold 6 bits (all
+  copies within 4). The p99 test alone let in every labelled burst pair. SSIM catches patterned
+  paper; burst shots within the same second look like copies to every measure at 32 x 32 except the
+  largest difference at the same size, where same-size re-encodes (JPEG q60, q85) never exceed 4.
+  On the held-out page (200 pairs): 122 of 122 copies kept, 15 of 30 edited copies (colors or
+  contrast changed; the owner decided these are not similar), 4 of 48 burst shots let in. Larger
+  fingerprints (64 to 256 px) separated worse. EXIF sub-second times (`SubSecTimeOriginal`) were
+  measured and left out: they differ for 34 of 37 same-second burst pairs, but on top of this rule
+  caught 1 more of the 373 labelled pairs and lost 3 copies, not worth a schema change and a
+  metadata reread. Half-size copies of images 160 px or smaller fail about a third of the time
+  (their fingerprints lose detail the original's keep); larger ones pass. `similar` stays opt-in
+  (`--similar`, "a few burst shots may remain"), by the owner's decision. HEIC is decoded via
+  `ffmpeg` 7.1 or later when available (older versions may decode one tile of a phone's HEIC grid);
+  RAW is skipped with a note. `ffmpeg` applies the file's rotation itself, so for HEIC and AVIF the
+  pixel hash is of the upright image. In-process decoding is capped at 65,536 pixels per side, 512
+  MiB of decoded pixels and 512 MiB of file (`src/decode.rs`); a file beyond that is undecodable. A
+  file can claim any size in a few bytes, and `image`'s `into_decoder` does not apply its memory
+  limit to the pixel buffer, so pixrs reserves it. Every `ffmpeg` run starts with
+  `ffmpeg_input_options` (`src/decode.rs`): one decoding thread (each thread holds frames of its
+  own) and `-max_pixels` at the same budget, 512 MiB at 4 bytes a pixel, about 134 megapixels per
+  frame. Phones store larger HEIC and AVIF photos as grids of small tiles, which stay below it.
 - Video and audio similarity: a video's signature is 9 frames at 5%, 15%, ... 85% of its duration
   (`ffmpeg -ss`, duration from `ffprobe`), each with the image perceptual hash; frames shift with
   re-encoding when keyframes are used, fixed fractions do not. The fractions are of the video
@@ -231,13 +232,14 @@ Decided details:
   (Live Photo clips shot moments apart were not in the calibration sample). `--threshold` applies
   to images and video frames. Both are skipped with a note when `ffmpeg`/`ffprobe` or `fpcalc` are
   not on `PATH`.
-- Hash versions: each file stores the version it was hashed with. Images: the hash
-  definitions, the `image` and `image_hasher` crates and its format's decoder crate (major.minor,
-  from `Cargo.lock` via `build.rs`), plus `ffmpeg -version` for HEIC/AVIF. Videos: the signature
-  and image hash definitions, the crates that hash frames and `ffmpeg`'s version. Audio: the
-  signature definitions and `fpcalc`'s version. A scan rehashes files whose version differs,
-  since another decoder can produce slightly different pixels. Read errors and timeouts are not
-  recorded, so those files are tried again; only files the decoder rejects are recorded as
+- Hash versions: each file stores the version it was hashed with. Images: the hash definitions, the
+  `image` and `image_hasher` crates and its format's decoder crate (major.minor, from `Cargo.lock`
+  via `build.rs`), plus `ffmpeg -version` for HEIC/AVIF. Videos: the signature and frame hash
+  definitions (`FRAME_HASH_VERSION`: `ffmpeg` scales frames to 256 px, so a change to the shrinking
+  step alone does not sample videos again), the crates that hash frames and `ffmpeg`'s version.
+  Audio: the signature definitions and `fpcalc`'s version. A scan rehashes files whose version
+  differs, since another decoder can produce slightly different pixels. Read errors and timeouts
+  are not recorded, so those files are tried again; only files the decoder rejects are recorded as
   undecodable. A video frame `ffmpeg` cannot decode counts as one without detail.
 
 ## Invariants
