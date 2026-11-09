@@ -18,6 +18,7 @@ use ring::digest::Digest;
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
@@ -628,7 +629,8 @@ fn remove_source(path: &Path) -> io::Result<()> {
                 clippy::permissions_set_readonly_false,
                 reason = "Windows only, where this clears the read-only attribute and nothing else"
             )]
-            permissions.set_readonly(false);
+            // The file is removed next; its permissions are never left loosened.
+            permissions.set_readonly(false); // NOSONAR(S2612)
             fs::set_permissions(path, permissions)?;
         }
     }
@@ -1527,7 +1529,7 @@ fn append_to(path: &Path) -> io::Result<Journal> {
 /// Whether `path` is named like a temporary file `reserve_temp` makes:
 /// `.pixrs-<pid>-<nanos>-<n>.tmp`.
 fn is_temp_name(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return false;
     };
     let Some(numbers) = name
