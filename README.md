@@ -7,8 +7,8 @@ A command-line utility to present a bunch of media files in a reasonable manner.
 
 ## Download
 
-Releases after 0.2.0 come with an archive per system on the [releases page][releases]. Each
-holds the `pixrs` binary, `LICENSE.md`, `THIRD_PARTY_NOTICES.txt` and this README:
+From 0.3.0 on, each release comes with an archive per system on the [releases page][releases].
+Each holds the `pixrs` binary, `LICENSE.md`, `THIRD_PARTY_NOTICES.txt` and this README:
 
 | System                           | Archive                                            |
 | -------------------------------- | -------------------------------------------------- |

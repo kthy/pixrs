@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-09
+
 ### Added
 
 - `pixrs relocate OLD NEW` points a library at the folder it was moved to (another mount point,
@@ -156,8 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   move that did not exist crashed it. A plan is now checked as a whole before anything
   happens: every move must start in one of the plan's libraries and end below the plan's
   target folder (the library, the `--to` folder or the quarantine folder), and must refer to
-  earlier media moves and the plan's libraries only. The plan file format is now version 2
-  (it records the target folder); plans written by 0.2.0 must be made again.
+  earlier media moves and the plan's libraries only.
 - `pixrs scan` stops when the library disappears (an unplugged drive, a dropped network share)
   while reading metadata or hashing, as it already did while decoding, instead of failing on
   every remaining file. What was scanned so far is kept.
@@ -236,5 +237,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The static HTML gallery generator. `pixrs serve` replaces it.
 - Unused `polars` dependency.
 
-[Unreleased]: https://github.com/kthy/pixrs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kthy/pixrs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kthy/pixrs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/kthy/pixrs/releases/tag/v0.2.0

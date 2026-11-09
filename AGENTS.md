@@ -286,9 +286,9 @@ on the LFS files.
   regenerate `THIRD_PARTY_NOTICES.txt`; CI fails if it is out of date.
 - Catalog schema changes bump `SCHEMA_VERSION` in `src/catalog.rs` and must migrate existing
   catalogs (`MIGRATIONS`, run when any `Catalog::open*` finds an older version); users'
-  catalogs hold hours of hashing. Schema v1 shipped in 0.2.0. A change to the plan or journal
-  format bumps `PLAN_VERSION` in `src/plan.rs`; before 1.0, plans and journals of another
-  version are refused (by the version, read first), not migrated.
+  catalogs hold hours of hashing. Schema v1 shipped in 0.2.0, v2 in 0.3.0. A change to the plan
+  or journal format bumps `PLAN_VERSION` in `src/plan.rs`; before 1.0, plans and journals of
+  another version are refused (by the version, read first), not migrated.
 - Conventional Commits: `feat`, `fix`, `chore`, `chore(deps)`, `docs`, `ci`, `test`.
 - Add user-visible changes to `[Unreleased]` in `CHANGELOG.md` (Keep a Changelog format).
 - Keep the usage block in `README.md` identical to `pixrs --help` output.
