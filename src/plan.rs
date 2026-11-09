@@ -19,6 +19,7 @@ use log::debug;
 use same_file::is_same_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -555,7 +556,7 @@ impl Claims {
         let own_name = (own.parent() == Some(dir))
             .then(|| own.file_name())
             .flatten()
-            .and_then(|n| n.to_str());
+            .and_then(OsStr::to_str);
         match listing(&mut self.on_disk, dir) {
             None => Target::Unreadable,
             Some(names)
@@ -696,9 +697,9 @@ fn add_sidecars(moves: &mut Vec<Move>, claims: &mut Claims, notes: &mut PlanNote
     for (media, m) in moves.iter().enumerate() {
         let (Some(dir), Some(name), Some(to_dir), Some(new_name)) = (
             m.from.parent(),
-            m.from.file_name().and_then(|n| n.to_str()),
+            m.from.file_name().and_then(OsStr::to_str),
             m.to.parent(),
-            m.to.file_name().and_then(|n| n.to_str()),
+            m.to.file_name().and_then(OsStr::to_str),
         ) else {
             continue;
         };
