@@ -33,7 +33,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-about@0.9.2
       # Offline, as `just notices` runs it, so license texts come from the crates alone.
@@ -89,7 +89,7 @@ jobs:
           fetch-depth: 0 # blame information for new code detection
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --component clippy,llvm-tools
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-llvm-cov@0.9.1
       # So the code that calls ffmpeg and fpcalc is covered.
