@@ -340,9 +340,7 @@ const fn to_byte(difference: f64) -> u8 {
 /// How two fingerprints differ: `differences` rounded and sorted ascending. Empty if the sizes
 /// differ.
 pub fn fingerprint_differences(a: &[u8], b: &[u8]) -> Vec<u8> {
-    let mut diffs: Vec<u8> = differences(a, b)
-        .map(|d| d.map(to_byte).collect())
-        .unwrap_or_default();
+    let mut diffs: Vec<u8> = differences(a, b).map_or_default(|d| d.map(to_byte).collect());
     diffs.sort_unstable();
     diffs
 }
