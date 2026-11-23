@@ -1,0 +1,9 @@
+# cargo-audit configuration, also read by the Security Audit workflow.
+
+[advisories]
+ignore = [
+    # chrono is unmaintained. It comes only through nom-exif, whose public API returns chrono
+    # types (`ExifDateTime`), so pixrs cannot drop it until nom-exif does.
+    # https://github.com/kthy/pixrs/issues/113
+    "RUSTSEC-2026-0543",
+]
