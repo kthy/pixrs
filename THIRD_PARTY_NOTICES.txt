@@ -14,7 +14,7 @@ ffmpeg and ffprobe (https://ffmpeg.org/), and Chromaprint's fpcalc
 (https://acoustid.org/chromaprint).
 
 Licenses:
-- MIT License: 207
+- MIT License: 206
 - BSD 3-Clause "New" or "Revised" License: 30
 - ISC License: 17
 - Apache License 2.0: 5
@@ -3846,7 +3846,7 @@ DEALINGS IN THE SOFTWARE.
 ================================================================================
 MIT License
 
-Used by: hashbrown, hashbrown
+Used by: hashbrown
 
 Copyright (c) 2016 Amanieu d'Antras
 
